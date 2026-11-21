@@ -1103,6 +1103,107 @@
   [(compiler-with-world (_0 kr) (_0 vr))
    (tc-ffi spec-ty (pail-as-key (_0 options) (_1 options) (_0 key) (_1 key)))])
 
+;; fit is an ordinary builtin function with one type argument. Foil code
+;; writes fit[t] and then the value, as it writes pail/as[t]. There is no
+;; special syntax.
+;;
+;; fit[t] is a checked cast. It gives some of the value when the
+;; representation of the value is that of t to any depth. In all other cases
+;; it gives none. It makes no assumption about the value. Thus it is the way
+;; that data from outside the world becomes typed. The type is walked one
+;; time, at compile time, into a closed description that the compiled constant
+;; interprets:
+;;   0            any value (any, an open type variable)
+;;   [1]          a nat
+;;   [2 v]        the constant v
+;;   [3]          no value (a function is not data)
+;;   [4 d]        a pin of d
+;;   [5 d]        a row of d
+;;   [6 c ds]     a record: constructor c, one description for each field
+;;   [7 ds]       one of these
+;;   [8]          a pail: any branded value
+;;   [9 i]        entry i of the table (named and recursive types)
+;; The state is [world table seen]: the function describes each named type one
+;; time.
+(define (fit-describe state typ)
+  (define (each types)
+    (foldl (lambda (acc item)
+             (let ((r (fit-describe (_0 acc) item)))
+               [(_0 r) (Weld (_1 acc) [(_1 r)])]))
+           [state []] types))
+  (cond
+    ((Or (nt:any-type? typ) (Or (nt:type-var? typ) (nt:const-var? typ)))
+      [state 0])
+    ((nt:pail-type? typ) [state [8]])
+    ((nt:nat-type? typ) [state [1]])
+    ((nt:const-type? typ) [state [2 (nt:const-value typ)]])
+    ((nt:pin-type? typ)
+      (let ((r (fit-describe state (nt:pin-item typ)))) [(_0 r) [4 (_1 r)]]))
+    ((nt:array-type? typ)
+      (let ((r (fit-describe state (nt:array-item typ)))) [(_0 r) [5 (_1 r)]]))
+    ((nt:row-type? typ)
+      (let ((r (each (map nt:row-item-value (nt:row-items typ)))))
+        [(_0 r) [6 (nt:row-cstr typ) (_1 r)]]))
+    ((nt:sum-type? typ)
+      (let ((r (each (nt:sum-options typ)))) [(_0 r) [7 (_1 r)]]))
+    ((Or (nt:type-ref? typ) (nt:type-app? typ))
+      (let ((hit (find (lambda (pair) (Equal typ (_0 pair))) (_2 state))))
+        (If hit [state [9 (_1 (_0 hit))]]
+          (let* ((index (Sz (_1 state)))
+                 (seen [(_0 state) (Weld (_1 state) [0])
+                        (Weld (_2 state) [[typ index]])])
+                 (opened (nt:view (_0 seen) typ))
+                 (r (fit-describe [(_0 opened) (_1 seen) (_2 seen)] (_1 opened)))
+                 (after (_0 r)))
+            [[(_0 after) (Up index (_1 r) (_1 after)) (_2 after)] [9 index]]))))
+    (else [state [3]])))
+;; A brand is a boot cord ("/..." ) or a framed kernel brand.
+(define (fit-brand? c)
+  (And (IsNat c) (Or (Eq 47 (Mod c 256)) (brands:framed? c))))
+(define (fit-run table desc val)
+  (define (every d i n)
+    (If (Ge i n) 1 (And (fit-run table d (Ix i val)) (every d (Inc i) n))))
+  (define (fields ds i n)
+    (If (Ge i n) 1
+      (And (fit-run table (Ix i ds) (Ix i val)) (fields ds (Inc i) n))))
+  (define (some ds i n)
+    (If (Ge i n) 0 (Or (fit-run table (Ix i ds) val) (some ds (Inc i) n))))
+  (Ifz desc 1
+    (let ((tag (_0 desc)))
+      (cond
+        ((Eq 1 tag) (IsNat val))
+        ((Eq 2 tag) (Equal (_1 desc) val))
+        ((Eq 4 tag) (And (IsPin val) (fit-run table (_1 desc) (Unpin val))))
+        ((Eq 5 tag)
+          (Or (And (IsNat val) (Eq 0 val))
+            (And (IsApp val)
+              (And (IsNat (Hd val))
+                (And (Eq 0 (Hd val)) (every (_1 desc) 0 (Sz val)))))))
+        ((Eq 6 tag)
+          (let ((brand (_1 desc)) (ds (_2 desc)))
+            (Ifz (Sz ds) (And (IsNat val) (Eq brand val))
+              (And (IsApp val)
+                (And (IsNat (Hd val))
+                  (And (Eq brand (Hd val))
+                    (And (Eq (Sz ds) (Sz val)) (fields ds 0 (Sz ds)))))))))
+        ((Eq 7 tag) (some (_1 desc) 0 (Sz (_1 desc))))
+        ((Eq 8 tag)
+          (Or (fit-brand? val)
+            (And (IsApp val) (And (IsNat (Hd val)) (fit-brand? (Hd val))))))
+        ((Eq 9 tag) (fit-run table (Ix (_1 desc) table) val))
+        (else 0)))))
+(define (fit-key some none table desc v)
+  (If (fit-run table desc v) (some v) none))
+(define (elab-fit compiler env spec-ty gargs)
+  (define t (nt:argument-value (_0 gargs)))
+  (need env (Nil (nt:scheme? t))
+    "fit needs a type with every argument given" t)
+  (define r (fit-describe [(compiler-world compiler) [] []] t))
+  (define options (option-brands compiler))
+  [(compiler-with-world (_0 (_0 r)) compiler)
+   (tc-ffi spec-ty
+     (fit-key (_0 options) (_1 options) (_1 (_0 r)) (_1 r)))])
+
 ;; The row an option denotes, WITHOUT interning: a structural row is
 ;; itself; a nominal member's row is its entry's scheme body; a generic
 ;; member's is that body instantiated at the option's arguments
@@ -1530,6 +1631,9 @@
           (If (Equal (system-path compiler ["pail" "as"])
                      (specialization-base-path compiler val))
             (elab-pail-as compiler env spec gargs)
+          (If (Equal (system-path compiler ["fit"])
+                     (specialization-base-path compiler val))
+            (elab-fit compiler env spec gargs)
           (Ifz (nt:scheme-const-parameter-count scm)
             ;; Type-only specialization erases at runtime: the value
             ;; is the base itself at its specialized type.
@@ -1548,7 +1652,7 @@
                (tc-global spec
                  (ty-ap-encode
                    (Weld [(tc-global-path base)]
-                     (map specialization-argument-part gargs))))])))))))
+                     (map specialization-argument-part gargs))))]))))))))
   ;; One match arm -> [compiler [arm-tc key]].  env already carries the
   ;; scrutinee local (slot 0), matching lower-match's one-let framing; a
   ;; binder pattern adds TC_LET projections over that slot.

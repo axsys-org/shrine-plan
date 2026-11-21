@@ -1,0 +1,591 @@
+- eden_store
+- helm
+- net
+- mesa_foot
+- testing
+- tests/namespace [at=fixture]
+- tests/net [at=shared]
+
+' These tests run three worlds in one process. Each world has its own foot and
+' its own real Mesa engine. The test passes only packets from one world to
+' another. These are the steps:
+' - A world writes.
+' - The foot of that world sends a hint.
+' - The foot of the reader asks.
+' - The pages cross one fragment at a time.
+' - Each landing goes through the land command of the supervisor.
+'
+' 0x17 publishes. 0x18 is the peer that 0x17 publishes to. 0x19 is a third
+' world that can read only what is public.
++ foot_tests
+  + seed
+    \ n=nat
+    ^ nat
+    = w32 4294967296
+      w64 (mul w32 w32)
+    | add (mul (mul w64 w64) (mul w64 w64)) n
+  + world
+    : state=namespace foot=mesa_foot/foot
+  + packet
+    : to=nat from=nat bytes=nat
+  + net
+    ' This is a net. It holds the worlds, the packets on their way, the number
+    ' of carried packets and the number of lost packets.
+    : worlds=row[foot_tests/world] wire=row[foot_tests/packet] carried=nat lost=nat
+  + everyone
+    ^ row[nat]
+    [17 18 19]
+  + others
+    \ n=nat
+    ^ row[nat]
+    | (foot_tests/everyone).keep((\ other=nat !(eq other n)))
+  + apply
+    \ writes=row[[p=path q=writ]] state=namespace
+    ^ namespace
+    ? (eden_store/changes writes state)
+     > (./ok next) next
+     > (./err why) state
+  + boot
+    ' It makes a world and a foot for that world. The world holds the key of
+    ' each other world on its card for that other world.
+    \ n=nat
+    ^ foot_tests/world
+    = self=iota ($x n)
+      blank (namespace self sov/new (fixture/namespace_tests/initial).system (mop/empty))
+      cards
+        | (foot_tests/others n).map
+          \ other=nat
+          ^ [p=path q=writ]
+          = at=path [self 'io 'mesa ($x other)]
+          [at (writ/make (myth/sing ['key] (pails/n (Ed25519PublicKey (foot_tests/seed other)))))]
+      peers
+        | (foot_tests/others n).map
+          \ other=nat
+          ^ mesa_foot/peer
+          | mesa_foot/peer ($x other) other (Ed25519PublicKey (foot_tests/seed other))
+    | foot_tests/world (foot_tests/apply cards blank) (mesa_foot/start self (foot_tests/seed n) 0 peers)
+  + again
+    ' It gives the same world with a new foot. This is the state after a
+    ' restart.
+    \ rift=nat me=foot_tests/world
+    ^ foot_tests/world
+    = n (mesa_foot/id me.state.self)
+      peers
+        | (foot_tests/others n).map
+          \ other=nat
+          ^ mesa_foot/peer
+          | mesa_foot/peer ($x other) other (Ed25519PublicKey (foot_tests/seed other))
+    | foot_tests/world me.state (mesa_foot/start me.state.self (foot_tests/seed n) rift peers)
+  + fresh
+    ' This is not a constant, because a net holds live engines. Live engines
+    ' are made when a caller asks for them, and the module does not keep them
+    ' as a value.
+    \ _=nat
+    ^ foot_tests/net
+    = none=row[foot_tests/packet] []
+      worlds (foot_tests/everyone).map(foot_tests/boot)
+    | foot_tests/net worlds none 0 0
+  + of
+    \ id=nat all=row[foot_tests/world]
+    ^ foot_tests/world
+    | all.keep((\ item=foot_tests/world (eq (mesa_foot/id item.state.self) id))).at(0)
+  + put
+    \ me=foot_tests/world all=row[foot_tests/world]
+    ^ row[foot_tests/world]
+    | all.map
+      \ item=foot_tests/world
+      ^ foot_tests/world
+      ? (eq_iota item.state.self me.state.self) me
+      item
+  + settled
+    : world=foot_tests/world out=row[foot_tests/packet]
+  + settle
+    ' It does what a foot asks, in the same way as the actor that runs the
+    ' foot:
+    ' - It puts what the foot sends in a queue.
+    ' - It makes each write that the foot asks for.
+    ' - It plans each landing on the world as it is, and gives the plan to
+    '   the world as one land command.
+    ' - It tells the foot the answer of the world.
+    ' - It tells the foot that the world moved.
+    \ me=foot_tests/world does=row[mesa_foot/effect]
+    ^ foot_tests/settled
+    = none=row[foot_tests/packet] []
+      landed=maybe[iota] .none
+    % at=foot_tests/world me
+      todo=row[mesa_foot/effect] does
+      out=row[foot_tests/packet] none
+    ^ foot_tests/settled
+    ? !(todo.len) (foot_tests/settled at out)
+    = first todo.at(0)
+      rest todo.drop(1)
+    ? first
+     > (./send to bytes)
+      | _ at rest out.snoc((foot_tests/packet to (mesa_foot/id at.foot.self) bytes))
+     > (./admit request change)
+      = outcome (foot_tests/made change at.state)
+      ? outcome
+       > (./err why)
+        = refused=maybe[iota] (./some why)
+          told (mesa_foot/landed request refused at.state at.foot)
+        | _ (foot_tests/world at.state told.foot) rest.weld(told.does) out
+       > (./ok next)
+        = told (mesa_foot/landed request landed next at.foot)
+          fitted (foot_tests/refit (foot_tests/world next told.foot))
+          moved (mesa_foot/turned next fitted.foot)
+        | _ (foot_tests/world next moved.foot) rest.weld(told.does).weld(moved.does) out
+  + made
+    ' It makes one change that a foot asks for, as the actor that runs the
+    ' foot does.
+    \ change=mesa_foot/change state=namespace
+    ^ either[iota namespace]
+    ? change
+     > (./write target wit)
+      = one=row[[p=path q=writ]] [[target wit]]
+      | eden_store/changes one state
+     > (./land root card epic)
+      ? (net/land root card epic state)
+       > (./err why) (./err why)
+       > (./ok plan) (shared/net_tests/admit root.at(0) plan state)
+  + refit
+    ' It does what the actor does when a card changes. It gives the world a
+    ' foot that knows each peer by the key that the card for that peer now
+    ' holds.
+    \ me=foot_tests/world
+    ^ foot_tests/world
+    = peers
+        | me.foot.peers.map
+          \ item=mesa_foot/peer
+          ^ mesa_foot/peer
+          = card=path [me.state.self 'io 'mesa item.world]
+          | mesa_foot/peer item.world item.id (net/held ['key] card me.state)
+    ? (equal[row[mesa_foot/peer]] peers me.foot.peers) me
+    | foot_tests/world me.state (mesa_foot/start me.state.self me.foot.seed me.foot.rift peers)
+  + took
+    ' It gives a net after one of its worlds took a turn.
+    \ me=foot_tests/world turn=mesa_foot/turn now=foot_tests/net
+    ^ foot_tests/net
+    = done (foot_tests/settle (foot_tests/world me.state turn.foot) turn.does)
+    | now.set_worlds((foot_tests/put done.world now.worlds)).set_wire(now.wire.weld(done.out))
+  + carry
+    ' It carries packets, the oldest packet first, until there are no more
+    ' packets or there is no more fuel. fate tells what occurs to the n-th
+    ' carried packet:
+    ' - 0: the packet arrives.
+    ' - 1: the packet is lost.
+    ' - 2: the packet arrives two times.
+    ' - 3: all the packets behind it go before it.
+    \ fate={\ nat}nat fuel=nat start=foot_tests/net
+    ^ foot_tests/net
+    % left=nat fuel
+      now=foot_tests/net start
+    ^ foot_tests/net
+    ? !(left) now
+    ? !(now.wire.len) now
+    = first now.wire.at(0)
+      rest now.wire.drop(1)
+      what (fate now.carried)
+      counted now.set_carried(now.carried.inc)
+    ? (eq what 1) (_ left.dec counted.set_wire(rest).set_lost(now.lost.inc))
+    ? (eq what 3) (_ left.dec counted.set_wire(rest.snoc(first)))
+    = target (foot_tests/of first.to now.worlds)
+      ;turn (mesa_foot/heard first.from first.bytes target.state target.foot)
+      queue (? (eq what 2) rest.snoc(first) rest)
+    | _ left.dec (foot_tests/took target turn counted.set_wire(queue))
+  + clean
+    \ n=nat
+    ^ nat
+    0
+  + rough
+    ' It gives the fate of a packet from a hash of the packet's number. One
+    ' packet in five is lost. One packet in ten arrives two times. For one
+    ' packet in ten, all the packets behind it go before it. The fates are the
+    ' same in each run. They have no regular rhythm, and thus an exchange
+    ' cannot have the same rhythm as the fates.
+    \ n=nat
+    ^ nat
+    = r (mod (Sha256 (add n (bex 64))) 100)
+    ? (lt r 20) 1
+    ? (lt r 30) 2
+    ? (lt r 40) 3
+    0
+  + write
+    ' It makes a world commit some writes and then tells the foot of that
+    ' world.
+    \ id=nat writes=row[[p=path q=writ]] now=foot_tests/net
+    ^ foot_tests/net
+    = me (foot_tests/of id now.worlds)
+      next (foot_tests/apply writes me.state)
+      moved (foot_tests/world next me.foot)
+    | foot_tests/took moved (mesa_foot/turned next me.foot) now
+  + tick
+    ' It makes time pass for each world.
+    \ time=nat start=foot_tests/net
+    ^ foot_tests/net
+    = ids=row[nat] start.worlds.map((\ item=foot_tests/world (mesa_foot/id item.state.self)))
+    | ids.fold start
+      \ now=foot_tests/net id=nat
+      ^ foot_tests/net
+      = me (foot_tests/of id now.worlds)
+      | foot_tests/took me (mesa_foot/tick time me.state me.foot) now
+  + weather
+    ' It does rounds. In each round, it makes time pass and then carries
+    ' packets. It stops when the wire is quiet for a full round or when there
+    ' are no more rounds.
+    \ fate={\ nat}nat rounds=nat start=foot_tests/net
+    ^ foot_tests/net
+    % round=nat 1
+      now=foot_tests/net start
+    ^ foot_tests/net
+    ? (gt round rounds) now
+    | _ round.inc (foot_tests/carry fate 4000 (foot_tests/tick (mul round 1000) now))
+  + rec
+    \ v=nat
+    ^ myth
+    | myth/sing ['value] (pails/n v)
+  + value
+    \ name=path state=namespace
+    ^ nat
+    | (sovereign_care .x name state).fil.fall(myth/new).nat_at(['value] 0)
+  + state
+    \ id=nat now=foot_tests/net
+    ^ namespace
+    | (foot_tests/of id now.worlds).state
+  + hash
+    \ name=path state=namespace
+    ^ nat
+    ?> (./known records) (namespace/page .x .none name state) 0
+    ?> (./some record) records.fil 0
+    | PinHash record.myth
+  + why
+    \ card=path state=namespace
+    ^ str
+    = record (sovereign_care .x card state).fil.fall(myth/new)
+    ?> (./some held) record.get(['why]) "none"
+    ?> (./some said) (pail/as[pails/q] held) "none"
+    | str/from_atom (iota_show said.q)
+  + boxed
+    ' This is a record's value that holds a pin. The pin is bytes kept apart
+    ' from the record.
+    : held=pin[row[nat]]
+  + coded
+    ' This is a record's value that holds code.
+    : run=pin[{\ nat}nat]
+  + unboxed
+    \ name=path state=namespace
+    ^ nat
+    = record (sovereign_care .x name state).fil.fall(myth/new)
+    ?> (./some held) record.get(['blob]) 0
+    ?> (./some box) (pail/as[foot_tests/boxed] held) 0
+    | (unpin box.held).fold 0 add
+  + pub
+    \ rel=path
+    ^ path
+    = root=path [($x 17) 'our ($x 18)]
+    | root.weld(rel)
+  + open
+    \ rel=path
+    ^ path
+    = root=path [($x 17) 'our 'public]
+    | root.weld(rel)
+  + first
+    ' It gives the first commit of the publisher. The commit makes a root for
+    ' the publisher's peer with a doc and a deep name. It also makes a public
+    ' root with a note.
+    ^ row[[p=path q=writ]]
+    [[(foot_tests/pub []) (writ/make (foot_tests/rec 1))]
+     [(foot_tests/pub ['doc]) (writ/make (foot_tests/rec 10))]
+     [(foot_tests/pub ['a 'b]) (writ/make (foot_tests/rec 20))]
+     [(foot_tests/open []) (writ/make (foot_tests/rec 2))]
+     [(foot_tests/open ['note]) (writ/make (foot_tests/rec 40))]]
+  + crossing
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_deep=path [($x 17) 'our ($x 18) 'a 'b]
+      bob_note=path [($x 17) 'our 'public 'note]
+      bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      carol_doc=path [($x 17) 'our ($x 18) 'doc]
+      carol_note=path [($x 17) 'our 'public 'note]
+      n0 (foot_tests/fresh 0)
+      n1 (foot_tests/write 17 foot_tests/first n0)
+      hints n1.wire.len
+      n2 (foot_tests/carry foot_tests/clean 4000 n1)
+      alice (foot_tests/state 17 n2)
+      bob (foot_tests/state 18 n2)
+      carol (foot_tests/state 19 n2)
+      said (net/said bob_doc bob)
+      held (sovereign_care .x bob_doc bob).fil.fall(myth/new)
+      key (Ed25519PublicKey (foot_tests/seed 17))
+    [(testing/nat "a commit sends a hint for each root that holds something" 3 hints)
+     (testing/nat "nothing is left on the wire" 0 n2.wire.len)
+     (testing/nat "the peer holds the doc" 10 (foot_tests/value bob_doc bob))
+     (testing/nat "and the deep name" 20 (foot_tests/value bob_deep bob))
+     (testing/nat "and what is public" 40 (foot_tests/value bob_note bob))
+     (testing/nat "its card stands at the publisher's head" (net/stamp 0 alice.case(.z (foot_tests/pub [])).fall(0)) (net/held ['head] bob_card bob))
+     (testing/nat "the record is the publisher's own pin, byte for byte" 1 (eq (foot_tests/hash (foot_tests/pub ['doc]) alice) (foot_tests/hash bob_doc bob)))
+     (testing/nat "its statement carries the publisher's signature" 1 (gt said.sig 0))
+     (testing/nat "which anyone holding the key can check against the record" 1 (net/attested key (foot_tests/pub ['doc]) said held))
+     (testing/nat "the third world holds what is public" 40 (foot_tests/value carol_note carol))
+     (testing/nat "and nothing published to the peer" 0 (net/live carol_doc carol))]
+  + gate
+    ' The third world asks the publisher for the peer's root by name.
+    \ _=unit
+    ^ row[testing/check]
+    = n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      alice (foot_tests/of 17 n1.worlds)
+      carol (foot_tests/of 19 n1.worlds)
+      head (net/stamp 0 alice.state.case(.z (foot_tests/pub [])).fall(0))
+      asking (mesa_foot/read_page 17 101 18 0 head 0 carol.state carol.foot)
+      packets asking.does.keep((\ item=mesa_foot/effect ?=((./send _ _) item)))
+      first
+        ?> (./send to bytes) packets.at(0) 0
+        bytes
+      ;refused (mesa_foot/heard 19 first alice.state alice.foot)
+      ;allowed (mesa_foot/heard 18 first alice.state alice.foot)
+    [(testing/nat "the ask leaves the third world" 1 (gt packets.len 0))
+     (testing/nat "asked by the third world, the publisher answers nothing" 0 refused.does.len)
+     (testing/nat "asked by the peer, it answers" 1 (gt allowed.does.len 0))]
+  + changes
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_deep=path [($x 17) 'our ($x 18) 'a 'b]
+      bob_new=path [($x 17) 'our ($x 18) 'c]
+      bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      gone=writ .cull
+      second=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 11))]
+        [(foot_tests/pub ['c]) (writ/make (foot_tests/rec 30))]
+        [(foot_tests/pub ['a 'b]) gone]]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      before (foot_tests/state 18 n1).local.top
+      n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 second n1))
+      bob (foot_tests/state 18 n2)
+      alice (foot_tests/state 17 n2)
+      restarted n2.set_worlds((foot_tests/put (foot_tests/again 0 (foot_tests/of 17 n2.worlds)) (foot_tests/put (foot_tests/again 0 (foot_tests/of 18 n2.worlds)) n2.worlds)))
+      third=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 12))]]
+      n3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 third restarted))
+    [(testing/nat "a change crosses" 11 (foot_tests/value bob_doc bob))
+     (testing/nat "an addition crosses" 30 (foot_tests/value bob_new bob))
+     (testing/nat "a removal crosses" 0 (net/live bob_deep bob))
+     (testing/nat "as one event in the reader" before.inc bob.local.top)
+     (testing/nat "the card follows" (net/stamp 0 alice.case(.z (foot_tests/pub [])).fall(0)) (net/held ['head] bob_card bob))
+     (testing/nat "after both feet restart, the next change still crosses" 12 (foot_tests/value bob_doc (foot_tests/state 18 n3)))]
+  + faults
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_new=path [($x 17) 'our ($x 18) 'c]
+      bob_deep=path [($x 17) 'our ($x 18) 'a 'b]
+      carol_note=path [($x 17) 'our 'public 'note]
+      gone=writ .cull
+      second=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 11))]
+        [(foot_tests/pub ['c]) (writ/make (foot_tests/rec 30))]
+        [(foot_tests/pub ['a 'b]) gone]]
+      third=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 12))]
+        [(foot_tests/open ['note]) (writ/poke (foot_tests/rec 41))]]
+      n1 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n2 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 second n1))
+      n3 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 third n2))
+      n4 (foot_tests/weather foot_tests/rough 40 n3)
+      bob (foot_tests/state 18 n4)
+      alice (foot_tests/state 17 n4)
+      carol (foot_tests/state 19 n4)
+    [(testing/nat "packets were lost" 1 (gt n4.lost 0))
+     (testing/nat "and still the peer ends where the publisher is: the doc" 12 (foot_tests/value bob_doc bob))
+     (testing/nat "the addition" 30 (foot_tests/value bob_new bob))
+     (testing/nat "the removal" 0 (net/live bob_deep bob))
+     (testing/nat "byte for byte" 1 (eq (foot_tests/hash (foot_tests/pub ['doc]) alice) (foot_tests/hash bob_doc bob)))
+     (testing/nat "and the third world what is public" 41 (foot_tests/value carol_note carol))]
+  + values
+    \ _=unit
+    ^ row[testing/check]
+    = bob_blob=path [($x 17) 'our ($x 18) 'blob]
+      bob_code=path [($x 17) 'our ($x 18) 'code]
+      bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      bytes=row[nat] [5 6 7 8]
+      double
+        \ n=nat
+        ^ nat
+        | mul n 2
+      blob=row[[p=path q=writ]] [[(foot_tests/pub ['blob]) (writ/make (myth/sing ['blob] (foot_tests/boxed (pin bytes))))]]
+      code=row[[p=path q=writ]] [[(foot_tests/pub ['code]) (writ/make (myth/sing ['code] (foot_tests/coded (pin double))))]]
+      gone=writ .cull
+      uncode=row[[p=path q=writ]] [[(foot_tests/pub ['code]) gone]
+        [(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 13))]]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 blob n1))
+      held (foot_tests/state 18 n2)
+      n3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 code n2))
+      stuck (foot_tests/state 18 n3)
+      n4 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 uncode n3))
+      freed (foot_tests/state 18 n4)
+    [(testing/nat "a record that holds a pin crosses with it" 26 (foot_tests/unboxed bob_blob held))
+     (testing/nat "and is the publisher's pin" 1 (eq (foot_tests/hash (foot_tests/pub ['blob]) (foot_tests/state 17 n2)) (foot_tests/hash bob_blob held)))
+     (testing/nat "a record that holds code does not land" 0 (net/live bob_code stuck))
+     (testing/text "the card says why" "net_unfit" (foot_tests/why bob_card stuck))
+     (testing/nat "and what the reader held stays" 26 (foot_tests/unboxed bob_blob stuck))
+     (testing/nat "once the publisher takes the code away, its next change lands" 13 (foot_tests/value bob_doc freed))]
+  + keys
+    ' It gives the keys that one foot shares with a peer.
+    \ id=nat foot=mesa_foot/foot
+    ^ mesa_foot/lock
+    | (mesa_foot/lock_of id foot).fall((mesa_foot/lock id 0 0 0))
+  + sealing
+    \ _=unit
+    ^ row[testing/check]
+    = alice (foot_tests/boot 17).foot
+      bob (foot_tests/boot 18).foot
+      carol (foot_tests/boot 19).foot
+      ab (foot_tests/keys 18 alice)
+      ba (foot_tests/keys 17 bob)
+      ca (foot_tests/keys 17 carol)
+      cb (foot_tests/keys 18 carol)
+      name (mesa_foot/name 101 18 0 7)
+      other (mesa_foot/name 101 18 0 8)
+      page (PinBytes (pin (foot_tests/rec 10)))
+      sealed (mesa_foot/wrap ab name page)
+      hash (PinHash (pin (foot_tests/rec 10)))
+    [(testing/nat "two peers derive the same keys, each from its own seed" 1 (and (eq ab.seal ba.seal) (eq ab.name ba.name)))
+     (testing/nat "a third world derives other keys with each of them" 0 (add (eq ca.seal ab.seal) (eq cb.seal ab.seal)))
+     (testing/nat "the peer opens what was sealed for it" 1 (eq page (mesa_foot/unwrap ba name sealed)))
+     (testing/nat "the third world does not" 0 (mesa_foot/unwrap ca name sealed))
+     (testing/nat "nor with its key for the other peer" 0 (mesa_foot/unwrap cb name sealed))
+     (testing/nat "a sealed page is not the page" 0 (eq sealed page))
+     (testing/nat "it is the page, a nonce and a tag" 40 (sub (wid sealed) (wid page)))
+     (testing/nat "under another name it does not open" 0 (mesa_foot/unwrap ba other sealed))
+     (testing/nat "changed by one bit it does not open" 0 (mesa_foot/unwrap ba name (add sealed (bex 250))))
+     (testing/nat "cut short it does not open" 0 (mesa_foot/unwrap ba name (add (mod sealed (bex 80)) (bex 80))))
+     (testing/nat "the same page under the same name seals the same" 1 (eq sealed (mesa_foot/wrap ab name page)))
+     (testing/nat "a pin of a peer's root is asked for by an alias, not its hash" 0 (eq hash (mesa_foot/veil ab.name hash)))
+     (testing/nat "which both peers compute" 1 (eq (mesa_foot/veil ab.name hash) (mesa_foot/veil ba.name hash)))
+     (testing/nat "and the third world cannot" 0 (eq (mesa_foot/veil ca.name hash) (mesa_foot/veil ab.name hash)))
+     (testing/nat "a public pin is asked for by its hash" 1 (eq hash (mesa_foot/veil 0 hash)))]
+  + blob
+    \ name=path state=namespace
+    ^ nat
+    | (sovereign_care .x name state).fil.fall(myth/new).nat_at(['blob] 0)
+  + long
+    ' This test uses a record of two and a half million bytes. That is more
+    ' than Mesa carries as one page. Thus the record crosses in slices, and it
+    ' is sealed.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_big=path [($x 17) 'our ($x 18) 'big]
+      bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      big (add (bex 20000000) 12345)
+      heavy=row[[p=path q=writ]] [[(foot_tests/pub ['big]) (writ/make (myth/sing ['blob] (pails/n big)))]]
+      after=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 14))]]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n2 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 heavy n1))
+      n3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 after n2))
+      alice (foot_tests/state 17 n2)
+      bob (foot_tests/state 18 n2)
+    [(testing/nat "the long record arrives" 1 (eq big (foot_tests/blob bob_big bob)))
+     (testing/nat "as the publisher's own pin" 1 (eq (foot_tests/hash (foot_tests/pub ['big]) alice) (foot_tests/hash bob_big bob)))
+     (testing/nat "it took more packets than a page has fragments" 1 (gt n2.carried 2000))
+     (testing/nat "and what follows it still crosses" 14 (foot_tests/value bob_doc (foot_tests/state 18 n3)))]
+  + many
+    ' This test uses five records that are each too long for one page, in one
+    ' commit. The reader asks for the five at the same time. The publisher
+    ' keeps the bytes of four long pages at most, and makes a page again when
+    ' a reader asks for a slice of a page that it no longer keeps.
+    \ _=unit
+    ^ row[testing/check]
+    = sizes=row[nat] [1 2 3 4 5]
+      big (\ n=nat (add (bex 9700000) n))
+      there
+        \ n=nat
+        ^ path
+        [($x 17) 'our ($x 18) 'big ($u n)]
+      heavy
+        | sizes.map
+          \ n=nat
+          ^ [p=path q=writ]
+          = at=path (foot_tests/pub ['big ($u n)])
+          [at (writ/make (myth/sing ['blob] (pails/n (big n))))]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n2 (foot_tests/weather foot_tests/clean 8 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 heavy n1)))
+      bob (foot_tests/state 18 n2)
+      got (sizes.keep((\ n=nat (eq (big n) (foot_tests/blob (there n) bob))))).len
+    [(testing/nat "each of the five long records arrives" 5 got)]
+  + lost
+    ' It is the fate of each packet while a world is not there.
+    \ n=nat
+    ^ nat
+    1
+  + recovers
+    ' A foot keeps no list of work. After a restart it has the records of its
+    ' world and no other knowledge. In this test the publisher changes a
+    ' record three times while no packet arrives. Then the two feet start
+    ' again. The reader gets what it did not get, from where its card says
+    ' that the root stands.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      doc=path (foot_tests/pub ['doc])
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      stood (net/held ['head] bob_card (foot_tests/state 18 n1))
+      e2=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 11))]]
+      e3=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 12))]]
+      e4=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 13))]]
+      n2 (foot_tests/carry foot_tests/lost 4000 (foot_tests/write 17 e2 n1))
+      n3 (foot_tests/carry foot_tests/lost 4000 (foot_tests/write 17 e3 n2))
+      n4 (foot_tests/carry foot_tests/lost 4000 (foot_tests/write 17 e4 n3))
+      apart (foot_tests/state 18 n4)
+      down n4.set_worlds((foot_tests/put (foot_tests/again 0 (foot_tests/of 17 n4.worlds)) (foot_tests/put (foot_tests/again 0 (foot_tests/of 18 n4.worlds)) n4.worlds)))
+      new (foot_tests/of 18 down.worlds).foot
+      n5 (foot_tests/weather foot_tests/clean 3 down)
+      bob (foot_tests/state 18 n5)
+      alice (foot_tests/state 17 n5)
+      head (net/stamp 0 alice.case(.z (foot_tests/pub [])).fall(0))
+    [(testing/nat "while no packet arrives, the reader holds the first content" 10 (foot_tests/value bob_doc apart))
+     (testing/nat "and its card says where the root stands" stood (net/held ['head] bob_card apart))
+     (testing/nat "the new foot of the reader has no read in progress" 0 new.asks.len)
+     (testing/nat "no epic in parts" 0 new.loads.len)
+     (testing/nat "and no landing in progress" 0 new.lands.len)
+     (testing/nat "after time passes, the reader holds the last content" 13 (foot_tests/value bob_doc bob))
+     (testing/nat "the card stands at the head of the publisher" head (net/held ['head] bob_card bob))
+     (testing/nat "the record has two cases in the store that the reader keeps for the publisher" 2 bob.case(.x bob_doc).fall(0))
+     (testing/nat "and the statement names the fourth version of the publisher" (net/stamp 0 alice.case(.x doc).fall(0)) (net/version bob_doc bob))]
+  + unanswered
+    ' A reader commits a landing and stops before its foot gets the answer.
+    ' The record and where the root stands were one admission, and thus the
+    ' new foot finds the two together. The publisher offers the same version
+    ' again, and the reader does not land it a second time.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      doc=path (foot_tests/pub ['doc])
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      e2=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 11))]]
+      n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 e2 n1))
+      landed (foot_tests/state 18 n2)
+      down n2.set_worlds((foot_tests/put (foot_tests/again 0 (foot_tests/of 17 n2.worlds)) (foot_tests/put (foot_tests/again 0 (foot_tests/of 18 n2.worlds)) n2.worlds)))
+      n3 (foot_tests/weather foot_tests/clean 3 down)
+      n4 (foot_tests/weather (\ n=nat 2) 3 n3)
+      bob (foot_tests/state 18 n4)
+      alice (foot_tests/state 17 n4)
+      head (net/stamp 0 alice.case(.z (foot_tests/pub [])).fall(0))
+    [(testing/nat "the reader committed the second version" 11 (foot_tests/value bob_doc landed))
+     (testing/nat "and where the root stands, in that admission" head (net/held ['head] bob_card landed))
+     (testing/nat "after the restart the publisher offers again: the record keeps its case" landed.case(.x bob_doc).fall(0) bob.case(.x bob_doc).fall(0))
+     (testing/nat "the statement keeps its case" landed.case(.x (net/note ($x 18) bob_doc)).fall(0) bob.case(.x (net/note ($x 18) bob_doc)).fall(0))
+     (testing/nat "the root stands where it stood" head (net/held ['head] bob_card bob))
+     (testing/nat "and no landing is in progress" 0 (foot_tests/of 18 n4.worlds).foot.lands.len)]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "a first commit crosses between three worlds" foot_tests/crossing)
+   (testing/case "a peer's root is served to that peer only" foot_tests/gate)
+   (testing/case "changes, removals and restarts cross" foot_tests/changes)
+   (testing/case "after a restart, a foot gets what it did not get, from its records only" foot_tests/recovers)
+   (testing/case "a landing whose answer the foot did not get is not landed again" foot_tests/unanswered)
+   (testing/case "loss, duplication and reordering" foot_tests/faults)
+   (testing/case "values that hold pins cross; values that hold code do not" foot_tests/values)
+   (testing/case "what is published to a peer is sealed for that peer" foot_tests/sealing)
+   (testing/case "a page longer than Mesa carries crosses in slices" foot_tests/long)
+   (testing/case "more long pages than the foot keeps cross at one time" foot_tests/many)]

@@ -26,6 +26,7 @@
 (#bind shrine-brand (#module shrine-brand))
 (#bind cairn (#module cairn))
 (#bind contexts (#module foil-context))
+(#bind mesa (#module mesa))
 
 
 ;;; Built-in Foil environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -219,6 +220,13 @@
   (core:quantify ["t"] (nt:tfun [nt:tpail] (maybe-of (nt:type-var "t")))))
 (define (pail-as-unspecialized p)
   (error "pail/as must be specialized: pail/as[t]"))
+;; fit[t] is a checked cast from any value, and it is specialized in the same
+;; way as pail/as. (elab-fit in foil-new-elab compiles the description of t
+;; into the cast.)
+(define fit-ty
+  (core:quantify ["t"] (nt:tfun [nt:tany] (maybe-of (nt:type-var "t")))))
+(define (fit-unspecialized v)
+  (error "fit must be specialized: fit[t]"))
 
 (define/typed typed-add (-> (Nat Nat) Nat) Add)
 (define/typed typed-pin (All (a) (-> (a) (Pin a))) Pin)
@@ -387,6 +395,9 @@
 
 (define (maybe-some x) (maybe-some-brand x))
 (define maybe-none maybe-none-brand)
+(define (foil-pin-from stream)
+  (let ((found (PinFrom stream)))
+    (If (IsPin found) (maybe-some found) maybe-none)))
 
 (define (decode-brand value)
   (define result (shrine-brand:decode-path value))
@@ -412,6 +423,24 @@
 (define iota-ref (nt:type-ref ["iota"]))
 (define nat-ref (nt:type-ref ["nat"]))
 (define (maybe-nt t) (nt:type-app ["maybe"] [(nt:type-arg t)]))
+(define pin-nat-ty
+  (core:quantify ["a"]
+    (nt:tfun [(nt:tpin (nt:type-var "a"))] (nt:tnat 0))))
+(define nat-pin-ty
+  (core:quantify ["a"]
+    (nt:tfun [(nt:tnat 0)] (maybe-nt (nt:tpin (nt:type-var "a"))))))
+(define pin-parts-ty
+  (core:quantify ["a"]
+    (nt:tfun [(nt:tpin (nt:type-var "a"))] (nt:tarr (nt:tpin nt:tany)))))
+(define nat-nats-ty (nt:tfun [(nt:tnat 0)] (nt:tarr (nt:tnat 0))))
+;; These definitions are for the Mesa bridge (src/reaver/mesa.rvr). An engine
+;; is a live handle, and its type is nat, as for each handle. Packets, pages
+;; and names are bars. What an engine asks of its host comes back as rows of
+;; nats.
+(define nats-ty (nt:tarr (nt:tnat 0)))
+(define mesa-acts-ty (nt:tarr nats-ty))
+(define (nats-fun n result)
+  (nt:tfun (gen n (lambda (i) (nt:tnat 0))) result))
 (define str-cat-ty (nt:tfun [str-ref str-ref] str-ref))
 (define str-slice-ty (nt:tfun [str-ref nat-ref nat-ref] str-ref))
 (define str-len-ty (nt:tfun [str-ref] nat-ref))
@@ -552,6 +581,64 @@
     (insert-ffi ["Trace"] Trace sequence-ty)
     (insert-ffi ["ZoneStart"] ZoneStart path-io-ty)
     (insert-ffi ["ZoneEnd"] ZoneEnd unary-nat-ty)
+    ;; The operations below are for pins as values, and for the runtime's
+    ;; deterministic hashes and signatures. Bytes are bars. PinFrom answers
+    ;; none for each of these streams:
+    ;; - a stream that is not canonical
+    ;; - a stream that names a pin that this store does not have
+    ;; - a stream that holds a law
+    ;;
+    ;; The type of the value that PinFrom does answer is the claim of the
+    ;; caller. Do a check of the value before you trust it.
+    (insert-ffi ["PinHash"] PinHash pin-nat-ty)
+    (insert-ffi ["PinBytes"] PinBytes pin-nat-ty)
+    (insert-ffi ["PinFrom"] foil-pin-from nat-pin-ty)
+    ;; These operations give the pins that a stream names, by hash, and the
+    ;; pins that a pin holds. A reader must get these pins before PinFrom can
+    ;; answer, and a publisher must give them.
+    (insert-ffi ["PinNames"] PinNames nat-nats-ty)
+    (insert-ffi ["PinParts"] PinParts pin-parts-ty)
+    ;; These operations give one connection out and one connection in. The
+    ;; connection out sends all the bytes and then closes. Its answer is 1, or
+    ;; 0 when it was not possible to make the connection or the connection
+    ;; broke. The answer of the connection in is all that the connection sends
+    ;; before it closes, or 0. The two operations do not raise.
+    (insert-ffi ["SendTo"] SendTo
+      (nt:tfun [(nt:tnat 0) (nt:type-ref ["str"]) (nt:tnat 0) (nt:tnat 0)]
+        (nt:tnat 0)))
+    (insert-ffi ["ReadAll"] ReadAll binary-nat-ty)
+    (insert-ffi ["MesaEngine"] mesa:engine
+      (nt:tfun [(nt:tnat 0) (nt:tnat 0) nats-ty nats-ty nats-ty (nt:tarr nats-ty)]
+        (nt:tnat 0)))
+    (insert-ffi ["MesaRead"] mesa:read (nats-fun 4 mesa-acts-ty))
+    (insert-ffi ["MesaBind"] mesa:bind (nats-fun 3 mesa-acts-ty))
+    (insert-ffi ["MesaReceive"] mesa:receive (nats-fun 4 mesa-acts-ty))
+    (insert-ffi ["MesaAdvance"] mesa:advance (nats-fun 2 mesa-acts-ty))
+    (insert-ffi ["MesaLook"] mesa:look
+      (nt:tfun [(nt:tnat 0) nats-ty] nats-ty))
+    (insert-ffi ["MesaHint"] mesa:hint
+      (nt:tfun [(nt:tnat 0) (nt:tnat 0) (nt:tnat 0) (nt:tnat 0) (nt:tnat 0)
+                (nt:tnat 0) nats-ty]
+        (nt:tnat 0)))
+    (insert-ffi ["Sha256"] Sha256 unary-nat-ty)
+    (insert-ffi ["Blake3Keyed"] Blake3Keyed binary-nat-ty)
+    ;; These operations give the key that two worlds share, and they seal
+    ;; under that key with a name bound in. (The key comes from the seed of
+    ;; one world and the public key of the other world.) They answer 0 for an
+    ;; incorrect argument or for a seal that is not valid.
+    (insert-ffi ["BoxKey"] BoxKey binary-nat-ty)
+    (insert-ffi ["SecretSeal"] SecretSeal quaternary-nat-ty)
+    (insert-ffi ["SecretOpen"] SecretOpen quaternary-nat-ty)
+    ;; These operations give bytes from the operating system, and a folder in
+    ;; the file root.
+    (insert-ffi ["Entropy"] Entropy unary-nat-ty)
+    (insert-ffi ["Folder"] Folder
+      (nt:tfun [(nt:type-ref ["str"])] (nt:tnat 0)))
+    (insert-ffi ["Blake3"] Blake3 unary-nat-ty)
+    (insert-ffi ["Ed25519PublicKey"] Ed25519PublicKey unary-nat-ty)
+    (insert-ffi ["Ed25519Sign"] Ed25519Sign binary-nat-ty)
+    (insert-ffi ["Ed25519Verify"] Ed25519Verify
+      (nt:tfun [(nt:tnat 0) (nt:tnat 0) (nt:tnat 0)] (nt:tnat 0)))
     (insert-ffi ["eq"] Eq eq-ty)
     ;; PLAN Eq is intentionally shallow on structured values.  Namespace
     ;; version deduplication needs extensional equality of whole myths, so
@@ -663,6 +750,7 @@
     (insert-ffi ["maybe" "is_some"] maybe-is-some maybe-test-ty)
     (insert-ffi ["maybe" "is_none"] maybe-is-none maybe-test-ty)
     (insert-ffi ["pail" "as"] pail-as-unspecialized pail-as-ty)
+    (insert-ffi ["fit"] fit-unspecialized fit-ty)
     ;; text: the aura-preserving primitives (stage-1 types)
     (insert-ffi ["str" "cat"] str-cat str-cat-ty)
     (insert-ffi ["str" "slice"] str-slice str-slice-ty)
@@ -707,7 +795,7 @@
   (define option-functions
     [["brand_decode"] ["nat" "parse"] ["iota" "text"]
      ["str" "sym"] ["path_parse"]
-     ["rex" "shape_kind"] ["rex" "shape_error"]])
+     ["rex" "shape_kind"] ["rex" "shape_error"] ["PinFrom"]])
   (define (install sut pair)
     (define name (_0 pair))
     (define tc (core:subject-entry-tc (_1 pair)))

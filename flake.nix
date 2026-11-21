@@ -4,8 +4,10 @@
     url = "github:liam-fitzgerald/rex/lf/remove-quip-poems";
     flake = false;
   };
+  # Liam's wormholes branch (enki PR #59): actor and Mesa handles are host capabilities, and
+  # libmesa is in the runtime as opset-83 operations.
   inputs.enki = {
-    url = "github:axsys-org/enki/main";
+    url = "github:axsys-org/enki/lf/wormholes";
   };
   outputs = { self, nixpkgs, rex, enki }:
     let
@@ -16,11 +18,15 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+      # the world runtime: enki's wormholes branch as pinned. It holds what the kernel's networking needs
+      # of the runtime: SeqHost, pins as values, sockets that answer, sealing, Entropy and Folder.
+      runtimeFor = system: enki.packages.${system}.default;
     in {
+      packages = forAllSystems (system: { runtime = runtimeFor system; });
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = runtimeFor system;
           edenTools = [ enkiPkg pkgs.python3 pkgs.lsof ];
 
           hsPkgs = pkgs.haskellPackages.override {
@@ -52,7 +58,7 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = runtimeFor system;
         in {
           default = pkgs.runCommand "reaver-tests" {
             nativeBuildInputs = [ enkiPkg pkgs.python3 ];

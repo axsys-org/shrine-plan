@@ -235,6 +235,24 @@ For a generic record use `box/try_from_pail[nat]`. Like `pail/as[T]`,
 this checks nominal identity and arity; generic arguments are erased.
 The helper name is reserved within a record declaration.
 
+`fit[T] : {\ any}maybe[T]` is the checked cast for a value that came from
+outside the world. It returns `.some` only when the value's whole
+representation is that of `T`: every field of every record, every element
+of every row, every case of every union, through pins, to the last nat. A
+function type never fits. A `pail` position fits any branded value and is
+not looked into: what a pail holds is checked where it is read, with
+`pail/as[T]` and then `fit[T]`. `T` must be fully given (`fit[myth]`,
+`fit[row[path]]`, `fit[[a=nat b=row[path]]]`). The type is walked once, at
+compile time. Use it on anything rebuilt with `PinFrom`.
+
+Pins as values: `PinHash pin` is the pin's content hash (a 32-byte bar),
+`PinBytes pin` its canonical stream (`Sha256` of it is the hash), `PinFrom
+stream` rebuilds the pin as `maybe[pin[T]]` and answers `.none` for a
+stream that is not canonical, names a pin this store lacks, or holds code.
+`PinNames stream` lists the hashes a stream names and `PinParts pin` the
+pins a pin holds. The type of what `PinFrom` answers is the caller's
+claim; `fit` is the check.
+
 Updates are functional and return a new row. `.#` and `.%` parse but are not
 implemented; always use `set_<field>` and `over_<field>`.
 
@@ -872,8 +890,13 @@ The raw builtins retain their runtime spellings:
 - `CloseHandle : {\ nat}nat` drops a local actor handle; it does not
   stop the target actor.
 
-Use explicit demand to sequence these operations. A handle number inside
-the message is just data: transfer capabilities through `SendCaps` and use
+Use explicit demand to sequence these operations. A handle is a host
+capability (a wormhole), not a number, although these signatures still spell
+it `nat`: it has no normal form, so never compare, show, save or deep-force
+one, never put one in a message, and never bind one at Reaver top level.
+Demand it with `;`, pass it to `Send`, `SendCaps` or `CloseHandle`, or keep
+it in a record that stays in the actor's own state. Literal `0` still names
+the current actor. Transfer capabilities through `SendCaps` and use
 the recipient-local handles returned by `Recv`. The chosen message type
 is trusted, not checked by the transport; it must match the foot's protocol.
 `Save` changes
@@ -890,7 +913,9 @@ when the original function body is entered, not when partially applied.
 A tall `; expr` sequences that demand before the following body, and a
 final `;expr` demands and returns the result. Branches and unused lazy
 initializers keep their own evaluation boundaries. Demand uses runtime
-`Seq`, so a row's fields remain lazy. Existing block-mode argument
+`SeqHost`, which evaluates to weak head normal form or to a host capability,
+so a row's fields remain lazy and a demanded `Spawn` happens at once. The
+explicit `Seq` builtin still rejects a capability. Existing block-mode argument
 separators retain their meaning.
 
 The final codegen let is `L now value body` (0 lazy, 1 strict). `TC_DEMAND`

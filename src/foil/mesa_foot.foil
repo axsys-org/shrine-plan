@@ -1,0 +1,1008 @@
+- net
+
+' This is the foot at /io/mesa, the one place where a world connects to Mesa.
+' The foot holds the engine of the world and the key that the world signs
+' with. The engine and the key are not records. The foot keeps no data that a
+' restart cannot make again. The first time that a reader asks for a page, the
+' foot derives that page from the history of its world. What a world holds of
+' another world is in the store that it keeps for that world, and in its own
+' records beside the card of that world.
+'
+' These are the rules of the foot. The rules are steps that use the state of
+' the foot and the state of the world. The actor that owns the socket runs the
+' rules and asks the world to make each change that the rules ask for.
+'
+' A page is the sequence of bytes that Mesa binds to one name and sends as
+' fragments. The foot binds one page for each epic, for each pin, and for
+' each slice of a page that is too long (mesa_foot/bind).
+'
+' An audience is the reader that a published root is for. A world publishes
+' one root to each peer, /<self>/our/<peer>, and one root to all the peers
+' that it knows, /<self>/our/public. The audience of a page from the root of
+' a peer is the number of that peer. The audience of a page from the public
+' root is 0. The function mesa_foot/mine gives the root of an audience, and
+' the key that seals a page comes from the audience (mesa_foot/lock_of).
+'
+' The name of a page is publ/<kind>|<audience>|<x>|<y>. The audience is the
+' number of the world that a root is published to, or 0 for the public root.
+'   e|aud|base|head   an epic of that root from version base (0: from
+'                     no version) to version head, without its records
+'   p|aud|head|hash   the pin with that hash, shown in the epic at head
+'   s|aud|page|n      slice n of a page too long for Mesa to send as one
+'   h|aud|0|head      not a page: the name in a hint. It gives the version
+'                     of a root
+' A version is a stamp (net/stamp). Thus a name refers to the same content at
+' all times, and a page does not change after the foot binds it.
+'
+' A world seals for one peer all that it publishes to that peer. The two
+' worlds share a key that each world derives from its own seed and the public
+' key of the other world. The world seals a page of a peer's root with that
+' key and binds the page to its name. A reader asks for a pin of that root by
+' a keyed alias of the hash of the pin. Thus a watcher of the wire does not
+' learn a record, and does not learn if it guessed a record correctly.
+'
+' A world sends public content as it is. Mesa signs each page, sealed or not
+' sealed.
++ mesa_foot
+  + limits
+    ' These are the sizes of a packet, a name and a fragment: the defaults of
+    ' Mesa. The signed-public profile sets a fragment to 1 KiB and a page to
+    ' 1024 fragments. Thus a longer name is possible only with a larger
+    ' packet. A larger value thus goes as pins, and each pin is one page at
+    ' most.
+    ^ row[nat]
+    [1472 256 1024]
+  + domain
+    ' This is the domain that each name is in, for now. In Mesa, the domain of
+    ' a name is a part of the identity of the name. This domain is a
+    ' placeholder until worlds have names in a real domain.
+    ^ nat
+    | mesa_foot/tag "gw-btc"
+  + realm
+    ' This is what the foot tells the engine about each world: the domain,
+    ' life 1 and rift 0. The life and the rift of Mesa are not used. The rift
+    ' of a world is in each stamp (net/stamp), and the rules examine each
+    ' stamp. An engine holds no durable data and is made again each time the
+    ' key of a peer changes. Thus an engine does not see a second life.
+    ^ row[nat]
+    [mesa_foot/domain 1 0]
+  + bounds
+    ' This row has the bounds of the engine, with the names that Mesa gives
+    ' them: max_bindings, max_binding_bytes, max_reassembly_bytes and
+    ' max_reads. These bounds are larger than their defaults, and those
+    ' defaults are for a small number of pages. Then the row has the retry
+    ' policy of Mesa, at its defaults: retry_after, read_timeout and
+    ' max_attempts. The values retry_after and read_timeout are in
+    ' milliseconds, the unit that the foot uses when it moves the engine
+    ' forward. An engine holds 64 MiB of bound pages, the maximum that the
+    ' bridge lets it hold. After that, the foot starts a new engine.
+    ^ row[nat]
+    [65536 67108864 67108864 1024 100 2000 4]
+  + most_read
+    ' This is the maximum number of bytes that the wire accepts from one
+    ' connection.
+    ^ nat
+    16777216
+  + acceptors
+    ' This is the number of connections that the wire accepts at the same
+    ' time.
+    ^ nat
+    4
+  + every
+    ' This is the number of beats of the wire's clock between two times that
+    ' the foot tells its peers the versions that it has (tick). The clock has
+    ' one beat each second.
+    ^ nat
+    15
+  + name
+    ' This function gives the name of a page in the signed-public space of
+    ' Mesa: publ/<kind>|<a>|<b>|<c>. The name has one letter and three
+    ' numbers. The place where each kind is used tells what the letter and the
+    ' numbers mean.
+    \ kind=nat a=nat b=nat c=nat
+    ^ nat
+    | mesa_foot/tag (str/to_atom (str/cat_all ["publ/" (str/from_atom kind) "|" (nat/show a) "|" (nat/show b) "|" (nat/show c)]))
+  + parse
+    ' This function gives [kind a b c] from the name of a page. It gives no
+    ' parts when the input is not the name of a page.
+    \ named=nat
+    ^ row[nat]
+    = none=row[nat] []
+    ? (lt (wid named) 9) none
+    = text (str/from_atom (mod named (bex (mul 8 (dec (wid named))))))
+      parts (str/split_byte 124 text)
+    ? !(eq parts.len 4) none
+    = head parts.at(0)
+    ? !(eq head.len 6) none
+    ? !(eq (str/slice 0 5 head) "publ/") none
+    ?> (./some a) (nat/parse parts.at(1)) none
+    ?> (./some b) (nat/parse parts.at(2)) none
+    ?> (./some c) (nat/parse parts.at(3)) none
+    [head.at(5) a b c]
+  + most
+    ' These are the maximum number of streams that one epic can make a reader
+    ' get, and the maximum number of bytes.
+    ^ nat
+    65536
+  + room
+    ^ nat
+    268435456
+  + page
+    ' This is the maximum number of bytes that the foot sends as one page. It
+    ' is below the 1 MiB limit of Mesa, and that gives space for a seal.
+    ^ nat
+    1000000
+  + most_bytes
+    ' This is the maximum number of bytes that one page can have, in slices.
+    ^ nat
+    67108864
+  + peer
+    ' This is a world that this world corresponds with. It holds the name of
+    ' that world, the number that Mesa knows it by, and the key that it signs
+    ' with.
+    : world=iota id=nat key=nat
+  + ask
+    ' This is a page that the foot asked for and that still has no answer. It
+    ' holds the peer that the foot asked and the parts of the name of the
+    ' page. The field want is the content hash that the bytes of a pin must
+    ' have. The name contains only an alias of that hash.
+    : request=nat from=nat kind=nat aud=nat a=nat b=nat want=nat
+  + stream
+    ' These are the bytes of a pin as they came. The foot did a check of the
+    ' bytes against the hash that named them.
+    : hash=nat bytes=nat
+  + load
+    ' This is an epic of the root of one publisher while the foot gathers it.
+    ' It holds:
+    ' - the streams that came for the epic
+    ' - the hashes that the foot asked for and that still have no answer
+    ' - the hashes that the foot must still ask for
+    '
+    ' The foot asks for only a window of these hashes at one time.
+    : from=nat aud=nat epic=net/epic streams=row[mesa_foot/stream] wanted=row[nat] queued=row[nat] size=nat
+  + lock
+    ' This is what this world shares with one peer. It holds a key to seal
+    ' with, a key to make nonces from, and a key to make aliases of names
+    ' with. All these keys are zero when the key of the peer is not a key.
+    : id=nat seal=nat nonce=nat name=nat
+  + long
+    ' This is a page that comes in slices. It holds the ask that the page is
+    ' the answer to, the length of the page, and the slices that came until
+    ' now.
+    : ask=mesa_foot/ask mark=nat total=nat count=nat asked=nat got=row[mesa_foot/stream]
+  + window
+    ' This is the maximum number of pages of one epic that the foot asks for
+    ' at one time.
+    ^ nat
+    16
+  + shown
+    ' This is a pin that this world showed to an audience in an epic that it
+    ' supplied.
+    : bytes=nat
+  + landing
+    ' This is a landing that the foot asked the world to admit.
+    : request=nat from=nat aud=nat head=nat
+  + change
+    ' This is one change that the foot asks the world to make.
+    & mesa_foot/change/land
+      mesa_foot/change/write
+    + land
+      ' Land this epic of this root of a peer (net/land). The card is where
+      ' this world keeps where the root stands.
+      : root=path card=path epic=net/epic
+    + write
+      ' Make this one write to a record of this world.
+      : target=path change=writ
+  + effect
+    ' This is what the foot asks the actor that runs it to do.
+    & mesa_foot/effect/send
+      mesa_foot/effect/admit
+    + send
+      : to=nat packet=nat
+    + admit
+      ' This asks the world to make a change. The request is the number that
+      ' the foot knows the answer by (0: the foot waits for no answer).
+      : request=nat change=mesa_foot/change
+  + foot
+    : self=iota seed=nat rift=nat engine=nat peers=row[mesa_foot/peer] next=nat
+      asks=row[mesa_foot/ask] loads=row[mesa_foot/load]
+      lands=row[mesa_foot/landing]
+      bound=mop[path nat lt_pith] shown=mop[path mesa_foot/shown lt_pith]
+      told=mop[path nat lt_pith]
+      locks=row[mesa_foot/lock] kept=mop[path nat lt_pith] longs=row[mesa_foot/long]
+      whence=mop[path nat lt_pith]
+  + turn
+    ' This is what a step gives: the foot, and what the foot asks the actor to
+    ' do.
+    : foot=mesa_foot/foot does=row[mesa_foot/effect]
+  + id
+    ' This function gives the number that Mesa knows a world by.
+    \ world=iota
+    ^ nat
+    | quip_val world
+  + start
+    ' This function makes a foot for a world. The engine of the foot knows the
+    ' key of each peer. This set of keys does not change for the life of the
+    ' engine. Thus a new peer makes a new foot necessary. A new foot has no
+    ' cost, because an engine holds no durable data.
+    \ self=iota seed=nat rift=nat peers=row[mesa_foot/peer]
+    ^ mesa_foot/foot
+    = others=row[row[nat]]
+        | peers.map
+          \ item=mesa_foot/peer
+          ^ row[nat]
+          [item.id item.key]
+      ;engine (MesaEngine (mesa_foot/id self) seed mesa_foot/realm mesa_foot/limits mesa_foot/bounds others)
+      asks=row[mesa_foot/ask] []
+      loads=row[mesa_foot/load] []
+      lands=row[mesa_foot/landing] []
+      bound=mop[path nat lt_pith] (mop/empty)
+      shown=mop[path mesa_foot/shown lt_pith] (mop/empty)
+      told=mop[path nat lt_pith] (mop/empty)
+      kept=mop[path nat lt_pith] (mop/empty)
+      longs=row[mesa_foot/long] []
+      whence=mop[path nat lt_pith] (mop/empty)
+      locks
+        | peers.map
+          \ item=mesa_foot/peer
+          ^ mesa_foot/lock
+          = shared (BoxKey seed item.key)
+          ? (eq 0 shared) (mesa_foot/lock item.id 0 0 0)
+          | mesa_foot/lock item.id (Blake3Keyed shared (mesa_foot/tag "seal")) (Blake3Keyed shared (mesa_foot/tag "nonce")) (Blake3Keyed shared (mesa_foot/tag "name"))
+    | mesa_foot/foot self seed rift engine peers 1 asks loads lands bound shown told locks kept longs whence
+  + tag
+    ' This function gives a word as bytes.
+    \ text=nat
+    ^ nat
+    | add text (bex (mul 8 (wid text)))
+  + lock_of
+    ' This function gives the keys that this world shares with a peer. It
+    ' gives none when there are no keys to use.
+    \ id=nat foot=mesa_foot/foot
+    ^ maybe[mesa_foot/lock]
+    = none=maybe[mesa_foot/lock] .none
+      found foot.locks.keep((\ item=mesa_foot/lock (eq item.id id)))
+    ? !(found.len) none
+    ? (eq 0 found.at(0).seal) none
+    | ./some found.at(0)
+  + veil
+    ' This function gives the number that a reader uses to ask for a pin. For
+    ' a public root, the number is the hash of the pin. For a peer's root, the
+    ' number is a keyed alias of that hash.
+    \ name=nat hash=nat
+    ^ nat
+    ? (eq 0 name) hash
+    | Blake3Keyed name hash
+  + hashlike
+    ' This function tells if a number has the form of a content hash: 32
+    ' bytes.
+    \ h=nat
+    ^ bool
+    ? !(eq 33 (wid h)) .false
+    | eq 1 (load8 32 h)
+  + wrap
+    ' This function gives a page that is sealed for a peer and bound to its
+    ' name. It makes the nonce from the page and the name of the page, with a
+    ' key that is for the nonce only. Thus the same page under the same name
+    ' gives the same bytes. Thus also, the function does not use one nonce for
+    ' two contents.
+    \ with=mesa_foot/lock spelled=nat page=nat
+    ^ nat
+    = made (Blake3Keyed (Blake3Keyed with.nonce (Sha256 page)) spelled)
+      raw (mod made (bex 192))
+      sealed (SecretSeal with.seal (add raw (bex 192)) spelled page)
+    | add raw (lsh sealed 192)
+  + unwrap
+    ' This function gives the page that is in sealed bytes. It gives 0 when
+    ' this peer did not seal the bytes, when the seal is not for this name, or
+    ' when the bytes were changed.
+    \ with=mesa_foot/lock spelled=nat bytes=nat
+    ^ nat
+    ? (lt (wid bytes) 42) 0
+    | SecretOpen with.seal (add (mod bytes (bex 192)) (bex 192)) spelled (rsh bytes 192)
+  + renew
+    ' This function gives the same foot with a new engine. The foot does this
+    ' when the engine has no budget left for bound pages. The new foot derives
+    ' a bound page again when a reader next asks for that page. The foot
+    ' discards the reads that are in progress, and a later hint starts them
+    ' again.
+    \ foot=mesa_foot/foot
+    ^ mesa_foot/foot
+    = fresh (mesa_foot/start foot.self foot.seed foot.rift foot.peers)
+    | fresh.set_next(foot.next).set_lands(foot.lands).set_shown(foot.shown).set_told(foot.told).set_kept(foot.kept)
+  + quiet
+    \ foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = none=row[mesa_foot/effect] []
+    | mesa_foot/turn foot none
+  + peer_of
+    \ id=nat foot=mesa_foot/foot
+    ^ maybe[mesa_foot/peer]
+    = none=maybe[mesa_foot/peer] .none
+      found foot.peers.keep((\ item=mesa_foot/peer (eq item.id id)))
+    ? !(found.len) none
+    | ./some found.at(0)
+  + link
+    ' This function gives the number that Mesa knows the link of a peer by.
+    ' The number is the place of the peer among the peers.
+    \ id=nat foot=mesa_foot/foot
+    ^ nat
+    % i=nat 0
+    ^ nat
+    ? (ge i foot.peers.len) 0
+    ? (eq foot.peers.at(i).id id) i.inc
+    | _ i.inc
+  + mine
+    ' This function gives the root that this world publishes to an audience.
+    \ aud=nat foot=mesa_foot/foot
+    ^ maybe[path]
+    = none=maybe[path] .none
+      public=path [foot.self 'our 'public]
+    ? (eq aud 0) (./some public)
+    ?> (./some item) (mesa_foot/peer_of aud foot) none
+    = pairwise=path [foot.self 'our item.world]
+    | ./some pairwise
+  + theirs
+    ' This function gives the root of a publisher as the publisher spells it.
+    ' This is the root for this world, or the public root of the publisher.
+    \ from=mesa_foot/peer public=bool foot=mesa_foot/foot
+    ^ path
+    = open=path [from.world 'our 'public]
+      pairwise=path [from.world 'our foot.self]
+    ? public open
+    pairwise
+  + card
+    ' This function gives the path where this world keeps where a root of a
+    ' publisher stands. The path is below the card of the publisher and is
+    ' not the card. The card says who the publisher is and where it is
+    ' reached, and the one that decides that writes it. The foot writes only
+    ' where the roots stand.
+    \ from=mesa_foot/peer public=bool foot=mesa_foot/foot
+    ^ path
+    = pairwise=path [foot.self 'io 'mesa from.world 'stand]
+      open=path [foot.self 'io 'mesa from.world 'public]
+    ? public open
+    pairwise
+  + head
+    ' For a root that this world publishes, this function gives the version
+    ' that the root is at. It gives 0 while the root holds no record.
+    \ root=path state=namespace foot=mesa_foot/foot
+    ^ nat
+    = case state.case(.z root).fall(0)
+    ? (eq 0 case) 0
+    | net/stamp foot.rift case
+  + sends
+    ' This function gives what an engine asks the foot to send.
+    \ acts=row[row[nat]]
+    ^ row[mesa_foot/effect]
+    = none=row[mesa_foot/effect] []
+    | acts.fold none
+      \ out=row[mesa_foot/effect] act=row[nat]
+      ^ row[mesa_foot/effect]
+      ? !(eq 1 act.at(0)) out
+      | out.snoc((mesa_foot/effect/send act.at(1) act.at(3)))
+  + after
+    ' This function does one turn and then the next turn, and gives the two as
+    ' one turn.
+    \ first=mesa_foot/turn next={\ mesa_foot/foot}mesa_foot/turn
+    ^ mesa_foot/turn
+    = second (next first.foot)
+    | mesa_foot/turn second.foot first.does.weld(second.does)
+  + epic
+    ' This function gives the change of a root between two of its versions,
+    ' when this world can give that change exactly. This is possible when the
+    ' two versions are of this continuity and are in the history of this
+    ' world.
+    \ root=path base=nat head=nat state=namespace foot=mesa_foot/foot
+    ^ maybe[net/epic]
+    = w32 4294967296
+      none=maybe[net/epic] .none
+    ? !(eq (div head w32) foot.rift) none
+    ? !((eq base 0) || (eq (div base w32) foot.rift)) none
+    | net/delta foot.rift root (mod base w32) (mod head w32) state
+  + spot
+    \ aud=nat hash=nat
+    ^ path
+    [($u aud) ($u hash)]
+  + parts
+    ' This function gives a pin and each pin below it, as this world shows
+    ' them to an audience. Each pin is under the number that a reader uses to
+    ' ask for it.
+    \ aud=nat name=nat top=pin[any] out=mop[path mesa_foot/shown lt_pith]
+    ^ mop[path mesa_foot/shown lt_pith]
+    = at (mesa_foot/spot aud (mesa_foot/veil name (PinHash top)))
+    ? out.has(at) out
+    = kept out.put(at (mesa_foot/shown (PinBytes top)))
+      inner=row[pin[any]] (PinParts top)
+    | inner.fold kept
+      \ acc=mop[path mesa_foot/shown lt_pith] part=pin[any]
+      ^ mop[path mesa_foot/shown lt_pith]
+      | mesa_foot/parts aud name part acc
+  + show
+    ' This function keeps what an epic shows to its audience: each record that
+    ' the epic names, and the pins that those records hold. The result is a
+    ' cache. The foot derives again all that is not in the cache, from the
+    ' head that a name contains.
+    \ aud=nat name=nat epic=net/epic out=mop[path mesa_foot/shown lt_pith]
+    ^ mop[path mesa_foot/shown lt_pith]
+    = fresh=mop[path mesa_foot/shown lt_pith] (mop/empty)
+      room (? (gt out.size 16384) fresh out)
+    | epic.entries.fold room
+      \ acc=mop[path mesa_foot/shown lt_pith] item=net/entry
+      ^ mop[path mesa_foot/shown lt_pith]
+      ?> (./some record) item.record acc
+      = held=pin[any] (pin record)
+      | mesa_foot/parts aud name held acc
+  + served
+    : foot=mesa_foot/foot acts=row[row[nat]]
+  + keep
+    ' This function keeps a long page for its slices, and the name that the
+    ' page was bound under. The foot keeps the bytes of four long pages at
+    ' most. It keeps each name for as long as the engine does, because a
+    ' name that is bound stays bound. With the name, the foot can make again
+    ' a page whose bytes it no longer keeps.
+    \ at=path spelled=nat page=nat foot=mesa_foot/foot
+    ^ mesa_foot/foot
+    = fresh=mop[path nat lt_pith] (mop/empty)
+      room (? (gt foot.kept.size 3) fresh foot.kept)
+    | foot.set_kept(room.put(at page)).set_whence(foot.whence.put(at spelled))
+  + whole
+    ' This function gives a long page by the number that its slices name it
+    ' with. When the foot no longer keeps the bytes of the page, the function
+    ' makes the page again from the name that the page was bound under, and
+    ' keeps it. A page that is made again is the same bytes: the content of a
+    ' name does not change, and a seal is made from the name.
+    \ aud=nat hash=nat state=namespace foot=mesa_foot/foot
+    ^ [page=maybe[nat] foot=mesa_foot/foot]
+    = none=maybe[nat] .none
+      at (mesa_foot/spot aud hash)
+      had foot.kept.get(at)
+    ? (maybe/is_some had) [had foot]
+    ?> (./some spelled) foot.whence.get(at) [none foot]
+    = [found next] (mesa_foot/made (mesa_foot/parse spelled) spelled state foot)
+    ?> (./some page) found [none next]
+    [found (mesa_foot/keep at spelled page next)]
+  + made
+    ' This function gives the page that a name asks for, as the foot sends
+    ' it. It gives none when the page is not one that this world can give as
+    ' an answer. The function seals a page of a peer's root for that peer. If
+    ' this world shares no key with that peer, the foot supplies no part of
+    ' that root.
+    \ name=row[nat] spelled=nat state=namespace foot=mesa_foot/foot
+    ^ [page=maybe[nat] foot=mesa_foot/foot]
+    = none=maybe[nat] .none
+    ? !(eq name.len 4) [none foot]
+    = kind name.at(0)
+      aud name.at(1)
+      with (mesa_foot/lock_of aud foot)
+    ? (and !(eq 0 aud) (maybe/is_none with)) [none foot]
+    = veiled
+        ?> (./some held) with 0
+        held.name
+    ?> (./some root) (mesa_foot/mine aud foot) [none foot]
+    ? (eq kind 101)
+      ?> (./some change) (mesa_foot/epic root name.at(2) name.at(3) state foot) [none foot]
+      = sealed (net/seal foot.seed root change)
+        sent=[base=nat head=nat sig=nat lines=row[[rel=path stamp=nat sig=nat hash=nat]]] (net/wired sealed)
+        page (PinBytes (pin sent))
+        shown (mesa_foot/show aud veiled sealed foot.shown)
+      [(./some (mesa_foot/dress with spelled page)) foot.set_shown(shown)]
+    ? !(eq kind 112) [none foot]
+    = at (mesa_foot/spot aud name.at(3))
+      known
+        ? foot.shown.has(at) foot.shown
+        ?> (./some all) (mesa_foot/epic root 0 name.at(2) state foot) foot.shown
+        | mesa_foot/show aud veiled all foot.shown
+    ?> (./some item) known.get(at) [none foot.set_shown(known)]
+    [(./some (mesa_foot/dress with spelled item.bytes)) foot.set_shown(known)]
+  + serve
+    ' This function binds the page that a name asks for, the first time that a
+    ' reader asks for it. A slice is a part of a long page (mesa_foot/whole).
+    ' Each other page is made from its name (mesa_foot/made).
+    \ name=row[nat] spelled=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/served
+    = none=row[row[nat]] []
+      idle (mesa_foot/served foot none)
+      key=path [($u spelled)]
+    ? foot.bound.has(key) idle
+    = kind name.at(0)
+      aud name.at(1)
+    ? (and !(eq 0 aud) (maybe/is_none (mesa_foot/lock_of aud foot))) idle
+    ? (eq kind 115)
+      = [found held] (mesa_foot/whole aud name.at(2) state foot)
+      ?> (./some whole) found (mesa_foot/served held none)
+      = at (mul name.at(3) mesa_foot/page)
+        total (dec (wid whole))
+      ? (ge at total) (mesa_foot/served held none)
+      = len (? (lt (sub total at) mesa_foot/page) (sub total at) mesa_foot/page)
+      | mesa_foot/bind aud key spelled (add (loadvar at len whole) (bex (mul 8 len))) held
+    = [found next] (mesa_foot/made name spelled state foot)
+    ?> (./some page) found (mesa_foot/served next none)
+    | mesa_foot/bind aud key spelled page next
+  + dress
+    ' This function gives a page as the foot sends it. The page is sealed when
+    ' there is a peer to seal it for.
+    \ with=maybe[mesa_foot/lock] spelled=nat page=nat
+    ^ nat
+    ?> (./some held) with page
+    | mesa_foot/wrap held spelled page
+  + refused_call
+    ' This function tells if the engine did not accept a call at all.
+    \ acts=row[row[nat]]
+    ^ bool
+    | acts.any((\ act=row[nat] (eq 5 act.at(0))))
+  + bind
+    ' This function binds a page under its name. A page is the bytes that Mesa
+    ' binds to one name: here, an epic without its records, or one pin. Mesa
+    ' sends one page as 1024 fragments of 1 KiB at most, and mesa_foot/page is
+    ' the limit that the foot uses (1,000,000 bytes).
+    '
+    ' The foot keeps a page that is too long for Mesa to send as one page
+    ' (mesa_foot/keep). Under the name of that page, the foot binds only its
+    ' length and the number of slices that a reader can read it in. The foot
+    ' binds each slice when a reader asks for it (mesa_foot/whole). If an engine has no space left, the foot
+    ' replaces it with a new engine, one time only.
+    \ aud=nat key=path spelled=nat page=nat foot=mesa_foot/foot
+    ^ mesa_foot/served
+    = none=row[row[nat]] []
+      total (dec (wid page))
+    ? (gt total mesa_foot/most_bytes) (mesa_foot/served foot none)
+    ? (gt total mesa_foot/page)
+      = count (div (add total (dec mesa_foot/page)) mesa_foot/page)
+        holding (mesa_foot/keep (mesa_foot/spot aud (Sha256 spelled)) spelled page foot)
+      | mesa_foot/bind aud key spelled (mesa_foot/slip total count) holding
+    = ;acts (MesaBind foot.engine spelled page)
+    ? !(mesa_foot/refused_call acts) (mesa_foot/served foot.set_bound(foot.bound.put(key 1)) acts)
+    = again (mesa_foot/renew foot)
+      ;second (MesaBind again.engine spelled page)
+    ? (mesa_foot/refused_call second) (mesa_foot/served again none)
+    | mesa_foot/served again.set_bound(again.bound.put(key 1)) second
+  + slip
+    ' This function gives the slip that is in the place of a long page. The
+    ' slip is sixteen bytes that contain the word LONG, the number of bytes of
+    ' the page, and the number of slices.
+    \ total=nat count=nat
+    ^ nat
+    | add (add "LONG" (lsh total 32)) (add (lsh count 96) (bex 128))
+  + slipped
+    ' This function tells if bytes are such a slip. No page is a slip, because
+    ' a stream starts with SILO and a sealed page is longer.
+    \ bytes=nat
+    ^ bool
+    ? !(eq 17 (wid bytes)) .false
+    | eq "LONG" (mod bytes (bex 32))
+  + read_page
+    ' This function asks a peer for a page. When the name contains only an
+    ' alias of the content hash, want is the content hash that the bytes of
+    ' the page must have.
+    \ from=nat kind=nat aud=nat a=nat b=nat want=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = request foot.next
+      ;acts (MesaRead foot.engine request from (mesa_foot/name kind aud a b))
+      asked foot.set_next(request.inc).set_asks(foot.asks.snoc((mesa_foot/ask request from kind aud a b want)))
+    ? (mesa_foot/refused_call acts) (mesa_foot/finished request 1 0 state asked)
+    | mesa_foot/acted acts state asked
+  + acted
+    ' This function does what an engine asks. It sends what the engine asks it
+    ' to send. Then it does the step for each read that stopped.
+    \ acts=row[row[nat]] state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = sent (mesa_foot/turn foot (mesa_foot/sends acts))
+    | acts.fold sent
+      \ acc=mesa_foot/turn act=row[nat]
+      ^ mesa_foot/turn
+      ? !(eq 2 act.at(0)) acc
+      | mesa_foot/after acc
+        \ now=mesa_foot/foot
+        ^ mesa_foot/turn
+        | mesa_foot/finished act.at(1) act.at(2) act.at(3) state now
+  + home
+    ' This function gives the card that this world keeps for itself.
+    \ foot=mesa_foot/foot
+    ^ path
+    [foot.self 'io 'mesa]
+  + hint
+    ' This function tells a peer the version that the root published to that
+    ' peer is at. It also tells what this world holds of the same root of the
+    ' peer. The receiver does not believe a hint: it compares and then reads.
+    \ to=mesa_foot/peer public=bool state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/effect
+    = me (mesa_foot/id foot.self)
+      root=path (? public [foot.self 'our 'public] [foot.self 'our to.world])
+      offered (mesa_foot/head root state foot)
+      held (net/held ['head] (mesa_foot/card to public foot) state)
+      holds (mesa_foot/name 104 (? public 0 me) 0 held)
+      offers (mesa_foot/name 104 (? public 0 to.id) 0 offered)
+    | mesa_foot/effect/send to.id (MesaHint mesa_foot/domain me to.id holds offers 1 mesa_foot/limits)
+  + mark
+    ' This function gives what a hint to a peer contains, as one number.
+    \ to=mesa_foot/peer public=bool state=namespace foot=mesa_foot/foot
+    ^ nat
+    = root=path (? public [foot.self 'our 'public] [foot.self 'our to.world])
+      w64 18446744073709551616
+      offered (mesa_foot/head root state foot)
+      held (net/held ['head] (mesa_foot/card to public foot) state)
+    | add (mul offered w64) held
+  + turned
+    ' This function runs after the world commits. It sends a hint to each peer
+    ' whose roots changed after the foot last told that peer. It also sends a
+    ' hint when what this world holds of the roots of that peer changed.
+    \ state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = both=row[bool] [.false .true]
+    | foot.peers.fold (mesa_foot/quiet foot)
+      \ acc=mesa_foot/turn item=mesa_foot/peer
+      ^ mesa_foot/turn
+      | both.fold acc
+        \ had=mesa_foot/turn public=bool
+        ^ mesa_foot/turn
+        = at=path [($u item.id) ($u (? public 1 0))]
+          now (mesa_foot/mark item public state had.foot)
+        ? (eq now had.foot.told.get(at).fall(0)) had
+        | mesa_foot/turn had.foot.set_told(had.foot.told.put(at now)) had.does.snoc((mesa_foot/hint item public state had.foot))
+  + clock
+    ' This function runs when time goes by. It lets the engine retry or stop
+    ' all that the engine has in progress.
+    \ now=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = ;acts (MesaAdvance foot.engine now)
+    | mesa_foot/acted acts state foot
+  + tick
+    ' This function runs when time goes by and it is time to tell again the
+    ' versions that the foot has. It tells each peer, and thus it repairs a
+    ' lost hint.
+    \ now=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = moved (mesa_foot/clock now state foot)
+      hints
+        | moved.foot.peers.fold moved.does
+          \ out=row[mesa_foot/effect] item=mesa_foot/peer
+          ^ row[mesa_foot/effect]
+          | out.snoc((mesa_foot/hint item .false state moved.foot)).snoc((mesa_foot/hint item .true state moved.foot))
+    | mesa_foot/turn moved.foot hints
+  + busy
+    ' This function tells if the foot already has a part of the root of a
+    ' publisher in progress.
+    \ from=nat aud=nat foot=mesa_foot/foot
+    ^ bool
+    ? (foot.asks.any((\ item=mesa_foot/ask (and (eq item.from from) (eq item.aud aud))))) .true
+    ? (foot.loads.any((\ item=mesa_foot/load (and (eq item.from from) (eq item.aud aud))))) .true
+    | foot.lands.any((\ item=mesa_foot/landing (and (eq item.from from) (eq item.aud aud))))
+  + hinted
+    ' This function runs when a peer told the version that its root for this
+    ' world is at. The peer also told what it holds of the root of this world.
+    ' The function reads the root of the peer when its version is after the
+    ' held version and was not refused. It answers with a hint when the peer
+    ' is behind on the root of this world.
+    \ from=mesa_foot/peer holds=nat offers=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = me (mesa_foot/id foot.self)
+      offered (mesa_foot/parse offers)
+      held (mesa_foot/parse holds)
+      sought
+        ? !(eq offered.len 4) (mesa_foot/quiet foot)
+        ? !(eq offered.at(0) 104) (mesa_foot/quiet foot)
+        = aud offered.at(1)
+          public (eq aud 0)
+        ? !((eq aud 0) || (eq aud me)) (mesa_foot/quiet foot)
+        = card (mesa_foot/card from public foot)
+        ? !(net/wants card offered.at(3) state) (mesa_foot/quiet foot)
+        ? (mesa_foot/busy from.id aud foot) (mesa_foot/quiet foot)
+        | mesa_foot/read_page from.id 101 aud (net/held ['head] card state) offered.at(3) 0 state foot
+    ? !(eq held.len 4) sought
+    ? !(eq held.at(0) 104) sought
+    = aud held.at(1)
+      public (eq aud 0)
+    ? !((eq aud 0) || (eq aud from.id)) sought
+    ?> (./some root) (mesa_foot/mine aud sought.foot) sought
+    ? !(gt (mesa_foot/head root state sought.foot) held.at(3)) sought
+    | mesa_foot/turn sought.foot sought.does.snoc((mesa_foot/hint from public state sought.foot))
+  + heard
+    ' This function runs when a packet comes. The foot compares a hint from a
+    ' peer. The foot lets an ask from a peer through only for a name that this
+    ' world supplies to that peer. Such a name is for the public root or for
+    ' the root published to that peer. All other packets are for the engine. A
+    ' packet from a sender that this world holds no card for is not heard,
+    ' and a hint about a name that is not its sender is not heard.
+    \ from=nat packet=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    ? (eq from (mesa_foot/id foot.self)) (mesa_foot/quiet foot)
+    = seen (MesaLook packet mesa_foot/limits)
+      kind seen.at(0)
+    ? (eq kind 9) (mesa_foot/quiet foot)
+    ?> (./some sender) (mesa_foot/peer_of from foot) (mesa_foot/quiet foot)
+    ? (and (eq kind 2) !(eq seen.at(4) from)) (mesa_foot/quiet foot)
+    ? (eq kind 2) (mesa_foot/hinted sender seen.at(1) seen.at(2) state foot)
+    ? !(eq kind 0) (mesa_foot/receive from packet mesa_foot/none state foot)
+    = name (mesa_foot/parse seen.at(1))
+    ? !(eq name.len 4) (mesa_foot/quiet foot)
+    ? !((eq name.at(1) 0) || (eq name.at(1) from)) (mesa_foot/quiet foot)
+    = ready (mesa_foot/serve name seen.at(1) state foot)
+    | mesa_foot/receive from packet ready.acts state ready.foot
+  + none
+    ^ row[row[nat]]
+    []
+  + receive
+    \ from=nat packet=nat before=row[row[nat]] state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = ;acts (MesaReceive foot.engine from (mesa_foot/link from foot) packet)
+    | mesa_foot/acted before.weld(acts) state foot
+  + finished
+    ' This function runs when a read stops, with its page or without it. A
+    ' slice goes to the page that it is a slice of. A slip in the place of a
+    ' page starts the read of the slices of that page. In all other cases, the
+    ' bytes are the page.
+    \ request=nat status=nat bytes=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = found foot.asks.keep((\ item=mesa_foot/ask (eq item.request request)))
+    ? !(found.len) (mesa_foot/quiet foot)
+    = asked found.at(0)
+      cleared foot.set_asks(foot.asks.keep((\ item=mesa_foot/ask !(eq item.request request))))
+    ? (eq asked.kind 115) (mesa_foot/got_slice asked status bytes state cleared)
+    ? (and (eq status 0) (mesa_foot/slipped bytes)) (mesa_foot/begin asked bytes state cleared)
+    | mesa_foot/arrived asked status bytes state cleared
+  + arrived
+    ' This function runs when a complete page comes, or does not come. The
+    ' foot opens a page of a peer's root with the key that this world shares
+    ' with that peer. A page that does not open is the same as a page that did
+    ' not come.
+    \ asked=mesa_foot/ask status=nat bytes=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    ?> (./some sender) (mesa_foot/peer_of asked.from foot) (mesa_foot/quiet foot)
+    = plain
+        ? !(eq status 0) 0
+        ? (eq 0 asked.aud) bytes
+        ?> (./some with) (mesa_foot/lock_of asked.from foot) 0
+        | mesa_foot/unwrap with (mesa_foot/name asked.kind asked.aud asked.a asked.b) bytes
+      state_of (? (eq 0 plain) 1 status)
+    ? (eq asked.kind 101) (mesa_foot/got_epic sender asked state_of plain state foot)
+    | mesa_foot/got_pin sender asked state_of plain state foot
+  + begin
+    ' This function runs when a slip comes in the place of a page. It asks for
+    ' the slices of that page, one window of slices at a time.
+    \ asked=mesa_foot/ask slip=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = total (mod (rsh slip 32) (bex 64))
+      count (mod (rsh slip 96) (bex 32))
+      mark (Sha256 (mesa_foot/name asked.kind asked.aud asked.a asked.b))
+      none=row[mesa_foot/stream] []
+    ? (gt total mesa_foot/most_bytes) (mesa_foot/arrived asked 1 0 state foot)
+    ? !(eq count (div (add total (dec mesa_foot/page)) mesa_foot/page)) (mesa_foot/arrived asked 1 0 state foot)
+    | mesa_foot/more (mesa_foot/long asked mark total count 0 none) state foot
+  + more
+    ' This function asks for more slices of a long page, up to the window. The
+    ' foot that the function gets does not hold this page, but the foot that
+    ' the function gives holds it.
+    \ reading=mesa_foot/long state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = flying (sub reading.asked reading.got.len)
+      room (? (lt flying mesa_foot/window) (sub mesa_foot/window flying) 0)
+      left (sub reading.count reading.asked)
+      take (? (lt left room) left room)
+      next reading.set_asked((add reading.asked take))
+      holding foot.set_longs(foot.longs.snoc(next))
+    % i=nat 0
+      acc=mesa_foot/turn (mesa_foot/quiet holding)
+    ^ mesa_foot/turn
+    ? (ge i take) acc
+    | _ i.inc
+      | mesa_foot/after acc
+        \ now=mesa_foot/foot
+        ^ mesa_foot/turn
+        | mesa_foot/read_page reading.ask.from 115 reading.ask.aud reading.mark (add reading.asked i) 0 state now
+  + got_slice
+    ' This function runs when a slice comes, or does not come. When the last
+    ' slice is in, the function puts the page together in order. It then uses
+    ' the result as the page that the slices are the parts of.
+    \ asked=mesa_foot/ask status=nat bytes=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = mine foot.longs.keep((\ item=mesa_foot/long (and (and (eq item.ask.from asked.from) (eq item.ask.aud asked.aud)) (eq item.mark asked.a))))
+    ? !(mine.len) (mesa_foot/quiet foot)
+    = reading mine.at(0)
+      rest foot.set_longs(foot.longs.keep((\ item=mesa_foot/long !(and (and (eq item.ask.from asked.from) (eq item.ask.aud asked.aud)) (eq item.mark asked.a)))))
+    ? !(eq status 0) (mesa_foot/arrived reading.ask 1 0 state rest)
+    = got reading.got.snoc((mesa_foot/stream asked.b bytes))
+      next reading.set_got(got)
+    ? (lt got.len reading.count) (mesa_foot/more next state rest)
+    = whole (mesa_foot/joined got reading.count)
+    ? !(eq (dec (wid whole)) reading.total) (mesa_foot/arrived reading.ask 1 0 state rest)
+    | mesa_foot/arrived reading.ask 0 whole state rest
+  + joined
+    ' This function gives the slices put together in order, as one sequence of
+    ' bytes. It makes a byte tree of the slices (bat_concat), and the runtime
+    ' flattens the tree in one pass. Thus the work is in proportion to the
+    ' number of bytes, and the function does no arithmetic on a large number
+    ' for each slice.
+    \ got=row[mesa_foot/stream] count=nat
+    ^ nat
+    % i=nat 0
+      parts=row[any] []
+    ^ nat
+    ? (ge i count) (mesa_foot/flat parts)
+    = found got.keep((\ item=mesa_foot/stream (eq item.hash i)))
+    ? !(found.len) (mesa_foot/flat parts)
+    | _ i.inc parts.snoc((bat_bar found.at(0).bytes))
+  + flat
+    ' This function gives the bytes of a row of byte trees as one bar: the
+    ' bytes, and then the byte 1 that shows where they stop.
+    \ parts=row[any]
+    ^ nat
+    | bat_flatten (bat_concat parts.snoc((bat_bytes 1 1)))
+  + refused
+    ' This function records that a head was refused, and the reason, in the
+    ' place that keeps where the root stands. As a result, the foot does not
+    ' ask for that head again.
+    \ from=mesa_foot/peer public=bool head=nat why=iota state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = [target change] (net/refuse (mesa_foot/card from public foot) head why state)
+      does=row[mesa_foot/effect] [(mesa_foot/effect/admit 0 (mesa_foot/change/write target change))]
+    | mesa_foot/turn foot does
+  + got_epic
+    ' This function runs when an epic comes, without its records. The foot
+    ' makes no assumption about the epic. It must be an epic, the epic that
+    ' the foot asked for, and the epic of its publisher. Then the foot asks
+    ' for each record that this world does not have, by the hash of the
+    ' record. A publisher that cannot give the change from the version that
+    ' this world is at sends no page. The foot then asks that publisher for
+    ' all of the root.
+    \ from=mesa_foot/peer asked=mesa_foot/ask status=nat bytes=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = public (eq asked.aud 0)
+      idle (mesa_foot/quiet foot)
+    ? !(eq status 0)
+      ? (eq asked.a 0) idle
+      | mesa_foot/read_page from.id 101 asked.aud 0 asked.b 0 state foot
+    = stored=maybe[pin[any]] (PinFrom bytes)
+    ?> (./some held) stored idle
+    ?> (./some change) (net/read (unpin held)) idle
+    ? !(and (eq change.base asked.a) (eq change.head asked.b)) idle
+    ? !(change.entries.all((\ item=net/entry ((eq 0 item.hash) || (mesa_foot/hashlike item.hash))))) idle
+    = card (mesa_foot/card from public foot)
+      root (mesa_foot/theirs from public foot)
+    ? !(net/proven (net/key card state) root change) (mesa_foot/refused from public change.head 'net_forged state foot)
+    = lacking (net/lacks root change state)
+      streams=row[mesa_foot/stream] []
+      nothing=row[nat] []
+      fresh (mesa_foot/load from.id asked.aud change streams nothing lacking 0)
+    | mesa_foot/pump from fresh state foot
+  + without
+    ' This function keeps only the loads that are not for the root of one
+    ' publisher.
+    \ from=nat aud=nat foot=mesa_foot/foot
+    ^ mesa_foot/foot
+    | foot.set_loads(foot.loads.keep((\ item=mesa_foot/load !(and (eq item.from from) (eq item.aud aud)))))
+  + got_pin
+    ' This function runs when the bytes of a pin come. The bytes must hash to
+    ' the name that the foot used to ask for them. The foot then asks for each
+    ' pin that the bytes name. When no pin is left, the epic is complete. When
+    ' a page does not come, the foot does not continue with this epic, and a
+    ' later hint starts again.
+    \ from=mesa_foot/peer asked=mesa_foot/ask status=nat bytes=nat state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = public (eq asked.aud 0)
+      held foot.loads.keep((\ item=mesa_foot/load (and (and (eq item.from asked.from) (eq item.aud asked.aud)) (eq item.epic.head asked.a))))
+    ? !(held.len) (mesa_foot/quiet foot)
+    = gathering held.at(0)
+      rest (mesa_foot/without asked.from asked.aud foot)
+    ? !(eq status 0) (mesa_foot/quiet rest)
+    ? !(eq (Sha256 bytes) asked.want) (mesa_foot/refused from public asked.a 'net_unfit state rest)
+    = streams=row[mesa_foot/stream] gathering.streams.snoc((mesa_foot/stream asked.want bytes))
+      size (add gathering.size (wid bytes))
+    ? (gt streams.len mesa_foot/most) (mesa_foot/refused from public asked.a 'net_unfit state rest)
+    ? (gt size mesa_foot/room) (mesa_foot/refused from public asked.a 'net_unfit state rest)
+    = still=row[nat] gathering.wanted.keep((\ hash=nat !(eq hash asked.want)))
+      named=row[nat] (PinNames bytes)
+      more=row[nat]
+        | named.keep
+          \ hash=nat
+          ^ bool
+          ? (streams.any((\ item=mesa_foot/stream (eq item.hash hash)))) .false
+          ? (still.any((\ seen=nat (eq seen hash)))) .false
+          ? (gathering.queued.any((\ seen=nat (eq seen hash)))) .false
+          .true
+      next gathering.set_streams(streams).set_wanted(still).set_queued(gathering.queued.weld(more)).set_size(size)
+    | mesa_foot/pump from next state rest
+  + pump
+    ' This function asks for more of the pages of an epic, up to the window.
+    ' When the foot waits for no page and no page is left to ask for, the epic
+    ' is complete. The foot that the function gets does not hold this load.
+    ' The foot that the function gives holds the load as the load is now.
+    \ from=mesa_foot/peer gathering=mesa_foot/load state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = room (? (lt gathering.wanted.len mesa_foot/window) (sub mesa_foot/window gathering.wanted.len) 0)
+      count (? (lt gathering.queued.len room) gathering.queued.len room)
+      asking=row[nat] gathering.queued.take(count)
+      next gathering.set_wanted(gathering.wanted.weld(asking)).set_queued(gathering.queued.drop(count))
+      loading foot.set_loads(foot.loads.snoc(next))
+      veiled
+        ? (eq 0 gathering.aud) 0
+        ?> (./some held) (mesa_foot/lock_of from.id foot) 0
+        held.name
+    ? (and (eq 0 next.wanted.len) (eq 0 next.queued.len)) (mesa_foot/complete from next state loading)
+    | asking.fold (mesa_foot/quiet loading)
+      \ acc=mesa_foot/turn hash=nat
+      ^ mesa_foot/turn
+      | mesa_foot/after acc
+        \ now=mesa_foot/foot
+        ^ mesa_foot/turn
+        | mesa_foot/read_page from.id 112 gathering.aud gathering.epic.head (mesa_foot/veil veiled hash) hash state now
+  + staged
+    ' This function tells if a stream loads into the store now. A stream loads
+    ' after each pin that it names loads. A stream that holds code does not
+    ' load.
+    \ bytes=nat
+    ^ bool
+    = found=maybe[pin[any]] (PinFrom bytes)
+    | maybe/is_some found
+  + rebuild
+    ' This function loads each stream, and it loads the parts of a pin before
+    ' the pin. Parts come after the pin that names them, and thus the last
+    ' streams that came go first. The function tries again all that a pass
+    ' does not load, while a pass still loads some stream.
+    \ streams=row[mesa_foot/stream]
+    ^ bool
+    % left=row[mesa_foot/stream] streams.rev
+    ^ bool
+    ? !(left.len) .true
+    = ;after (left.keep((\ item=mesa_foot/stream !(mesa_foot/staged item.bytes))))
+    ? (eq after.len left.len) .false
+    | _ after
+  + record
+    ' This function gives the record that a stream holds, when the stream
+    ' holds a record.
+    \ bytes=nat
+    ^ maybe[myth]
+    = none=maybe[myth] .none
+      found=maybe[pin[any]] (PinFrom bytes)
+    ?> (./some held) found none
+    | net/sound (unpin held)
+  + complete
+    ' This function runs after all the streams of an epic came. It makes the
+    ' pins of the epic again. It puts each record where the epic names the
+    ' hash of that record. Then it asks the world to land the epic as one
+    ' event.
+    \ from=mesa_foot/peer gathered=mesa_foot/load state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = public (eq gathered.aud 0)
+      rest (mesa_foot/without gathered.from gathered.aud foot)
+      head gathered.epic.head
+      ;whole (mesa_foot/rebuild gathered.streams)
+    ? !whole (mesa_foot/refused from public head 'net_unfit state rest)
+    = start=maybe[net/epic] (./some gathered.epic)
+      none=maybe[net/epic] .none
+      filled
+        | gathered.epic.entries.fold start
+          \ acc=maybe[net/epic] item=net/entry
+          ^ maybe[net/epic]
+          ?> (./some change) acc none
+          ? (eq 0 item.hash) acc
+          = found gathered.streams.keep((\ got=mesa_foot/stream (eq got.hash item.hash)))
+          ? !(found.len) acc
+          ?> (./some record) (mesa_foot/record found.at(0).bytes) none
+          | ./some (net/given item.hash record change)
+    ?> (./some change) filled (mesa_foot/refused from public head 'net_unfit state rest)
+    = root (mesa_foot/theirs from public foot)
+      card (mesa_foot/card from public foot)
+      request rest.next
+      waiting rest.set_next(request.inc).set_lands(rest.lands.snoc((mesa_foot/landing request gathered.from gathered.aud head)))
+      does=row[mesa_foot/effect] [(mesa_foot/effect/admit request (mesa_foot/change/land root card change))]
+    | mesa_foot/turn waiting does
+  + landed
+    ' This function runs when the world gives an answer to a landing. If the
+    ' world did not accept the landing, the function records that with the
+    ' reason, in the place that keeps where the root stands. In three cases
+    ' it records nothing, and a later hint starts again: the epic was a
+    ' repeat, the epic did not start where the root stands, or the store of
+    ' the publisher moved after the plan was made.
+    \ request=nat why=maybe[iota] state=namespace foot=mesa_foot/foot
+    ^ mesa_foot/turn
+    = found foot.lands.keep((\ item=mesa_foot/landing (eq item.request request)))
+    ? !(found.len) (mesa_foot/quiet foot)
+    = was found.at(0)
+      cleared foot.set_lands(foot.lands.keep((\ item=mesa_foot/landing !(eq item.request request))))
+    ?> (./some reason) why (mesa_foot/quiet cleared)
+    ? (eq_iota reason 'net_stale) (mesa_foot/quiet cleared)
+    ? (eq_iota reason 'net_gap) (mesa_foot/quiet cleared)
+    ? (eq_iota reason 'peer_store_moved) (mesa_foot/quiet cleared)
+    ?> (./some sender) (mesa_foot/peer_of was.from cleared) (mesa_foot/quiet cleared)
+    | mesa_foot/refused sender (eq was.aud 0) was.head reason state cleared

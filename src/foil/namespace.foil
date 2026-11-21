@@ -26,7 +26,15 @@
   : system=pin[system_publication] changes=pin[axal[note]] predecessor=nat now=nat block=nat
 
 + namespace
-  : self=iota local=sov system=pin[system_publication]
+  ' This is the state of a world. It has three kinds of store:
+  ' - local: the names of this world. Only this world writes them.
+  ' - system: the system publication, which is trusted and does not change.
+  ' - peers: one store for each world whose publication this world holds. A
+  '   store of a peer holds the names of that peer, as that peer spells them.
+  '   It is not a part of local: this world does not copy the records of a
+  '   peer into its own names. A store of a peer has its own cases, and thus
+  '   its history is the history of what this world got from that peer.
+  : self=iota local=sov system=pin[system_publication] peers=mop[path sov lt_pith]
 
   + confined
     \ root=path state=sov
@@ -69,7 +77,7 @@
     ? !(equal publication.definitions
           (system_publication/assigned publication.state))
       | ./err 'system_definition_mismatch
-    | ./ok | namespace self local system
+    | ./ok | namespace self local system (mop/empty)
 
   + owns
     \ name=path state=namespace
@@ -82,7 +90,43 @@
     ? (name.starts('sys))
       | ./some (unpin state.system).state
     ? (state.owns(name)) (./some state.local)
-    .none
+    ? (eq 0 name.len) .none
+    = peer=path [name.at(0)]
+    | state.peers.get(peer)
+
+  + receive
+    ' This function advances the store that this world keeps for a peer. The
+    ' changes are names of that peer only. base is the epoch that the caller
+    ' read the store at: the function does not accept changes that were
+    ' planned on a store that moved after that. No behaviour runs: the
+    ' records of a peer are data in this world.
+    \ peer=iota base=nat diffs=axal[note] now=nat block=nat state=namespace
+    ^ either[iota namespace]
+    = at=path [peer]
+    ? (state.owns(at)) (./err 'peer_is_self)
+    ? (at.starts('sys)) (./err 'peer_is_system)
+    ? !(diffs.tap.all((\ [name change] (pith_prefix at name)))) (./err 'peer_authority_mismatch)
+    = store (state.peers.get(at)).fall(sov/new)
+    ? !(eq base store.top) (./err 'peer_store_moved)
+    ? (sov/step diffs now block store)
+     > (./rejected why) (./err why)
+     > (./accepted result=[next=sov signs=axal[sign]])
+       = [next signs] result
+       ' A change that changes no record must not advance the store.
+       ? (eq signs.wyt 0) (./ok state)
+       | ./ok state.set_peers(state.peers.put(at next))
+
+  + moved
+    ' This function tells if a state has a store at a different epoch than
+    ' the state before it: the local store, or the store of a peer.
+    \ before=namespace after=namespace
+    ^ bool
+    ? !(eq before.local.top after.local.top) .true
+    | after.peers.tap.any
+      \ [name store]
+      ^ bool
+      ?> (./some was) before.peers.get(name) .true
+      | !(eq was.top store.top)
 
   + system_at
     ' Every admitted event records its selected system publication. A frozen
@@ -152,7 +196,13 @@
       shared (project system.top [] system)
       local (project state.local.top [] state.local)
       ' Authorities occupy disjoint root children; reuse their subtrees.
-      all (axal[saga] .none (shared.kid.uni(local.kid)))
+      own (axal[saga] .none (shared.kid.uni(local.kid)))
+      all
+        | state.peers.tap.fold own
+          \ out=axal[saga] [name store]
+          ^ axal[saga]
+          = held (project store.top [] store)
+          | axal[saga] .none (out.kid.uni(held.kid))
     ? car
      > .x (axal/new[saga] .none)
      > .y all
