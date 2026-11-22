@@ -24,18 +24,17 @@
 (define (told reply) (Ix 1 (ok reply)))
 
 ;; This file makes no decision. These items belong to the caller
-;; (src/foil/mesa_foot.foil):
+;; (src/foil/mesa_foot.foil and src/foil/mesa_wire.foil):
 ;; - the domain
-;; - the life and the rift that an engine is told
+;; - the life and the rift of each world
 ;; - the bounds and the retry policy of an engine
 ;; - the names of pages
+;; - the files that hold what must stay outside the world
 ;;
 ;; What is here is the shape of the bridge.
 
-;; realm is [domain life rift]. It is what the engine is told about each
-;; world.
-(define (peer realm id key-id)
-  (made (call "MesaPeer" 0 [id (Ix 0 realm) (Ix 1 realm) (Ix 2 realm) key-id 1])))
+(define (fine reply) (If (Ix 0 reply) 0 1))
+(define (word text n) (bar text n))
 
 ;; This function makes a config from the defaults of Mesa, with the numbers of
 ;; the caller in their places. core_config is [wire_limits bloq max_peers
@@ -53,61 +52,246 @@
                   (Up 4 (Ix 1 bounds) (Up 3 (Ix 0 bounds)
                     (Up 0 limits fields)))))))))))))
 
-;; This function makes an engine for one world from the seed that the world
-;; signs with, and from each peer as [id key-bytes]. The bridge takes the keys
-;; as one table, with the key of the world first. Thus peers have key ids and
-;; attachments 1, 2, ... in the given order. The table does not change during
-;; the life of the engine.
-(define (engine self seed realm limits bounds others)
-  (#let ((keypair (made (call "MesaKeyFromSeed" 0 [seed]))))
-    (#let ((publics (map (lambda (other) (made (call "MesaPublicKey" 0 [(Ix 1 other)]))) others)))
-      (#let ((protection
-               (made (call "MesaProtection" (Weld [keypair] publics)
-                       [0 (gen (Sz others) (lambda (i) (Inc i)))]))))
-        (#let ((made-engine
-                 (made (call "MesaEngine" [(config limits bounds) (peer realm self 0) protection] 0))))
-          (Seq
-            (foldl (lambda (count other)
-                     (Seq (ok (call "MesaEngineInstallPeer"
-                                [made-engine (peer realm (Ix 0 other) (Inc count))] 0))
-                       (Seq (ok (call "MesaEngineSetAttachment" [made-engine]
-                                  [(Ix 0 other) [(Inc count)]]))
-                         (Inc count))))
-                   0 others)
-            made-engine))))))
+;; This function makes an engine for one world. The engine holds no key of the
+;; world: it is closed until the keys of the world activate it (activate). It
+;; learns each peer from the authority (sync). Thus one engine serves a world
+;; for as long as its process runs.
+(define (engine self domain limits bounds)
+  (made (call "MesaEngineConfigured" [(config limits bounds)] [self domain])))
 
-;; This is what an engine asks of its host, as plain rows:
-;;   [1 peer attachment packet]   send these bytes
-;;   [2 request status bytes]     a read stopped (status 0: the page)
-;;   [3 0 0 text]                 something was dropped
-;;   [4 0 0 0]                    any other action (advance drives the timers)
-;;   [5 0 0 text]                 the engine did not accept the call
-(define send-tag (bar "Send" 4))
+;; This is what an engine tells its host, as plain rows:
+;;   [2 request status bytes]     a read stopped (status 0: the page). Mesa
+;;                                examined the page as the page of the peer
+;;                                that the read named.
+;;   [3 0 0 text]                 something was dropped, or was not sent
+;;   [4 0 0 0]                    any other record (a send that the socket took,
+;;                                a timer)
+;;   [5 0 0 text]                 the engine did not accept the event
+;; The engine sends through its endpoint in the same call. The foot gets no
+;; packet of the engine.
 (define finished-tag (bar "ReadFinished" 12))
 (define dropped-tag (bar "Dropped" 7))
+(define unsent-tag (bar "Unsent" 6))
 (define (action raw)
   (#let ((tag (Ix 0 raw)))
-    (If (Eq tag send-tag) [1 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
-      (If (Eq tag finished-tag) [2 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
-        (If (Eq tag dropped-tag) [3 0 0 (Ix 1 raw)]
+    (If (Eq tag finished-tag) [2 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
+      (If (Eq tag dropped-tag) [3 0 0 (Ix 1 raw)]
+        (If (Eq tag unsent-tag) [3 0 0 (Ix 3 raw)]
           [4 0 0 0])))))
-(define (drain-from actions out)
-  (#let ((next (Ix 1 (call "MesaActionsNext" actions 0))))
-    (If (IsNat next) out
-      (drain-from actions (Weld out [(action next)])))))
-(define (step name made-engine data)
-  (#let ((reply (call name [made-engine] data)))
+(define (acts-of results)
+  (foldl (lambda (out result)
+           (If (Ix 0 result) (Weld out [[5 0 0 (Ix 1 result)]])
+             (Weld out (map action (Ix 1 result)))))
+         [] results))
+;; The bridge stops a batch after an event that the engine refuses, or when the
+;; output is large. This function gives the events that are left to the bridge
+;; again, until each event has its result.
+(define (step made-engine endpoint events)
+  (#let ((reply (call "MesaEngineStep" [made-engine endpoint] [events])))
     (If (Ix 0 reply) [[5 0 0 (Ix 1 reply)]]
-      (drain-from (Ix 2 reply) []))))
+      (#let ((results (Ix 0 (Ix 1 reply))))
+        (#let ((done (Sz results)))
+          (If (Or (Eq done 0) (Ge done (Sz events))) (acts-of results)
+            (Weld (acts-of results)
+                  (step made-engine endpoint (Slice done (Sz events) events)))))))))
 
-(define (read made-engine request peer-id path)
-  (step "MesaEngineRead" made-engine [request peer-id path]))
-(define (bind made-engine path bytes)
-  (step "MesaEngineBind" made-engine [path bytes 0]))
-(define (receive made-engine from attachment bytes)
-  (step "MesaEngineReceive" made-engine [from attachment bytes]))
-(define (advance made-engine tick)
-  (step "MesaEngineAdvanceTo" made-engine [tick]))
+(define (read made-engine endpoint request peer-id path)
+  (step made-engine endpoint [[(word "Read" 4) request peer-id path]]))
+(define (bind made-engine endpoint path bytes)
+  (step made-engine endpoint [[(word "Bind" 4) path bytes 0]]))
+(define (receive made-engine endpoint from attachment bytes)
+  (step made-engine endpoint [[(word "Receive" 7) from attachment bytes]]))
+(define (advance made-engine endpoint tick)
+  (step made-engine endpoint [[(word "AdvanceTo" 9) tick]]))
+
+;; This function gives the next time that the engine must be told the time, or
+;; 0 when the engine waits for nothing.
+(define (deadline made-engine endpoint)
+  (#let ((reply (call "MesaEngineStep" [made-engine endpoint] [0])))
+    (If (Ix 0 reply) 0
+      (#let ((next (Ix 1 (Ix 1 reply))))
+        (If (IsNat next) 0 (Ix 0 next))))))
+
+;; One socket carries the packets of all peers. The second answer of the
+;; bridge is the number of that socket, which a waiting actor polls (wait).
+(define (endpoint address max-packet)
+  (made (call "MesaEndpoint" 0 [address max-packet 256])))
+(define (socket made-endpoint)
+  (Ix 1 (told (call "MesaEndpointSocket" [made-endpoint] 0))))
+(define (wait fd milliseconds)
+  (told (call "MesaWaitReadable" 0 [fd milliseconds])))
+(define (close handle) (fine (call "MesaClose" [handle] 0)))
+
+;; This function gives the first numeric address of a host and a port, or 0.
+(define (resolve host port)
+  (#let ((reply (call "MesaResolve" 0 [host port])))
+    (If (Ix 0 reply) 0
+      (If (IsNat (Ix 1 reply)) 0 (Ix 0 (Ix 1 reply))))))
+
+;; A route is where the packets for a peer go, at a generation. The generation
+;; of the route is the attachment of the peer in the engine. `track` sets the
+;; route only: a new endpoint gets the routes that the engine already has.
+;; `route` moves the two together. An address of 0 is no route. `attach` sets
+;; the attachment only: a new engine gets the routes that the endpoint has.
+(define (track made-endpoint peer-id old new address)
+  (#let ((reply (call "MesaEndpointStep" [made-endpoint]
+                  [[[(word "SetRoute" 8) peer-id old new address]]])))
+    (If (Ix 0 reply) 0
+      (If (Ix 0 (Ix 0 (Ix 1 reply))) 0 1))))
+(define (refused? acts) (any (lambda (act) (Eq 5 (Ix 0 act))) acts))
+(define (route made-engine made-endpoint peer-id old new address)
+  (If (track made-endpoint peer-id old new address)
+    (If (refused? (step made-engine made-endpoint
+                    [[(word "ReplaceAttachment" 17) peer-id old new (If (Eq address 0) 0 1)]]))
+      0 1)
+    0))
+
+;; This function gives a new engine the attachment of a peer, at the
+;; generation that the route of the peer has.
+(define (attach made-engine made-endpoint peer-id generation)
+  (If (refused? (step made-engine made-endpoint
+                  [[(word "ReplaceAttachment" 17) peer-id 0 generation 1]]))
+    0 1))
+
+;; A packet that the foot itself made (a hint) goes to the socket as it is.
+(define (send made-endpoint peer-id attachment packet)
+  (#let ((reply (call "MesaEndpointStep" [made-endpoint]
+                  [[[(word "Send" 4) peer-id attachment packet]]])))
+    (If (Ix 0 reply) 0
+      (#let ((result (Ix 0 (Ix 1 reply))))
+        (If (Ix 0 result) 0 (If (Ix 1 result) 0 1))))))
+;; This function gives the packets that the socket holds, 64 at most, each as
+;; [peer attachment bytes]. The endpoint gives the peer from the address that
+;; the packet came from. It discards a packet from an address that is not a
+;; route.
+(define (hear made-endpoint)
+  (#let ((reply (call "MesaEndpointStep" [made-endpoint] [[[(word "Receive" 7) 64]]])))
+    (If (Ix 0 reply) []
+      (#let ((result (Ix 0 (Ix 1 reply))))
+        (If (Ix 0 result) [] (Ix 1 result))))))
+
+;; The authority is what Mesa holds of each world (mesa-jael): the key, the
+;; life and the rift that it accepted, the domains, and each block. Its
+;; checkpoint is a file outside the world. A change is durable before Mesa
+;; uses it: the checkpoint goes to the file, and then the authority is told
+;; (settle).
+(define (settle made-authority file data)
+  (#let ((pending (Ix 1 data)))
+    (If (IsNat pending) 0
+      (Seq (ok (call "MesaPersist" 0 [file (Ix 2 pending)]))
+        (Seq (ok (call "MesaAuthorityStep" [made-authority]
+                   [[[(word "Commit" 6) (Ix 0 (Ix 0 pending)) (Ix 1 (Ix 0 pending))]]]))
+          0)))))
+;; This function tells the authority the time and gives it one command. It
+;; gives the reason that the authority gave when it did not accept the
+;; command, or 0 when it accepted the command and the change is durable.
+(define (rule made-authority file now command)
+  (#let ((data (told (call "MesaAuthorityStep" [made-authority]
+                       [[[(word "Advance" 7) now] command]]))))
+    (#let ((results (Ix 0 data)))
+      (#let ((result (Ix (Dec (Sz results)) results)))
+        (If (Ix 0 result) (Ix 1 result)
+          (Seq (settle made-authority file data) 0))))))
+;; This function makes the authority of a world from its checkpoint (0: there
+;; is none). Until a domain has a verifier, the world is the verifier of its
+;; domain: it says which key it wants Mesa to accept for each world, and Mesa
+;; decides. Mesa keeps the numbers from going back.
+(define (authority incarnation checkpoint file domain now)
+  (#let ((made-authority (made (call "MesaAuthority" 0 [incarnation checkpoint 0]))))
+    (Seq (If (Eq checkpoint 0) (rule made-authority file now [(word "Register" 8) domain 0 1]) 0)
+      (Seq (rule made-authority file now [(word "Ready" 5) domain 1 1])
+        made-authority))))
+;; This function gives what the authority holds of a world: [known key life
+;; rift ordinary blocked]. A world is ordinary when Mesa serves it and reads
+;; from it.
+(define (standing made-authority peer-id)
+  (#let ((data (told (call "MesaAuthorityPeer" [made-authority] [peer-id]))))
+    (#let ((point (Ix 1 data)))
+      (#let ((policy (Ix 2 data)))
+        (If (IsNat point) [0 0 0 0 0 0]
+          [1 (Ix 3 point) (Ix 1 point) (Ix 2 point) (Ix 0 policy) (Ix 1 policy)])))))
+;; This function asks the authority to accept the key, the life and the rift
+;; of a world. It gives 0 when the authority holds that point and the point
+;; is durable. If not, it gives the reason: Rollback for a lower life or
+;; rift, Conflict for a different key at the same life, Unavailable for a
+;; world that is blocked.
+(define (vouch made-authority file now peer-id domain life rift key)
+  (#let ((data (told (call "MesaAuthorityPeer" [made-authority] [peer-id]))))
+    (#let ((point (Ix 1 data)))
+      (#let ((policy (Ix 2 data)))
+        (If (And (If (IsNat point) 0 1)
+              (And (And (Eq (Ix 1 point) life) (Eq (Ix 2 point) rift))
+                (And (Eq (Ix 3 point) key)
+                  (And (Ix 5 policy) (And (Ix 6 policy) (If (Ix 2 policy) 0 1))))))
+          0
+          (rule made-authority file now
+            [(word "Accept" 6) (Ix 0 data) [peer-id domain life rift key (bar 0 0)]]))))))
+(define (block made-authority file now peer-id blocked)
+  (rule made-authority file now [(word "Block" 5) peer-id blocked]))
+;; This function gives the engine what the authority holds of each peer. The
+;; engine stops each read of a peer whose credential changed.
+(define (sync made-authority made-engine made-endpoint peers)
+  (#let ((reply (call "MesaAuthoritySync" [made-authority made-engine made-endpoint] [peers])))
+    (If (Ix 0 reply) [[5 0 0 (Ix 1 reply)]]
+      (acts-of (Ix 0 (Ix 1 reply))))))
+
+;; The keys of a world are in the runtime. The seed of a key goes from its
+;; file to the bridge, and this file gets the public key only. manifest is the
+;; bytes of the manifest file (0: there is none), and floor is the lowest
+;; revision of it that the world accepts.
+(define (keys self domain incarnation epoch manifest floor)
+  (made (call "MesaKeys" 0
+          [self domain incarnation epoch 60000 (If (Eq manifest 0) 0 [manifest floor])])))
+;; This function gives [public created], or no fields when there is no key
+;; file and the caller did not let the bridge make one.
+(define (key-import made-keys ring version life rift create)
+  (#let ((reply (call "MesaKeysImport" [made-keys] [ring [version life rift create]])))
+    (If (Ix 0 reply) [] (Ix 1 reply))))
+;; This function makes one version of the key the key that the world signs
+;; with. The manifest is durable before the keys are told. Then the engine
+;; gets the key. The answer is what the engine tells (reads that stopped),
+;; and then [6 revision 0 0] with the revision of the manifest.
+(define (activate made-keys made-authority made-engine made-endpoint file version)
+  (#let ((offer (call "MesaKeysStep" [made-keys made-authority] [(word "Prepare" 7) version])))
+    (If (Ix 0 offer) [[5 0 0 (Ix 1 offer)]]
+      (#let ((token (Ix 0 (Ix 1 offer))))
+        (Seq (ok (call "MesaPersist" 0 [file (Ix 2 (Ix 1 offer))]))
+          (#let ((kept (call "MesaKeysStep" [made-keys made-authority]
+                         [(word "Commit" 6) (Ix 0 token) (Ix 1 token)])))
+            (If (Ix 0 kept) [[5 0 0 (Ix 1 kept)]]
+              (#let ((synced (call "MesaKeysSync"
+                               [made-keys made-authority made-engine made-endpoint] 0)))
+                (If (Ix 0 synced) [[5 0 0 (Ix 1 synced)]]
+                  (Weld (acts-of [(Ix 0 (Ix 1 synced))]) [[6 (Ix 1 token) 0 0]]))))))))))
+;; This function retires an old version of the key and removes its file. It
+;; gives the revision of the manifest, or 0 when the keys did not retire it.
+;; Mesa closes the engine for each change of the manifest: the caller
+;; activates the key again after this.
+(define (retire made-keys made-authority file version ring)
+  (#let ((offer (call "MesaKeysStep" [made-keys made-authority] [(word "Retire" 6) version])))
+    (If (Ix 0 offer) 0
+      (#let ((token (Ix 0 (Ix 1 offer))))
+        (Seq (ok (call "MesaPersist" 0 [file (Ix 2 (Ix 1 offer))]))
+          (Seq (ok (call "MesaKeysStep" [made-keys made-authority]
+                     [(word "Commit" 6) (Ix 0 token) (Ix 1 token)]))
+            (Seq (call "MesaKeysStep" [made-keys made-authority] [(word "Delete" 6) version])
+              (Seq (call "MesaRemove" 0 [ring 0])
+                (Ix 1 token)))))))))
+;; These functions give what two worlds share, for one use that a label
+;; names, and they hash and seal with it. The secret stays in the bridge.
+(define (lock made-keys made-authority peer-id label)
+  (#let ((shared (made (call "MesaKeysAgree" [made-keys made-authority] [peer-id]))))
+    (made (call "MesaSecretDerive" [shared] [label]))))
+(define (veil secret message) (told (call "MesaSecretHash" [secret] [message])))
+(define (seal secret nonce name message)
+  (told (call "MesaSecretSeal" [secret] [nonce name message])))
+(define (open secret nonce name sealed)
+  (#let ((reply (call "MesaSecretOpen" [secret] [nonce name sealed])))
+    (If (Ix 0 reply) 0
+      (If (IsNat (Ix 1 reply)) 0 (Ix 0 (Ix 1 reply))))))
+;; This function writes a file so that the file is whole on the disk when the
+;; function answers.
+(define (persist file bytes) (fine (call "MesaPersist" 0 [file bytes])))
 
 ;; This function tells what a packet is, before the engine sees it: [kind path
 ;; other data who]. Kind 0 is an ask for the page at path. Kind 2 is a hint.
