@@ -40,3 +40,20 @@ its record names a later `life`.
 
 Packets are UDP datagrams on one socket. The foot makes its socket on the `port` of its record. A packet from
 an address that no card names is discarded.
+
+## What this mount does not do
+
+- **No proof of a past publication to a third party.** A reader keeps the version and the content hash that a
+  publisher gave for each name. It keeps no signature: Mesa examines the signature of each page and gives the
+  rules the bytes only. So a reader cannot show a third party later what a publisher said. The smallest
+  addition that restores this is in libmesa: a finished read that also gives the life, the rift, the total, the
+  root and the signature of its page. Shrine makes no signatures of its own in their place.
+- **A card is trusted.** Until a verifier for the domain exists, the one that writes a card is the one that says
+  whose key is whose. A wrong key at a new life is accepted, and the right key then needs a later life.
+- **The key is on the machine.** The seed is a file that only the runtime reads, and it is in the memory of the
+  runtime. A host that is taken over can take it. A signer outside the process is not in this mount.
+- **Mesa's files are in the world's folder.** A restore of the store alone (the folder `snap`) keeps them, and
+  then an old key of the world or of a peer does not come back. A restore of the whole folder from a copy takes
+  them back with it; nothing in that folder can prevent this.
+- Not here: first contact with a world that has no card, a verifier of identities, an outside signer, and
+  proofs of history.

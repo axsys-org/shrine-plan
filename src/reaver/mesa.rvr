@@ -192,6 +192,14 @@
       (#let ((result (Ix (Dec (Sz results)) results)))
         (If (Ix 0 result) (Ix 1 result)
           (Seq (settle made-authority file data) 0))))))
+;; This function tells if Mesa takes the checkpoint of an authority: 0, or the
+;; reason. A caller asks before it makes the authority. Thus a file that is
+;; not whole stops the foot with a reason, and nothing starts as if the file
+;; were not there.
+(define (authority-fit incarnation checkpoint)
+  (#let ((reply (call "MesaAuthority" 0 [incarnation checkpoint 0])))
+    (If (Ix 0 reply) (Ix 1 reply)
+      (Seq (call "MesaClose" (Ix 2 reply) 0) 0))))
 ;; This function makes the authority of a world from its checkpoint (0: there
 ;; is none). Until a domain has a verifier, the world is the verifier of its
 ;; domain: it says which key it wants Mesa to accept for each world, and Mesa
@@ -242,8 +250,17 @@
 (define (keys self domain incarnation epoch manifest floor)
   (made (call "MesaKeys" 0
           [self domain incarnation epoch 60000 (If (Eq manifest 0) 0 [manifest floor])])))
-;; This function gives [public created], or no fields when there is no key
-;; file and the caller did not let the bridge make one.
+;; This function tells if Mesa takes the manifest of the keys of a world: 0,
+;; or the reason (Rollback for a manifest that is older than the floor, or
+;; that is of a different world).
+(define (keys-fit self domain incarnation epoch manifest floor)
+  (#let ((reply (call "MesaKeys" 0
+                  [self domain incarnation epoch 60000 (If (Eq manifest 0) 0 [manifest floor])])))
+    (If (Ix 0 reply) (Ix 1 reply)
+      (Seq (call "MesaClose" (Ix 2 reply) 0) 0))))
+;; This function gives [public created]. It gives no fields when the key file
+;; is not a key, or when there is no key file and the caller did not let the
+;; bridge make one.
 (define (key-import made-keys ring version life rift create)
   (#let ((reply (call "MesaKeysImport" [made-keys] [ring [version life rift create]])))
     (If (Ix 0 reply) [] (Ix 1 reply))))
@@ -267,9 +284,19 @@
 ;; gives the revision of the manifest, or 0 when the keys did not retire it.
 ;; Mesa closes the engine for each change of the manifest: the caller
 ;; activates the key again after this.
+;;
+;; A version that the keys do not hold was retired before, or was never
+;; there. A stop of the process between the retirement and the removal of the
+;; file leaves the file. Thus, for such a version, the function ends what was
+;; left: it tells the keys that the version is deleted, and removes the file.
+(define missing-key (bar "MissingKey" 10))
 (define (retire made-keys made-authority file version ring)
   (#let ((offer (call "MesaKeysStep" [made-keys made-authority] [(word "Retire" 6) version])))
-    (If (Ix 0 offer) 0
+    (If (Ix 0 offer)
+      (If (Eq (Ix 1 offer) missing-key)
+        (Seq (call "MesaKeysStep" [made-keys made-authority] [(word "Delete" 6) version])
+          (Seq (call "MesaRemove" 0 [ring 0]) 0))
+        0)
       (#let ((token (Ix 0 (Ix 1 offer))))
         (Seq (ok (call "MesaPersist" 0 [file (Ix 2 (Ix 1 offer))]))
           (Seq (ok (call "MesaKeysStep" [made-keys made-authority]

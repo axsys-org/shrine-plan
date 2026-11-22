@@ -12,6 +12,8 @@
 '   second.
 ' - It asks the world to make each change that the rules ask for, one after
 '   the other (mesa_wire/wish).
+' - It writes the mark before it announces a new epoch of the world. If the
+'   mark is not written, it announces nothing.
 ' - It tells Mesa the key that each card names for a peer. Mesa decides if it
 '   accepts that key, and Mesa holds what it accepted.
 '
@@ -238,15 +240,29 @@
     ' and the lowest revision of its key manifest that the world accepts.
     : rift=nat top=nat floor=nat
   + marked
-    ' This function gives the mark of a world. It gives zeros when there is
-    ' no file. It gives none when the file does not hold a mark: zeros would
-    ' then let the world use again a version that it published before.
-    \ file=str
+    ' This function gives the mark of a world. It gives zeros for a world
+    ' that never started: there is no mark, and Mesa has no manifest for the
+    ' world. In each other case with no whole mark it gives none: the file is
+    ' there and does not hold a mark, or it cannot be read, or it is gone and
+    ' the world started before. Zeros would then let the world use again a
+    ' version that it published before.
+    \ file=str ring=str
     ^ maybe[mesa_wire/mark]
     = ;bytes (mesa_wire/took file)
-    ? (eq 0 bytes) (./some (mesa_wire/mark 0 0 0))
+      ;there (? (eq 0 bytes) (Stamp file) 0)
+      ;begun (? (eq 0 bytes) (Stamp (str/cat_all [ring ".manifest"])) 0)
+    ? (and (eq 0 bytes) (and (eq 0 there) (eq 0 begun))) (./some (mesa_wire/mark 0 0 0))
     ? !(eq (wid bytes) 25) .none
     | ./some (mesa_wire/mark (loadvar 0 8 bytes) (loadvar 8 8 bytes) (loadvar 16 8 bytes))
+  + resumed
+    ' This function gives the mark of a world that starts, from its mark and
+    ' the epoch that the world is at. A world that is behind what it announced
+    ' was restored to an older copy. Its rift then increases, and thus each
+    ' version that it publishes from now on is later than each version that it
+    ' published before (net/stamp).
+    \ was=mesa_wire/mark top=nat
+    ^ mesa_wire/mark
+    | mesa_wire/mark (? (lt top was.top) was.rift.inc was.rift) (nmax was.top top) was.floor
   + remark
     ' This function writes a mark. It gives 1 when the mark is whole on the
     ' disk (the runtime writes a new file and then gives it the name), and 0
@@ -296,6 +312,21 @@
     ?> (./some port) (nat/parse parts.at(1)) none
     = got=[host=str port=nat] [parts.at(0) port]
     got
+  + kept
+    ' This function gives the bytes of a file that Mesa keeps for the world,
+    ' or 0 when there is no file. `whole` is false when the file is there and
+    ' cannot be read: the foot must then stop, and not start as if there were
+    ' no file.
+    \ file=str
+    ^ [whole=bool bytes=nat]
+    = ;bytes (mesa_wire/took file)
+      ;there (? (eq 0 bytes) (Stamp file) 0)
+    [(eq 0 there) bytes]
+  + told
+    ' This function gives the text of a reason that Mesa gave.
+    \ why=nat
+    ^ str
+    | str/from_atom (mod why (bex (mul 8 (dec (wid why)))))
   + spelled
     ' This function gives a text as bytes, for the Mesa bridge.
     \ text=str
@@ -344,14 +375,15 @@
     ' This function gives the write that records a card that Mesa did not
     ' accept: the key that the card names, and the reason. The record is in
     ' the place that keeps where the root of the peer stands, beside the
-    ' card. The function gives no write when the record is there already.
+    ' card. The function gives no write when the record says that already.
     \ self=iota want=mesa_wire/route why=nat state=namespace
     ^ row[mesa_foot/effect]
     = card=path [self 'io 'mesa want.world 'stand]
       none=row[mesa_foot/effect] []
-    ? (eq want.key (net/held ['barred] card state)) none
-    = text (str/from_atom (mod why (bex (mul 8 (dec (wid why))))))
-      said=myth (myth/sing ['barred] (pails/n want.key)).put(['cause] (pails/t text))
+      text (mesa_wire/told why)
+      was (sovereign_care .x card state).fil.fall(myth/new)
+    ? (and (eq want.key was.nat_at(['barred] 0)) (equal[str] text was.txt_at(['cause]))) none
+    = said=myth (myth/sing ['barred] (pails/n want.key)).put(['cause] (pails/t text))
       change (? (net/live card state) (writ/poke said) (writ/make said))
     | none.snoc((mesa_foot/effect/admit 0 (mesa_foot/change/write card change)))
   + locked
@@ -443,10 +475,10 @@
     ' first and is closed. Mesa then activates the key of the world for it:
     ' the manifest is durable before the engine signs. The engine gets what
     ' Mesa holds of each peer, and the routes that the socket has.
-    \ self=iota life=nat links=row[mesa_wire/link] endpoint=nat keys=nat authority=nat manifest=nat
+    \ self=iota life=nat links=row[mesa_wire/link] endpoint=nat keys=nat authority=nat manifest=nat bounds=row[nat]
     ^ mesa_wire/drive
     = none=row[nat] []
-      ;engine (MesaEngine (mesa_foot/id self) mesa_foot/domain mesa_foot/limits mesa_foot/bounds)
+      ;engine (MesaEngine (mesa_foot/id self) mesa_foot/domain mesa_foot/limits bounds)
       ;acts (MesaActivate keys authority engine endpoint manifest life)
       ids
         | links.fold none
@@ -462,6 +494,36 @@
           ; (MesaAttach engine endpoint item.id item.gen)
           done.inc
     | mesa_wire/drive engine acts.weld(synced) (mesa_wire/revision acts)
+  + sweep
+    ' This function retires each key of the world before the present one, and
+    ' removes its file. In the ordinary case there is none. A world that
+    ' stopped between the activation of a new key and the retirement of the
+    ' old one has one, and this function ends that change of key. It gives
+    ' the revision of the manifest after the last retirement, or 0 when it
+    ' retired no key. Mesa closes the engine for a retirement: the caller
+    ' activates the key again when the answer is not 0.
+    \ ring=str life=nat keys=nat authority=nat manifest=nat
+    ^ nat
+    % version=nat 1
+      last=nat 0
+    ^ nat
+    ? (ge version life) last
+    = ;done (MesaRetire keys authority manifest version (mesa_wire/spelled (mesa_wire/ring_of ring version)))
+    | _ version.inc (nmax last done)
+  + renew
+    ' This function gives a foot a new engine on the same socket, and closes
+    ' the old engine. The foot asks for this when its engine has no space left
+    ' for a page. The new engine holds no page. A name always has the same
+    ' content, and thus the new engine binds the same bytes under a name when
+    ' a reader asks again. The answer is the turn of the new foot and the
+    ' revision of the key manifest. The revision is 0 when Mesa did not
+    ' activate the key for the new engine: the foot then keeps its engine.
+    \ life=nat links=row[mesa_wire/link] keys=nat authority=nat manifest=nat bounds=row[nat] state=namespace foot=mesa_foot/foot
+    ^ [turn=mesa_foot/turn floor=nat]
+    = ;made (mesa_wire/engine state.self life links foot.endpoint keys authority manifest bounds)
+      ;shut (MesaClose (? (eq 0 made.floor) made.engine foot.engine))
+    ? (eq 0 made.floor) [(mesa_foot/quiet foot) 0]
+    [(mesa_foot/acted made.acts state (mesa_foot/raised made.engine foot)) made.floor]
   + turned
     ' This is the answer to a change of the key of the world: if Mesa changed
     ' it, the new public key, what the engine told, and the revision of the
@@ -499,6 +561,14 @@
     ' `why` is empty for a foot that started. If not, it is the reason that
     ' the foot did not start.
     : why=str foot=mesa_foot/foot links=row[mesa_wire/link] keys=nat authority=nat fd=nat floor=nat life=nat public=nat does=row[mesa_foot/effect]
+  + down
+    ' This function gives the answer of a foot that did not start, with the
+    ' reason.
+    \ why=str rift=nat life=nat world=namespace
+    ^ mesa_wire/up
+    = no_links=row[mesa_wire/link] []
+      no_does=row[mesa_foot/effect] []
+    | mesa_wire/up why (mesa_foot/start world.self rift 0 0) no_links 0 0 0 0 life 0 no_does
   + raise
     ' This function starts a foot. It opens what Mesa keeps for the world
     ' beside the ring file: the authority and the keys. It makes the key of
@@ -506,42 +576,56 @@
     ' accept that key for the world, and makes the socket and the engine.
     ' Then it tells Mesa the cards.
     '
+    ' The foot does not start when a file that Mesa keeps is not whole, cannot
+    ' be read, or is older than the mark allows. It gives the reason. It does
+    ' not start as if there were no file: that would give the world a new
+    ' identity or let an old key back.
+    '
     ' The life of the key is the higher of two numbers: the life that the
     ' caller wants, and the life that Mesa holds for the world. Thus a world
     ' that is restored to an old record does not go back to an old key.
-    \ ring=str port=nat rift=nat floor=nat wanted=nat stated=bool routes=row[mesa_wire/route] began=nat world=namespace
+    \ ring=str port=nat rift=nat floor=nat wanted=nat stated=bool routes=row[mesa_wire/route] began=nat bounds=row[nat] world=namespace
     ^ mesa_wire/up
     = me (mesa_foot/id world.self)
       no_links=row[mesa_wire/link] []
-      no_does=row[mesa_foot/effect] []
+      no_acts=row[row[nat]] []
       started=str ""
-      idle (mesa_foot/start world.self rift 0 0)
       held (mesa_wire/beside ring "authority")
       kept_at (mesa_wire/beside ring "manifest")
       ;fresh (Entropy 16)
       incarnation (add 1 (mod fresh (bex 120)))
-      ;checkpoint (mesa_wire/took (str/cat_all [ring ".authority"]))
-      ;authority (MesaAuthority incarnation checkpoint held mesa_foot/domain began)
-      ;manifest (mesa_wire/took (str/cat_all [ring ".manifest"]))
+      ;[trusted checkpoint] (mesa_wire/kept (str/cat_all [ring ".authority"]))
+      ;[listed manifest] (mesa_wire/kept (str/cat_all [ring ".manifest"]))
+    ? !(trusted) (mesa_wire/down "the file of the authority cannot be read" rift wanted world)
+    ? !(listed) (mesa_wire/down "the manifest of the keys cannot be read" rift wanted world)
+    = ;unfit (MesaAuthorityFit incarnation checkpoint)
+    ? !(eq 0 unfit) (mesa_wire/down (str/cat_all ["Mesa does not take the file of the authority: " (mesa_wire/told unfit)]) rift wanted world)
+    = ;unkept (MesaKeysFit me mesa_foot/domain incarnation.inc 1 manifest floor)
+    ? !(eq 0 unkept) (mesa_wire/down (str/cat_all ["Mesa does not take the manifest of the keys: " (mesa_wire/told unkept)]) rift wanted world)
+    = ;authority (MesaAuthority incarnation checkpoint held mesa_foot/domain began)
       ;keys (MesaKeys me mesa_foot/domain incarnation.inc 1 manifest floor)
       ;stood (MesaStanding authority me)
       life (nmax wanted stood.at(2))
       ;got (MesaKeyImport keys (mesa_wire/spelled (mesa_wire/ring_of ring life)) life life 0 (? stated 0 1))
-    ? !(eq 2 got.len) (mesa_wire/up "the record states a key, and the file of that key is not there" idle no_links keys authority 0 0 life 0 no_does)
+    ? !(eq 2 got.len) (mesa_wire/down "the file of the key is not there or is not a key, and the record states a key" rift life world)
     = ;why (MesaVouch authority held began me mesa_foot/domain life 0 got.at(0))
-    ? !(eq 0 why) (mesa_wire/up "Mesa does not accept the key of this world" idle no_links keys authority 0 0 life 0 no_does)
+    ? !(eq 0 why) (mesa_wire/down (str/cat_all ["Mesa does not accept the key of this world: " (mesa_wire/told why)]) rift life world)
     = ;sock (mesa_wire/bind port no_links)
-      ;made (mesa_wire/engine world.self life no_links sock.endpoint keys authority kept_at)
-    ? (eq 0 made.floor) (mesa_wire/up "Mesa did not activate the key of this world" idle no_links keys authority 0 0 life 0 no_does)
+      ;made (mesa_wire/engine world.self life no_links sock.endpoint keys authority kept_at bounds)
+    ? (eq 0 made.floor) (mesa_wire/down "Mesa did not activate the key of this world" rift life world)
+    = ;swept (mesa_wire/sweep ring life keys authority kept_at)
+      ;again (? (eq 0 swept) no_acts (MesaActivate keys authority made.engine sock.endpoint kept_at life))
+      level (? (eq 0 swept) made.floor (mesa_wire/revision again))
+    ? (eq 0 level) (mesa_wire/down "Mesa did not activate the key of this world after it retired an old key" rift life world)
     = begun (mesa_foot/start world.self rift made.engine sock.endpoint)
       ;fed (mesa_wire/feed routes no_links keys authority held world begun)
       met (mesa_foot/meet (mesa_wire/peers fed.links) fed.locks begun)
       ;opening
-        | mesa_foot/after (mesa_foot/acted made.acts.weld(fed.acts) world met)
+        | mesa_foot/after (mesa_foot/acted made.acts.weld(again).weld(fed.acts) world met)
           \ ready=mesa_foot/foot
           ^ mesa_foot/turn
           | mesa_foot/tick began world ready
-    | mesa_wire/up started opening.foot fed.links keys authority sock.fd made.floor life got.at(0) fed.notes.weld(opening.does)
+    | mesa_wire/up started opening.foot fed.links keys authority sock.fd level life got.at(0) fed.notes.weld(opening.does)
   + run
     ' This function is the foot. It waits for the world as it is now, and
     ' reads its mark. It increases its rift when the world is behind what it
@@ -573,16 +657,17 @@
         ; (helm/supervisor/close_caps caps)
         ?> (./binary request status body mime) message (_ 0)
         | mesa_wire/world body
-      ;found (mesa_wire/marked file)
-    ?> (./some was) found (mesa_wire/halt "mesa foot: the mark file is not whole, and the foot does not run" file)
-    = rift (? (lt world.local.top was.top) was.rift.inc was.rift)
-      seen (nmax was.top world.local.top)
+      ;found (mesa_wire/marked file ring)
+    ?> (./some was) found (mesa_wire/halt "mesa foot: the mark is not whole or is gone, and the foot does not run" file)
+    = resumed (mesa_wire/resumed was world.local.top)
+      rift resumed.rift
+      seen resumed.top
       ;noted (mesa_wire/remark file rift seen was.floor)
     ? !(noted) (mesa_wire/halt "mesa foot: the mark was not written, and the foot does not run" file)
     = began (div (Now 0) 1000000)
       held (mesa_wire/beside ring "authority")
       kept_at (mesa_wire/beside ring "manifest")
-      ;up (mesa_wire/raise ring port rift was.floor record.nat_at(['life] 1) (gt record.nat_at(['key] 0) 0) (mesa_wire/routes init.ax) began world)
+      ;up (mesa_wire/raise ring port rift was.floor record.nat_at(['life] 1) (gt record.nat_at(['key] 0) 0) (mesa_wire/routes init.ax) began mesa_foot/bounds world)
     ? (gt up.why.len 0) (mesa_wire/halt (str/cat_all ["mesa foot: " up.why]) ring)
     = ;kept (mesa_wire/remark file rift seen up.floor)
       keys up.keys
@@ -627,9 +712,10 @@
       = ;turn (mesa_foot/turned held answered.foot)
         higher (nmax top held.local.top)
         ;kept (? (gt higher top) (mesa_wire/remark file foot.rift higher floor) 1)
-      ; (? kept 0 (Trace ["mesa foot: the mark was not written" file] 0))
+      ; (? kept 0 (Trace ["mesa foot: the mark was not written, and the foot announces nothing" file] 0))
+      ? !(kept) (_ answered.foot held links top floor last own_life at serial stopping rest)
       ; (mesa_wire/act foot.endpoint links turn.does)
-      | _ turn.foot held links (? kept higher top) floor last own_life at serial stopping rest
+      | _ turn.foot held links higher floor last own_life at serial stopping rest
      > (./fact binding)
       ; (mesa_wire/look init.parent)
       ? (mesa_wire/stopped binding) (_ foot view links top floor last own_life at serial 1 queue)
@@ -697,17 +783,13 @@
       | _ moved.foot view links top floor (? due time.now last) own_life at serial stopping queue
      > asked=mesa_wire/again
       ? !(eq asked.era foot.era) (_ foot view links top floor last own_life at serial stopping queue)
-      = ;made (mesa_wire/engine view.self own_life links foot.endpoint keys authority kept_at)
-      ? (eq 0 made.floor)
-        ; (MesaClose made.engine)
+      = ;[turn level] (mesa_wire/renew own_life links keys authority kept_at mesa_foot/bounds view foot)
+      ? (eq 0 level)
         ; (Trace ["mesa foot: a new engine was not made" own_life] 0)
         | _ foot view links top floor last own_life at serial stopping queue
-      = ;shut (MesaClose foot.engine)
-        ;kept (mesa_wire/remark file foot.rift top made.floor)
-        raised (mesa_foot/raised made.engine foot)
-        ;turn (mesa_foot/acted made.acts view raised)
-      ; (mesa_wire/act raised.endpoint links turn.does)
-      | _ turn.foot view links top made.floor last own_life at serial stopping queue
+      = ;kept (mesa_wire/remark file foot.rift top level)
+      ; (mesa_wire/act turn.foot.endpoint links turn.does)
+      | _ turn.foot view links top level last own_life at serial stopping queue
      > (./ack err)
       ? !(queue.len) (_ foot view links top floor last own_life at serial stopping queue)
       = ;turn (mesa_foot/landed queue.at(0).request (mesa_wire/why err) view foot)
