@@ -4,10 +4,10 @@
     url = "github:liam-fitzgerald/rex/lf/remove-quip-poems";
     flake = false;
   };
-  # Liam's wormholes branch (enki PR #59): actor and Mesa handles are host capabilities, and
-  # libmesa is in the runtime as opset-83 operations.
+  # The wormholes branch (enki PR #59) with current libmesa and its raw host embedding (enki PR #69):
+  # actor and Mesa handles are host capabilities, and libmesa is in the runtime as opset-83 operations.
   inputs.enki = {
-    url = "github:axsys-org/enki/lf/wormholes";
+    url = "github:axsys-org/enki/ic-mesa-main";
   };
   outputs = { self, nixpkgs, rex, enki }:
     let
@@ -18,8 +18,8 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
-      # the world runtime: enki's wormholes branch as pinned. It holds what the kernel's networking needs
-      # of the runtime: SeqHost, pins as values, sockets that answer, sealing, Entropy and Folder.
+      # the world runtime: enki as pinned. It holds what the kernel's networking needs of the runtime:
+      # SeqHost, pins as values, Mesa's engine, UDP endpoint, authority and key store, Entropy and Folder.
       runtimeFor = system: enki.packages.${system}.default;
     in {
       packages = forAllSystems (system: { runtime = runtimeFor system; });

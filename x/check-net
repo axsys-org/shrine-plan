@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Two worlds on one machine, talking through their Mesa feet.
+"""Two worlds on one machine, talking through their Mesa feet over UDP.
 
 Boots world A (0x51) and world B (0x52) as two processes, each with the mcp and mesa mounts. Nothing outside
-tells a world anything: each foot makes its own seed, and this script then writes, through each world's own
-door, the port its foot is to listen on and a card for the other world, with the key that world's foot
-published. It checks through their doors that what A writes for B arrives in B, under A's own names, in the
-store B keeps for A: a first commit, a change, an addition, a removal, what is public, and a restart of the
-reader. Nothing is read from a world's files.
+tells a world anything: Mesa makes the key of each world in a file that only the runtime reads, and this script
+then writes, through each world's own door, the port its foot is to listen on and a card for the other world,
+with the key that world's foot published. It checks through their doors that what A writes for B arrives in B,
+under A's own names, in the store B keeps for A: a first commit, a change, an addition, a removal, what is
+public, a restart of the reader and of the publisher, a change of the publisher's key, and a reader and a
+publisher that are restored to an older copy of their world.
+
+No file of a world is read. The script lists the names of the files that Mesa keeps for a world, and it copies
+a stopped world's folder to restore it later.
+
+This is the preconfigured Shrine-to-Shrine run over UDP that libmesa's roadmap asks for before any run with an
+Urbit ship (libmesa doc/14, phase 7, first part), with one difference: the cards of the peers are written by
+this script, in the place of Groundwire identity and a verifier. It shows no first contact, and no change of
+key that a peer finds by itself.
 
     x/check-net [--keep] [--base-port 8451]
 
@@ -15,6 +24,7 @@ Exit 0 when every row passes. Run it on the build machine, never beside another 
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -101,6 +111,38 @@ def key_of(world, seconds=180):
     return found[-1] if until(there, seconds) else 0
 
 
+def listens(port):
+    """Whether something on this machine holds a UDP socket on a port, and whether something listens on TCP."""
+    def held(flag):
+        out = subprocess.run(['ss', '-H', flag, f'sport = :{port}'], capture_output=True, text=True).stdout
+        return bool(out.strip())
+    return held('-lun'), held('-ltn')
+
+
+def mesa_files(world):
+    """The names of the files that Mesa keeps for a world, outside the world's records."""
+    folder = world.home / 'world' / 'src' / 'io' / 'mesa'
+    return sorted(os.listdir(folder)) if folder.is_dir() else []
+
+
+def keep_copy(world, name):
+    """Copy a stopped world's folder, to restore the world to this moment later."""
+    target = world.home / name
+    shutil.copytree(world.home / 'world', target, symlinks=True)
+    return target
+
+
+def restore(world, copy):
+    """Put a stopped world back to a copy. What Mesa keeps for the world is outside the world and stays."""
+    live = world.home / 'world'
+    kept = world.home / 'mesa-kept'
+    shutil.move(str(live / 'src' / 'io' / 'mesa'), str(kept))
+    shutil.rmtree(live)
+    shutil.copytree(copy, live, symlinks=True)
+    shutil.rmtree(live / 'src' / 'io' / 'mesa')
+    shutil.move(str(kept), str(live / 'src' / 'io' / 'mesa'))
+
+
 def holds(answer, slot, value):
     """Whether a read's answer holds a slot with a value. The door gives every value as text."""
     properties = answer.get('properties') or {}
@@ -183,6 +225,138 @@ def main():
         b.start(args.timeout)
         row('a reader that was away catches up when it returns',
             until(lambda: holds(b.read('/0x51/our/0x52/doc'), 'value', 12), 180), b.read('/0x51/our/0x52/doc'))
+
+        udp_a, tcp_a = listens(ports['a'][1])
+        udp_b, tcp_b = listens(ports['b'][1])
+        row('each foot holds one UDP socket and no TCP listener', udp_a and udp_b and not tcp_a and not tcp_b,
+            dict(a=(udp_a, tcp_a), b=(udp_b, tcp_b)))
+        row('Mesa keeps the key, its manifest and the authority beside the world, with the mark',
+            mesa_files(a) == ['mark', 'ring', 'ring.authority', 'ring.manifest'], mesa_files(a))
+
+        def said(doc):
+            return a.write(dict(path='/0x51/our/0x52/doc', action='poke', slots={'value': doc}))
+
+        def got(doc, seconds=120):
+            return until(lambda: holds(b.read('/0x51/our/0x52/doc'), 'value', doc), seconds)
+
+        a.stop()
+        old_a = keep_copy(a, 'before-key-change')
+        a.start(args.timeout)
+        said(13)
+        row('a publisher that restarts goes on under its name', got(13, 180), b.read('/0x51/our/0x52/doc'))
+
+        b.stop()
+        old_b = keep_copy(b, 'before-key-change')
+        b.start(args.timeout)
+
+        # A changes its key. Mesa makes the new key; the foot retires the old one.
+        a.write(dict(path='/0x51/io/mesa', action='poke', slots={'life': 2}))
+        changed = []
+
+        def turned():
+            value = slot_of(a.read('/0x51/io/mesa'), 'key')
+            if value is None or int(str(value)) == keys[0]:
+                return False
+            changed.append(int(str(value)))
+            return True
+
+        row('a world changes its key when its record names a later life', until(turned, 120), a.read('/0x51/io/mesa'))
+        new_key = changed[-1] if changed else 0
+        row('the file of the old key is gone, and the new key has a file of its own',
+            until(lambda: mesa_files(a) == ['mark', 'ring.2', 'ring.authority', 'ring.manifest'], 60), mesa_files(a))
+        said(14)
+        time.sleep(20)
+        row('a reader that still holds the old key lands nothing that the new key signed',
+            holds(b.read('/0x51/our/0x52/doc'), 'value', 13), b.read('/0x51/our/0x52/doc'))
+        new_card = {'key': new_key, 'life': 2, 'host': '127.0.0.1', 'port': ports['a'][1]}
+        old_card = {'key': keys[0], 'life': 1, 'host': '127.0.0.1', 'port': ports['a'][1]}
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots=new_card))
+        row('told the new key, the reader goes on under the same name', got(14), b.read('/0x51/our/0x52/doc'))
+
+        # An old card does not bring the old key back.
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots=old_card))
+        row('Mesa does not accept the old key again, and the reason is a record beside the card',
+            until(lambda: holds(b.read('/0x52/io/mesa/0x51/stand'), 'barred', keys[0]), 60),
+            b.read('/0x52/io/mesa/0x51/stand'))
+        said(15)
+        time.sleep(20)
+        row('while the card names a key that Mesa does not accept, the reader lands nothing from that world',
+            holds(b.read('/0x51/our/0x52/doc'), 'value', 14), b.read('/0x51/our/0x52/doc'))
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots=new_card))
+        row('with the accepted key on the card again, the reader catches up', got(15), b.read('/0x51/our/0x52/doc'))
+
+        # The reader is restored to a copy from before the change: its card names the old key again.
+        b.stop()
+        restore(b, old_b)
+        b.start(args.timeout)
+        row('a restored reader does not get the old key back: Mesa keeps what it accepted outside the world',
+            until(lambda: holds(b.read('/0x52/io/mesa/0x51/stand'), 'barred', keys[0]), 120),
+            b.read('/0x52/io/mesa/0x51/stand'))
+        said(16)
+        time.sleep(20)
+        row('and it lands nothing from that world', not holds(b.read('/0x51/our/0x52/doc'), 'value', 16),
+            b.read('/0x51/our/0x52/doc'))
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots=new_card))
+        row('it opens again when the new card is written', got(16, 180), b.read('/0x51/our/0x52/doc'))
+
+        def stands():
+            value = slot_of(b.read('/0x52/io/mesa/0x51/stand'), 'head')
+            return int(str(value)) if value is not None else 0
+
+        before_restore = stands()
+
+        # The publisher is restored to a copy from before its own change: its record names life 1 again.
+        a.stop()
+        restore(a, old_a)
+        a.start(args.timeout)
+        row('a restored publisher does not go back to its old key: its record shows the key that Mesa holds',
+            until(lambda: holds(a.read('/0x51/io/mesa'), 'key', new_key) and holds(a.read('/0x51/io/mesa'), 'life', 2),
+                  120), a.read('/0x51/io/mesa'))
+        said(17)
+        row('and what it writes still lands in the reader, under the same name', got(17, 180),
+            b.read('/0x51/our/0x52/doc'))
+        after_restore = stands()
+        row('the restored publisher uses no version a second time: its versions are of a later continuity',
+            after_restore > before_restore and (after_restore >> 32) == (before_restore >> 32) + 1,
+            dict(before=before_restore, after=after_restore))
+
+        # The reader takes the key off the card: Mesa blocks the publisher.
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots={'key': 0}))
+        time.sleep(5)
+        said(18)
+        time.sleep(20)
+        row('a peer whose card has no key is blocked: the reader lands nothing from it',
+            holds(b.read('/0x51/our/0x52/doc'), 'value', 17), b.read('/0x51/our/0x52/doc'))
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke', slots=new_card))
+        row('the same card again does not lift the block, and the reason is a record',
+            until(lambda: holds(b.read('/0x52/io/mesa/0x51/stand'), 'cause', 'Blocked'), 60),
+            b.read('/0x52/io/mesa/0x51/stand'))
+        time.sleep(15)
+        row('and the reader still lands nothing', holds(b.read('/0x51/our/0x52/doc'), 'value', 17),
+            b.read('/0x51/our/0x52/doc'))
+
+        # The publisher changes its key a second time; a card with that later life lifts the block.
+        a.write(dict(path='/0x51/io/mesa', action='poke', slots={'life': 3}))
+        third = []
+
+        def turned_again():
+            value = slot_of(a.read('/0x51/io/mesa'), 'key')
+            if value is None or int(str(value)) in (keys[0], new_key):
+                return False
+            third.append(int(str(value)))
+            return True
+
+        row('the publisher changes its key a second time', until(turned_again, 120), a.read('/0x51/io/mesa'))
+        row('and keeps one key file', until(lambda: mesa_files(a) == ['mark', 'ring.3', 'ring.authority', 'ring.manifest'], 60),
+            mesa_files(a))
+        b.write(dict(path='/0x52/io/mesa/0x51', action='poke',
+                     slots={'key': third[-1] if third else 0, 'life': 3, 'host': '127.0.0.1', 'port': ports['a'][1]}))
+        row('a card with the later life lifts the block, and the reader catches up', got(18, 180),
+            b.read('/0x51/our/0x52/doc'))
+        udp_a, tcp_a = listens(ports['a'][1])
+        udp_b, tcp_b = listens(ports['b'][1])
+        row('after all of it each foot still holds one UDP socket and no TCP listener',
+            udp_a and udp_b and not tcp_a and not tcp_b, dict(a=(udp_a, tcp_a), b=(udp_b, tcp_b)))
     except Exception as error:
         row('the run completed', False, repr(error))
     finally:

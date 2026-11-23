@@ -2,21 +2,25 @@
 - helm
 - net
 - mesa_foot
+- mesa_wire
 - testing
 - tests/namespace [at=fixture]
 - tests/net [at=shared]
 
-' These tests run three worlds in one process. Each world has its own foot and
-' its own real Mesa engine. The test passes only packets from one world to
-' another. These are the steps:
-' - A world writes.
-' - The foot of that world sends a hint.
-' - The foot of the reader asks.
-' - The pages cross one fragment at a time.
-' - Each landing goes through the land command of the supervisor.
+' Three worlds in one process. Each has its own foot, its own real Mesa
+' engine and its own UDP socket on loopback. Mesa holds each world's key: the
+' test writes the key file and only the runtime reads it. The engines send
+' through their sockets. The test takes each packet off the socket it arrived
+' at and gives it to that world's rules, or loses it, or gives it twice, or
+' gives it late. The steps:
+' - a world writes
+' - that world's foot sends a hint
+' - the reader's foot asks
+' - the pages cross one fragment at a time
+' - each landing goes through the supervisor's land command
 '
-' 0x17 publishes. 0x18 is the peer that 0x17 publishes to. 0x19 is a third
-' world that can read only what is public.
+' 0x17 publishes. 0x18 is the peer 0x17 publishes to. 0x19 is a third world
+' that can read only what is public.
 + foot_tests
   + seed
     \ n=nat
@@ -25,12 +29,18 @@
       w64 (mul w32 w32)
     | add (mul (mul w64 w64) (mul w64 w64)) n
   + world
-    : state=namespace foot=mesa_foot/foot
+    ' A world with its foot, as the wire holds it: the foot's links, the handles
+    ' on the keys and the authority Mesa keeps for the world, its key file, the
+    ' life of that key, and the bounds of its engine. `base` is the first port
+    ' of the net the world is in: each net has ports of its own.
+    : base=nat state=namespace foot=mesa_foot/foot links=row[mesa_wire/link] keys=nat authority=nat ring=str life=nat bounds=row[nat]
   + packet
-    : to=nat from=nat bytes=nat
+    ' A packet that arrived at a world's socket, from a peer, on the link the
+    ' engine knows that peer by.
+    : to=nat from=nat link=nat bytes=nat
   + net
-    ' This is a net. It holds the worlds, the packets on their way, the number
-    ' of carried packets and the number of lost packets.
+    ' A net: the worlds, the packets that arrived and no world has taken yet,
+    ' and the counts of carried and lost packets.
     : worlds=row[foot_tests/world] wire=row[foot_tests/packet] carried=nat lost=nat
   + everyone
     ^ row[nat]
@@ -39,16 +49,64 @@
     \ n=nat
     ^ row[nat]
     | (foot_tests/everyone).keep((\ other=nat !(eq other n)))
+  + port
+    \ base=nat n=nat
+    ^ nat
+    | add base (sub n 17)
+  + ports
+    ' The first of three ports for a net, drawn at random so that a second run
+    ' of these tests on the same machine does not ask for the same ports. They
+    ' are below the range the operating system hands out to other sockets.
+    \ any=nat
+    ^ nat
+    = ;drawn (Entropy 2)
+    | add 20000 (mul 3 (mod drawn 4000))
   + apply
     \ writes=row[[p=path q=writ]] state=namespace
     ^ namespace
     ? (eden_store/changes writes state)
      > (./ok next) next
      > (./err why) state
+  + routes
+    ' The peers of a world, as its cards name them.
+    \ base=nat state=namespace
+    ^ row[mesa_wire/route]
+    = none=row[mesa_wire/route] []
+      n (mesa_foot/id state.self)
+    | (foot_tests/others n).fold none
+      \ out=row[mesa_wire/route] other=nat
+      ^ row[mesa_wire/route]
+      = card=path [state.self 'io 'mesa ($x other)]
+        key (net/held ['key] card state)
+      ? (eq 0 key) out
+      | out.snoc((mesa_wire/route ($x other) other key (nmax 1 (net/held ['life] card state)) 0 "127.0.0.1" (foot_tests/port base other)))
+  + try
+    ' Starts a world's foot as the wire does and gives the answer of the start.
+    ' `floor` is the lowest key manifest revision the world accepts.
+    \ rift=nat floor=nat me=foot_tests/world
+    ^ mesa_wire/up
+    = n (mesa_foot/id me.state.self)
+    | mesa_wire/raise me.ring (foot_tests/port me.base n) rift floor 1 .true (foot_tests/routes me.base me.state) 1 me.bounds me.state
+  + up
+    ' Starts a world's foot.
+    \ rift=nat me=foot_tests/world
+    ^ foot_tests/world
+    = ;started (foot_tests/try rift 0 me)
+    | me.set_foot(started.foot).set_links(started.links).set_keys(started.keys).set_authority(started.authority).set_life(started.life)
+  + down
+    ' Stops a world's foot: closes the engine, the socket and the handles on
+    ' what Mesa keeps. The files stay.
+    \ me=foot_tests/world
+    ^ nat
+    = ;engine (MesaClose me.foot.engine)
+      ;socket (MesaClose me.foot.endpoint)
+      ;keys (MesaClose me.keys)
+      ;authority (MesaClose me.authority)
+    1
   + boot
-    ' It makes a world and a foot for that world. The world holds the key of
-    ' each other world on its card for that other world.
-    \ n=nat
+    ' Makes a world and its foot. The world holds a card for each other world,
+    ' with the key it wants Mesa to accept for it.
+    \ run=nat base=nat bounds=row[nat] n=nat
     ^ foot_tests/world
     = self=iota ($x n)
       blank (namespace self sov/new (fixture/namespace_tests/initial).system (mop/empty))
@@ -58,32 +116,32 @@
           ^ [p=path q=writ]
           = at=path [self 'io 'mesa ($x other)]
           [at (writ/make (myth/sing ['key] (pails/n (Ed25519PublicKey (foot_tests/seed other)))))]
-      peers
-        | (foot_tests/others n).map
-          \ other=nat
-          ^ mesa_foot/peer
-          | mesa_foot/peer ($x other) other (Ed25519PublicKey (foot_tests/seed other))
-    | foot_tests/world (foot_tests/apply cards blank) (mesa_foot/start self (foot_tests/seed n) 0 peers)
+      none=row[mesa_wire/link] []
+      ring (str/cat_all ["mesa_foot_test_" (nat/show run) "_" (nat/show n)])
+      ;saved (WriteFile ring (foot_tests/seed n))
+    | foot_tests/up 0 (foot_tests/world base (foot_tests/apply cards blank) (mesa_foot/start self 0 0 0) none 0 0 ring 1 bounds)
   + again
-    ' It gives the same world with a new foot. This is the state after a
-    ' restart.
+    ' The same world with a new foot, as after a restart: the engine, the socket
+    ' and the handles are closed, and the new foot opens what Mesa keeps in its
+    ' files.
     \ rift=nat me=foot_tests/world
     ^ foot_tests/world
-    = n (mesa_foot/id me.state.self)
-      peers
-        | (foot_tests/others n).map
-          \ other=nat
-          ^ mesa_foot/peer
-          | mesa_foot/peer ($x other) other (Ed25519PublicKey (foot_tests/seed other))
-    | foot_tests/world me.state (mesa_foot/start me.state.self (foot_tests/seed n) rift peers)
+    = ;stopped (foot_tests/down me)
+    | foot_tests/up rift me
   + fresh
-    ' This is not a constant, because a net holds live engines. Live engines
-    ' are made when a caller asks for them, and the module does not keep them
-    ' as a value.
-    \ _=nat
+    ' Not a constant, because a net holds live engines, and those are made when
+    ' a caller asks for them. `run` is the number of the test: each test has
+    ' files of its own.
+    \ run=nat
+    ^ foot_tests/net
+    | foot_tests/tight run mesa_foot/bounds
+  + tight
+    ' A net whose engines have the given bounds.
+    \ run=nat bounds=row[nat]
     ^ foot_tests/net
     = none=row[foot_tests/packet] []
-      worlds (foot_tests/everyone).map(foot_tests/boot)
+      base (foot_tests/ports 0)
+      worlds (foot_tests/everyone).map((\ n=nat (foot_tests/boot run base bounds n)))
     | foot_tests/net worlds none 0 0
   + of
     \ id=nat all=row[foot_tests/world]
@@ -97,46 +155,46 @@
       ^ foot_tests/world
       ? (eq_iota item.state.self me.state.self) me
       item
-  + settled
-    : world=foot_tests/world out=row[foot_tests/packet]
   + settle
-    ' It does what a foot asks, in the same way as the actor that runs the
-    ' foot:
-    ' - It puts what the foot sends in a queue.
-    ' - It makes each write that the foot asks for.
-    ' - It plans each landing on the world as it is, and gives the plan to
-    '   the world as one land command.
-    ' - It tells the foot the answer of the world.
-    ' - It tells the foot that the world moved.
+    ' Does what a foot asks, the way the actor that runs the foot does:
+    ' - sends each packet the foot made to its peer's socket
+    ' - makes each write the foot asks for
+    ' - plans each landing on the world as it is and gives the plan to the
+    '   world as one land command
+    ' - tells the foot the world's answer
+    ' - tells the foot the world moved
     \ me=foot_tests/world does=row[mesa_foot/effect]
-    ^ foot_tests/settled
-    = none=row[foot_tests/packet] []
-      landed=maybe[iota] .none
+    ^ foot_tests/world
+    = landed=maybe[iota] .none
     % at=foot_tests/world me
       todo=row[mesa_foot/effect] does
-      out=row[foot_tests/packet] none
-    ^ foot_tests/settled
-    ? !(todo.len) (foot_tests/settled at out)
+    ^ foot_tests/world
+    ? !(todo.len) at
     = first todo.at(0)
       rest todo.drop(1)
     ? first
      > (./send to bytes)
-      | _ at rest out.snoc((foot_tests/packet to (mesa_foot/id at.foot.self) bytes))
+      = found at.links.keep((\ item=mesa_wire/link (and (eq item.id to) (gt item.address 0))))
+        ;sent (? (gt found.len 0) (MesaSend at.foot.endpoint to found.at(0).gen bytes) 0)
+      | _ at rest
+     > (./renew era)
+      ? !(eq era at.foot.era) (_ at rest)
+      = ;[turn level] (mesa_wire/renew at.life at.links at.keys at.authority (mesa_wire/beside at.ring "manifest") at.bounds at.state at.foot)
+      | _ at.set_foot(turn.foot) rest.weld(turn.does)
      > (./admit request change)
       = outcome (foot_tests/made change at.state)
       ? outcome
        > (./err why)
         = refused=maybe[iota] (./some why)
           told (mesa_foot/landed request refused at.state at.foot)
-        | _ (foot_tests/world at.state told.foot) rest.weld(told.does) out
+        | _ at.set_foot(told.foot) rest.weld(told.does)
        > (./ok next)
         = told (mesa_foot/landed request landed next at.foot)
-          fitted (foot_tests/refit (foot_tests/world next told.foot))
-          moved (mesa_foot/turned next fitted.foot)
-        | _ (foot_tests/world next moved.foot) rest.weld(told.does).weld(moved.does) out
+          fitted (foot_tests/refit at.set_state(next).set_foot(told.foot))
+          moved (mesa_foot/turned next fitted.world.foot)
+        | _ fitted.world.set_foot(moved.foot) rest.weld(told.does).weld(fitted.does).weld(moved.does)
   + made
-    ' It makes one change that a foot asks for, as the actor that runs the
-    ' foot does.
+    ' Makes one change a foot asks for, as the actor that runs the foot does.
     \ change=mesa_foot/change state=namespace
     ^ either[iota namespace]
     ? change
@@ -147,38 +205,45 @@
       ? (net/land root card epic state)
        > (./err why) (./err why)
        > (./ok plan) (shared/net_tests/admit root.at(0) plan state)
+  + fitted
+    : world=foot_tests/world does=row[mesa_foot/effect]
   + refit
-    ' It does what the actor does when a card changes. It gives the world a
-    ' foot that knows each peer by the key that the card for that peer now
-    ' holds.
+    ' Does what the actor does when a card changes: tells Mesa what the cards
+    ' say and gives the foot the peers Mesa accepted.
     \ me=foot_tests/world
-    ^ foot_tests/world
-    = peers
-        | me.foot.peers.map
-          \ item=mesa_foot/peer
-          ^ mesa_foot/peer
-          = card=path [me.state.self 'io 'mesa item.world]
-          | mesa_foot/peer item.world item.id (net/held ['key] card me.state)
-    ? (equal[row[mesa_foot/peer]] peers me.foot.peers) me
-    | foot_tests/world me.state (mesa_foot/start me.state.self me.foot.seed me.foot.rift peers)
+    ^ foot_tests/fitted
+    = ;fed (mesa_wire/feed (foot_tests/routes me.base me.state) me.links me.keys me.authority (mesa_wire/beside me.ring "authority") me.state me.foot)
+      met (mesa_foot/meet (mesa_wire/peers fed.links) fed.locks me.foot)
+      turn (mesa_foot/acted fed.acts me.state met)
+    | foot_tests/fitted me.set_foot(turn.foot).set_links(fed.links) fed.notes.weld(turn.does)
+  + drain
+    ' Takes the packets each world's socket holds.
+    \ start=foot_tests/net
+    ^ foot_tests/net
+    | start.worlds.fold start
+      \ ;now=foot_tests/net item=foot_tests/world
+      ^ foot_tests/net
+      = ;came (MesaHear item.foot.endpoint)
+        got=row[row[nat]] came
+        id (mesa_foot/id item.state.self)
+      | now.set_wire(now.wire.weld(got.map((\ part=row[nat] (foot_tests/packet id part.at(0) part.at(1) part.at(2))))))
   + took
-    ' It gives a net after one of its worlds took a turn.
+    ' A net after one of its worlds took a turn.
     \ me=foot_tests/world turn=mesa_foot/turn now=foot_tests/net
     ^ foot_tests/net
-    = done (foot_tests/settle (foot_tests/world me.state turn.foot) turn.does)
-    | now.set_worlds((foot_tests/put done.world now.worlds)).set_wire(now.wire.weld(done.out))
+    = ;done (foot_tests/settle me.set_foot(turn.foot) turn.does)
+    | foot_tests/drain now.set_worlds((foot_tests/put done now.worlds))
   + carry
-    ' It carries packets, the oldest packet first, until there are no more
-    ' packets or there is no more fuel. fate tells what occurs to the n-th
-    ' carried packet:
-    ' - 0: the packet arrives.
-    ' - 1: the packet is lost.
-    ' - 2: the packet arrives two times.
-    ' - 3: all the packets behind it go before it.
+    ' Gives packets to the worlds they arrived at, oldest first, until none
+    ' waits or the fuel runs out. fate says what happens to the n-th packet:
+    ' - 0: the world gets it
+    ' - 1: it is lost
+    ' - 2: the world gets it twice
+    ' - 3: every packet behind it goes first
     \ fate={\ nat}nat fuel=nat start=foot_tests/net
     ^ foot_tests/net
     % left=nat fuel
-      now=foot_tests/net start
+      now=foot_tests/net (foot_tests/drain start)
     ^ foot_tests/net
     ? !(left) now
     ? !(now.wire.len) now
@@ -186,10 +251,10 @@
       rest now.wire.drop(1)
       what (fate now.carried)
       counted now.set_carried(now.carried.inc)
-    ? (eq what 1) (_ left.dec counted.set_wire(rest).set_lost(now.lost.inc))
+    ? (eq what 1) (_ left.dec (foot_tests/drain counted.set_wire(rest).set_lost(now.lost.inc)))
     ? (eq what 3) (_ left.dec counted.set_wire(rest.snoc(first)))
     = target (foot_tests/of first.to now.worlds)
-      ;turn (mesa_foot/heard first.from first.bytes target.state target.foot)
+      ;turn (mesa_foot/heard first.from first.link first.bytes target.state target.foot)
       queue (? (eq what 2) rest.snoc(first) rest)
     | _ left.dec (foot_tests/took target turn counted.set_wire(queue))
   + clean
@@ -197,11 +262,10 @@
     ^ nat
     0
   + rough
-    ' It gives the fate of a packet from a hash of the packet's number. One
-    ' packet in five is lost. One packet in ten arrives two times. For one
-    ' packet in ten, all the packets behind it go before it. The fates are the
-    ' same in each run. They have no regular rhythm, and thus an exchange
-    ' cannot have the same rhythm as the fates.
+    ' The fate of a packet, from a hash of its number. One in five is lost. One
+    ' in ten arrives twice. For one in ten, every packet behind it goes first.
+    ' The fates are the same in every run. They have no regular rhythm, so an
+    ' exchange cannot fall into step with them.
     \ n=nat
     ^ nat
     = r (mod (Sha256 (add n (bex 64))) 100)
@@ -210,16 +274,17 @@
     ? (lt r 40) 3
     0
   + write
-    ' It makes a world commit some writes and then tells the foot of that
-    ' world.
+    ' Makes a world commit some writes and then tells its foot, as the actor
+    ' does: the foot tells Mesa what the cards say, then sends its hints.
     \ id=nat writes=row[[p=path q=writ]] now=foot_tests/net
     ^ foot_tests/net
     = me (foot_tests/of id now.worlds)
       next (foot_tests/apply writes me.state)
-      moved (foot_tests/world next me.foot)
-    | foot_tests/took moved (mesa_foot/turned next me.foot) now
+      fitted (foot_tests/refit me.set_state(next))
+      moved (mesa_foot/turned next fitted.world.foot)
+    | foot_tests/took fitted.world (mesa_foot/turn moved.foot fitted.does.weld(moved.does)) now
   + tick
-    ' It makes time pass for each world.
+    ' Makes time pass for every world.
     \ time=nat start=foot_tests/net
     ^ foot_tests/net
     = ids=row[nat] start.worlds.map((\ item=foot_tests/world (mesa_foot/id item.state.self)))
@@ -229,9 +294,8 @@
       = me (foot_tests/of id now.worlds)
       | foot_tests/took me (mesa_foot/tick time me.state me.foot) now
   + weather
-    ' It does rounds. In each round, it makes time pass and then carries
-    ' packets. It stops when the wire is quiet for a full round or when there
-    ' are no more rounds.
+    ' Runs rounds. Each round makes time pass and then carries packets. It
+    ' stops when the wire is quiet for a whole round or the rounds run out.
     \ fate={\ nat}nat rounds=nat start=foot_tests/net
     ^ foot_tests/net
     % round=nat 1
@@ -265,11 +329,11 @@
     ?> (./some said) (pail/as[pails/q] held) "none"
     | str/from_atom (iota_show said.q)
   + boxed
-    ' This is a record's value that holds a pin. The pin is bytes kept apart
-    ' from the record.
+    ' A record value that holds a pin. The pin is bytes kept apart from the
+    ' record.
     : held=pin[row[nat]]
   + coded
-    ' This is a record's value that holds code.
+    ' A record value that holds code.
     : run=pin[{\ nat}nat]
   + unboxed
     \ name=path state=namespace
@@ -289,9 +353,8 @@
     = root=path [($x 17) 'our 'public]
     | root.weld(rel)
   + first
-    ' It gives the first commit of the publisher. The commit makes a root for
-    ' the publisher's peer with a doc and a deep name. It also makes a public
-    ' root with a note.
+    ' The publisher's first commit. It makes a root for the publisher's peer
+    ' with a doc and a deep name, and a public root with a note.
     ^ row[[p=path q=writ]]
     [[(foot_tests/pub []) (writ/make (foot_tests/rec 1))]
      [(foot_tests/pub ['doc]) (writ/make (foot_tests/rec 10))]
@@ -307,16 +370,13 @@
       bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
       carol_doc=path [($x 17) 'our ($x 18) 'doc]
       carol_note=path [($x 17) 'our 'public 'note]
-      n0 (foot_tests/fresh 0)
+      n0 (foot_tests/fresh 1)
       n1 (foot_tests/write 17 foot_tests/first n0)
       hints n1.wire.len
       n2 (foot_tests/carry foot_tests/clean 4000 n1)
       alice (foot_tests/state 17 n2)
       bob (foot_tests/state 18 n2)
       carol (foot_tests/state 19 n2)
-      said (net/said bob_doc bob)
-      held (sovereign_care .x bob_doc bob).fil.fall(myth/new)
-      key (Ed25519PublicKey (foot_tests/seed 17))
     [(testing/nat "a commit sends a hint for each root that holds something" 3 hints)
      (testing/nat "nothing is left on the wire" 0 n2.wire.len)
      (testing/nat "the peer holds the doc" 10 (foot_tests/value bob_doc bob))
@@ -324,28 +384,34 @@
      (testing/nat "and what is public" 40 (foot_tests/value bob_note bob))
      (testing/nat "its card stands at the publisher's head" (net/stamp 0 alice.case(.z (foot_tests/pub [])).fall(0)) (net/held ['head] bob_card bob))
      (testing/nat "the record is the publisher's own pin, byte for byte" 1 (eq (foot_tests/hash (foot_tests/pub ['doc]) alice) (foot_tests/hash bob_doc bob)))
-     (testing/nat "its statement carries the publisher's signature" 1 (gt said.sig 0))
-     (testing/nat "which anyone holding the key can check against the record" 1 (net/attested key (foot_tests/pub ['doc]) said held))
+     (testing/nat "the reader keeps the version that the publisher gave the record" (net/stamp 0 alice.case(.x (foot_tests/pub ['doc])).fall(0)) (net/version bob_doc bob))
      (testing/nat "the third world holds what is public" 40 (foot_tests/value carol_note carol))
      (testing/nat "and nothing published to the peer" 0 (net/live carol_doc carol))]
   + gate
-    ' The third world asks the publisher for the peer's root by name.
+    ' The third world asks the publisher for the peer's root by name. The ask
+    ' arrives at the publisher's socket, which reports it as from the third
+    ' world: the socket knows a sender by the address on its card.
     \ _=unit
     ^ row[testing/check]
-    = n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+    = n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 2)))
       alice (foot_tests/of 17 n1.worlds)
+      bob (foot_tests/of 18 n1.worlds)
       carol (foot_tests/of 19 n1.worlds)
       head (net/stamp 0 alice.state.case(.z (foot_tests/pub [])).fall(0))
-      asking (mesa_foot/read_page 17 101 18 0 head 0 carol.state carol.foot)
-      packets asking.does.keep((\ item=mesa_foot/effect ?=((./send _ _) item)))
-      first
-        ?> (./send to bytes) packets.at(0) 0
-        bytes
-      ;refused (mesa_foot/heard 19 first alice.state alice.foot)
-      ;allowed (mesa_foot/heard 18 first alice.state alice.foot)
-    [(testing/nat "the ask leaves the third world" 1 (gt packets.len 0))
-     (testing/nat "asked by the third world, the publisher answers nothing" 0 refused.does.len)
-     (testing/nat "asked by the peer, it answers" 1 (gt allowed.does.len 0))]
+      ;asking (mesa_foot/read_page 17 101 18 0 head 0 carol.state carol.foot)
+      ;came (MesaHear alice.foot.endpoint)
+      got=row[row[nat]] came
+      blank=row[nat] [0 0 0]
+      ask (? (gt got.len 0) got.at(0) blank)
+      ;refused (mesa_foot/heard ask.at(0) ask.at(1) ask.at(2) alice.state alice.foot)
+      ;silence (MesaHear carol.foot.endpoint)
+      to_bob alice.links.keep((\ item=mesa_wire/link (eq item.id 18))).at(0).gen
+      ;allowed (mesa_foot/heard 18 to_bob ask.at(2) alice.state alice.foot)
+      ;answer (MesaHear bob.foot.endpoint)
+    [(testing/nat "the ask arrives at the publisher" 1 got.len)
+     (testing/nat "from the third world" 19 ask.at(0))
+     (testing/nat "asked by the third world, the publisher answers nothing" 0 silence.len)
+     (testing/nat "asked by the peer, it answers" 1 (gt answer.len 0))]
   + changes
     \ _=unit
     ^ row[testing/check]
@@ -357,7 +423,7 @@
       second=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 11))]
         [(foot_tests/pub ['c]) (writ/make (foot_tests/rec 30))]
         [(foot_tests/pub ['a 'b]) gone]]
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 3)))
       before (foot_tests/state 18 n1).local.top
       n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 second n1))
       bob (foot_tests/state 18 n2)
@@ -384,7 +450,7 @@
         [(foot_tests/pub ['a 'b]) gone]]
       third=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 12))]
         [(foot_tests/open ['note]) (writ/poke (foot_tests/rec 41))]]
-      n1 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 4)))
       n2 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 second n1))
       n3 (foot_tests/carry foot_tests/rough 4000 (foot_tests/write 17 third n2))
       n4 (foot_tests/weather foot_tests/rough 40 n3)
@@ -414,7 +480,7 @@
       gone=writ .cull
       uncode=row[[p=path q=writ]] [[(foot_tests/pub ['code]) gone]
         [(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 13))]]
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 5)))
       n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 blob n1))
       held (foot_tests/state 18 n2)
       n3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 code n2))
@@ -427,49 +493,58 @@
      (testing/text "the card says why" "net_unfit" (foot_tests/why bob_card stuck))
      (testing/nat "and what the reader held stays" 26 (foot_tests/unboxed bob_blob stuck))
      (testing/nat "once the publisher takes the code away, its next change lands" 13 (foot_tests/value bob_doc freed))]
-  + keys
-    ' It gives the keys that one foot shares with a peer.
-    \ id=nat foot=mesa_foot/foot
-    ^ mesa_foot/lock
-    | (mesa_foot/lock_of id foot).fall((mesa_foot/lock id 0 0 0))
+  + shut
+    ' Seals a page with what a foot shares with a peer, or gives 0.
+    \ with=maybe[mesa_foot/lock] name=nat page=nat
+    ^ nat
+    ?> (./some held) with 0
+    | mesa_foot/wrap held name page
+  + unshut
+    \ with=maybe[mesa_foot/lock] name=nat bytes=nat
+    ^ nat
+    ?> (./some held) with 0
+    | mesa_foot/unwrap held name bytes
   + sealing
+    ' What two worlds share is a secret Mesa makes for each of them and keeps.
+    ' A foot holds only a handle on it. So the test compares what the secrets
+    ' do, not the secrets.
     \ _=unit
     ^ row[testing/check]
-    = alice (foot_tests/boot 17).foot
-      bob (foot_tests/boot 18).foot
-      carol (foot_tests/boot 19).foot
-      ab (foot_tests/keys 18 alice)
-      ba (foot_tests/keys 17 bob)
-      ca (foot_tests/keys 17 carol)
-      cb (foot_tests/keys 18 carol)
+    = n0 (foot_tests/fresh 6)
+      alice (foot_tests/of 17 n0.worlds).foot
+      bob (foot_tests/of 18 n0.worlds).foot
+      carol (foot_tests/of 19 n0.worlds).foot
+      open=maybe[mesa_foot/lock] .none
+      ab (mesa_foot/lock_of 18 alice)
+      ba (mesa_foot/lock_of 17 bob)
+      ca (mesa_foot/lock_of 17 carol)
+      cb (mesa_foot/lock_of 18 carol)
       name (mesa_foot/name 101 18 0 7)
       other (mesa_foot/name 101 18 0 8)
       page (PinBytes (pin (foot_tests/rec 10)))
-      sealed (mesa_foot/wrap ab name page)
+      sealed (foot_tests/shut ab name page)
       hash (PinHash (pin (foot_tests/rec 10)))
-    [(testing/nat "two peers derive the same keys, each from its own seed" 1 (and (eq ab.seal ba.seal) (eq ab.name ba.name)))
-     (testing/nat "a third world derives other keys with each of them" 0 (add (eq ca.seal ab.seal) (eq cb.seal ab.seal)))
-     (testing/nat "the peer opens what was sealed for it" 1 (eq page (mesa_foot/unwrap ba name sealed)))
-     (testing/nat "the third world does not" 0 (mesa_foot/unwrap ca name sealed))
-     (testing/nat "nor with its key for the other peer" 0 (mesa_foot/unwrap cb name sealed))
+    [(testing/nat "each of two peers shares a secret with the other" 1 (and (maybe/is_some ab) (maybe/is_some ba)))
+     (testing/nat "the peer opens what was sealed for it" 1 (eq page (foot_tests/unshut ba name sealed)))
+     (testing/nat "the third world does not" 0 (foot_tests/unshut ca name sealed))
+     (testing/nat "nor with what it shares with the other peer" 0 (foot_tests/unshut cb name sealed))
      (testing/nat "a sealed page is not the page" 0 (eq sealed page))
      (testing/nat "it is the page, a nonce and a tag" 40 (sub (wid sealed) (wid page)))
-     (testing/nat "under another name it does not open" 0 (mesa_foot/unwrap ba other sealed))
-     (testing/nat "changed by one bit it does not open" 0 (mesa_foot/unwrap ba name (add sealed (bex 250))))
-     (testing/nat "cut short it does not open" 0 (mesa_foot/unwrap ba name (add (mod sealed (bex 80)) (bex 80))))
-     (testing/nat "the same page under the same name seals the same" 1 (eq sealed (mesa_foot/wrap ab name page)))
-     (testing/nat "a pin of a peer's root is asked for by an alias, not its hash" 0 (eq hash (mesa_foot/veil ab.name hash)))
-     (testing/nat "which both peers compute" 1 (eq (mesa_foot/veil ab.name hash) (mesa_foot/veil ba.name hash)))
-     (testing/nat "and the third world cannot" 0 (eq (mesa_foot/veil ca.name hash) (mesa_foot/veil ab.name hash)))
-     (testing/nat "a public pin is asked for by its hash" 1 (eq hash (mesa_foot/veil 0 hash)))]
+     (testing/nat "under another name it does not open" 0 (foot_tests/unshut ba other sealed))
+     (testing/nat "changed by one bit it does not open" 0 (foot_tests/unshut ba name (add sealed (bex 250))))
+     (testing/nat "cut short it does not open" 0 (foot_tests/unshut ba name (add (mod sealed (bex 80)) (bex 80))))
+     (testing/nat "the same page under the same name seals the same" 1 (eq sealed (foot_tests/shut ab name page)))
+     (testing/nat "a pin of a peer's root is asked for by an alias, not its hash" 0 (eq hash (mesa_foot/veil ab hash)))
+     (testing/nat "which both peers compute" 1 (eq (mesa_foot/veil ab hash) (mesa_foot/veil ba hash)))
+     (testing/nat "and the third world cannot" 0 (eq (mesa_foot/veil ca hash) (mesa_foot/veil ab hash)))
+     (testing/nat "a public pin is asked for by its hash" 1 (eq hash (mesa_foot/veil open hash)))]
   + blob
     \ name=path state=namespace
     ^ nat
     | (sovereign_care .x name state).fil.fall(myth/new).nat_at(['blob] 0)
   + long
-    ' This test uses a record of two and a half million bytes. That is more
-    ' than Mesa carries as one page. Thus the record crosses in slices, and it
-    ' is sealed.
+    ' A record of two and a half million bytes, more than Mesa carries as one
+    ' page. It crosses in slices, sealed.
     \ _=unit
     ^ row[testing/check]
     = bob_big=path [($x 17) 'our ($x 18) 'big]
@@ -477,7 +552,7 @@
       big (add (bex 20000000) 12345)
       heavy=row[[p=path q=writ]] [[(foot_tests/pub ['big]) (writ/make (myth/sing ['blob] (pails/n big)))]]
       after=row[[p=path q=writ]] [[(foot_tests/pub ['doc]) (writ/poke (foot_tests/rec 14))]]
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 7)))
       n2 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 heavy n1))
       n3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 after n2))
       alice (foot_tests/state 17 n2)
@@ -487,10 +562,10 @@
      (testing/nat "it took more packets than a page has fragments" 1 (gt n2.carried 2000))
      (testing/nat "and what follows it still crosses" 14 (foot_tests/value bob_doc (foot_tests/state 18 n3)))]
   + many
-    ' This test uses five records that are each too long for one page, in one
-    ' commit. The reader asks for the five at the same time. The publisher
-    ' keeps the bytes of four long pages at most, and makes a page again when
-    ' a reader asks for a slice of a page that it no longer keeps.
+    ' Five records, each too long for one page, in one commit. The reader asks
+    ' for all five at once. The publisher keeps the bytes of at most four long
+    ' pages and remakes a page when a reader asks for a slice of one it no
+    ' longer keeps.
     \ _=unit
     ^ row[testing/check]
     = sizes=row[nat] [1 2 3 4 5]
@@ -505,28 +580,27 @@
           ^ [p=path q=writ]
           = at=path (foot_tests/pub ['big ($u n)])
           [at (writ/make (myth/sing ['blob] (pails/n (big n))))]
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 8)))
       n2 (foot_tests/weather foot_tests/clean 8 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 heavy n1)))
       bob (foot_tests/state 18 n2)
       got (sizes.keep((\ n=nat (eq (big n) (foot_tests/blob (there n) bob))))).len
     [(testing/nat "each of the five long records arrives" 5 got)]
   + lost
-    ' It is the fate of each packet while a world is not there.
+    ' The fate of every packet while a world is away.
     \ n=nat
     ^ nat
     1
   + recovers
-    ' A foot keeps no list of work. After a restart it has the records of its
-    ' world and no other knowledge. In this test the publisher changes a
-    ' record three times while no packet arrives. Then the two feet start
-    ' again. The reader gets what it did not get, from where its card says
-    ' that the root stands.
+    ' A foot keeps no list of work. After a restart it has its world's records
+    ' and nothing else. Here the publisher changes a record three times while
+    ' no packet arrives. Then both feet start again. The reader gets what it
+    ' missed, from where its card says the root stands.
     \ _=unit
     ^ row[testing/check]
     = bob_doc=path [($x 17) 'our ($x 18) 'doc]
       bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
       doc=path (foot_tests/pub ['doc])
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 9)))
       stood (net/held ['head] bob_card (foot_tests/state 18 n1))
       e2=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 11))]]
       e3=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 12))]]
@@ -551,16 +625,16 @@
      (testing/nat "the record has two cases in the store that the reader keeps for the publisher" 2 bob.case(.x bob_doc).fall(0))
      (testing/nat "and the statement names the fourth version of the publisher" (net/stamp 0 alice.case(.x doc).fall(0)) (net/version bob_doc bob))]
   + unanswered
-    ' A reader commits a landing and stops before its foot gets the answer.
-    ' The record and where the root stands were one admission, and thus the
-    ' new foot finds the two together. The publisher offers the same version
-    ' again, and the reader does not land it a second time.
+    ' A reader commits a landing and stops before its foot gets the answer. The
+    ' record and where the root stands were one admission, so the new foot
+    ' finds the two together. The publisher offers the same version again, and
+    ' the reader does not land it a second time.
     \ _=unit
     ^ row[testing/check]
     = bob_doc=path [($x 17) 'our ($x 18) 'doc]
       bob_card=path [($x 18) 'io 'mesa ($x 17) 'stand]
       doc=path (foot_tests/pub ['doc])
-      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 0)))
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 10)))
       e2=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 11))]]
       n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 e2 n1))
       landed (foot_tests/state 18 n2)
@@ -576,6 +650,159 @@
      (testing/nat "the statement keeps its case" landed.case(.x (net/note ($x 18) bob_doc)).fall(0) bob.case(.x (net/note ($x 18) bob_doc)).fall(0))
      (testing/nat "the root stands where it stood" head (net/held ['head] bob_card bob))
      (testing/nat "and no landing is in progress" 0 (foot_tests/of 18 n4.worlds).foot.lands.len)]
+  + interrupted
+    ' A reader stops in the middle of a long page, and then the publisher stops
+    ' too. Each starts again with its world's records and nothing else, and the
+    ' page arrives.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_big=path [($x 17) 'our ($x 18) 'big]
+      big (add (bex 20000000) 777)
+      heavy=row[[p=path q=writ]] [[(foot_tests/pub ['big]) (writ/make (myth/sing ['blob] (pails/n big)))]]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 11)))
+      n2 (foot_tests/carry foot_tests/clean 700 (foot_tests/write 17 heavy n1))
+      partly (foot_tests/blob bob_big (foot_tests/state 18 n2))
+      cut n2.set_worlds((foot_tests/put (foot_tests/again 0 (foot_tests/of 18 n2.worlds)) n2.worlds))
+      n3 (foot_tests/carry foot_tests/clean 700 (foot_tests/weather foot_tests/clean 2 cut))
+      cut_again n3.set_worlds((foot_tests/put (foot_tests/again 0 (foot_tests/of 17 n3.worlds)) n3.worlds))
+      n4 (foot_tests/weather foot_tests/clean 12 cut_again)
+    [(testing/nat "the page is not there when the reader stops" 0 partly)
+     (testing/nat "after the two worlds started again, the long page arrives" 1 (eq big (foot_tests/blob bob_big (foot_tests/state 18 n4))))
+     (testing/nat "as the publisher's own pin" 1 (eq (foot_tests/hash (foot_tests/pub ['big]) (foot_tests/state 17 n4)) (foot_tests/hash bob_big (foot_tests/state 18 n4))))]
+  + sustained
+    ' An engine holds a bounded number of bytes of bound pages. Here the bound
+    ' is 3 MB and the publisher writes a 1.2 MB record four times. The engine
+    ' runs out of room, the foot asks for a new engine, and the reader asks
+    ' again. A name always has the same content, so the reader gets the same
+    ' page from the new engine.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_big=path [($x 17) 'our ($x 18) 'big]
+      small=row[nat] [65536 3000000 67108864 1024 100 2000 4]
+      big (\ n=nat (add (bex 9700000) n))
+      version
+        \ n=nat
+        ^ row[[p=path q=writ]]
+        [[(foot_tests/pub ['big]) (writ/poke (myth/sing ['blob] (pails/n (big n))))]]
+      first=row[[p=path q=writ]] [[(foot_tests/pub ['big]) (writ/make (myth/sing ['blob] (pails/n (big 1))))]]
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/tight 12 small)))
+      n2 (foot_tests/weather foot_tests/clean 6 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 first n1)))
+      n3 (foot_tests/weather foot_tests/clean 6 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 (version 2) n2)))
+      n4 (foot_tests/weather foot_tests/clean 6 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 (version 3) n3)))
+      n5 (foot_tests/weather foot_tests/clean 12 (foot_tests/carry foot_tests/clean 60000 (foot_tests/write 17 (version 4) n4)))
+      alice (foot_tests/of 17 n5.worlds)
+    [(testing/nat "the first version arrives" 1 (eq (big 1) (foot_tests/blob bob_big (foot_tests/state 18 n2))))
+     (testing/nat "the engine of the publisher was full, and the foot got a new engine" 1 (gt alice.foot.era 0))
+     (testing/nat "the reader holds the last version" 1 (eq (big 4) (foot_tests/blob bob_big (foot_tests/state 18 n5))))
+     (testing/nat "as the publisher's own pin" 1 (eq (foot_tests/hash (foot_tests/pub ['big]) (foot_tests/state 17 n5)) (foot_tests/hash bob_big (foot_tests/state 18 n5))))
+     (testing/nat "and no read is left in progress" 0 (foot_tests/of 18 n5.worlds).foot.asks.len)]
+  + turn_key
+    ' Changes a world's key to the key of life 2, as the actor does when the
+    ' foot's record names a later life.
+    \ id=nat now=foot_tests/net
+    ^ foot_tests/net
+    = me (foot_tests/of id now.worlds)
+      no_locks=row[mesa_foot/lock] []
+      ;turned (mesa_wire/rotate me.state.self me.ring me.life 2 me.foot.endpoint me.foot.engine me.keys me.authority)
+      fitted (foot_tests/refit me.set_life(2).set_foot(me.foot.set_locks(no_locks)))
+      turn (mesa_foot/acted turned.acts fitted.world.state fitted.world.foot)
+    | foot_tests/took fitted.world (mesa_foot/turn turn.foot fitted.does.weld(turn.does)) now
+  + cause
+    \ card=path state=namespace
+    ^ str
+    | (sovereign_care .x card state).fil.fall(myth/new).txt_at(['cause])
+  + barred
+    ' A reader takes the key off a publisher's card. Mesa then blocks that
+    ' publisher. Writing the same card again does not lift the block: an old
+    ' card must not bring a peer back. The publisher changes its key, and a
+    ' card with that later life lifts the block.
+    \ _=unit
+    ^ row[testing/check]
+    = bob_doc=path [($x 17) 'our ($x 18) 'doc]
+      card=path [($x 18) 'io 'mesa ($x 17)]
+      stand=path [($x 18) 'io 'mesa ($x 17) 'stand]
+      doc=path (foot_tests/pub ['doc])
+      n1 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 foot_tests/first (foot_tests/fresh 13)))
+      k1 (net/held ['key] card (foot_tests/state 18 n1))
+      off=row[[p=path q=writ]] [[card (writ/poke (myth/sing ['key] (pails/n 0)))]]
+      n2 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 18 off n1))
+      e2=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 11))]]
+      n3 (foot_tests/weather foot_tests/clean 3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 e2 n2)))
+      on=row[[p=path q=writ]] [[card (writ/poke (myth/sing ['key] (pails/n k1)))]]
+      n4 (foot_tests/weather foot_tests/clean 3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 18 on n3)))
+      n5 (foot_tests/turn_key 17 n4)
+      alice (foot_tests/of 17 n5.worlds)
+      ;stood (MesaStanding alice.authority 17)
+      k2 stood.at(1)
+      newer=row[[p=path q=writ]] [[card (writ/poke (myth/sing ['key] (pails/n k2)).put(['life] (pails/n 2)))]]
+      n7 (foot_tests/weather foot_tests/clean 4 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 18 newer n5)))
+      back=row[[p=path q=writ]] [[card (writ/poke (myth/sing ['key] (pails/n k1)).put(['life] (pails/n 1)))]]
+      n8 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 18 back n7))
+      e3=row[[p=path q=writ]] [[doc (writ/poke (foot_tests/rec 12))]]
+      n9 (foot_tests/weather foot_tests/clean 3 (foot_tests/carry foot_tests/clean 4000 (foot_tests/write 17 e3 n8)))
+    [(testing/nat "the reader holds the first content" 10 (foot_tests/value bob_doc (foot_tests/state 18 n1)))
+     (testing/nat "with no key on the card, the publisher is not a peer of the reader" 0 (foot_tests/of 18 n2.worlds).foot.peers.keep((\ item=mesa_foot/peer (eq item.id 17))).len)
+     (testing/nat "and the reader lands nothing from it" 10 (foot_tests/value bob_doc (foot_tests/state 18 n3)))
+     (testing/nat "the same card again does not bring the publisher back" 10 (foot_tests/value bob_doc (foot_tests/state 18 n4)))
+     (testing/nat "the key that Mesa did not accept is a record beside the card" k1 (net/held ['barred] stand (foot_tests/state 18 n4)))
+     (testing/text "with the reason" "Blocked" (foot_tests/cause stand (foot_tests/state 18 n4)))
+     (testing/nat "the publisher has a new key" 0 (eq k1 k2))
+     (testing/nat "a card with the later life and its key lifts the block: the reader catches up" 11 (foot_tests/value bob_doc (foot_tests/state 18 n7)))
+     (testing/text "a card that goes back to the old life is not accepted" "Rollback" (foot_tests/cause stand (foot_tests/state 18 n8)))
+     (testing/nat "and while it is there the reader lands nothing" 11 (foot_tests/value bob_doc (foot_tests/state 18 n9)))]
+  + turning
+    ' A world stops after Mesa activated its new key and before the old key was
+    ' retired. When it starts again, the foot finishes the change: the old key
+    ' is retired and its file is removed.
+    \ _=unit
+    ^ row[testing/check]
+    = n0 (foot_tests/fresh 14)
+      alice (foot_tests/of 17 n0.worlds)
+      next (mesa_wire/ring_of alice.ring 2)
+      ;got (MesaKeyImport alice.keys (mesa_wire/spelled next) 2 2 0 1)
+      ;why (MesaVouch alice.authority (mesa_wire/beside alice.ring "authority") (div (Now 0) 1000000) 17 mesa_foot/domain 2 0 got.at(0))
+      ;acts (MesaActivate alice.keys alice.authority alice.foot.engine alice.foot.endpoint (mesa_wire/beside alice.ring "manifest") 2)
+      ;before (Stamp alice.ring)
+      ;back (foot_tests/again 0 alice)
+      ;after (Stamp alice.ring)
+      ;kept (Stamp next)
+      ;stood (MesaStanding back.authority 17)
+    [(testing/nat "Mesa accepted the new key" 0 why)
+     (testing/nat "and activated it" 1 (gt (mesa_wire/revision acts) 0))
+     (testing/nat "the world stopped with the file of the old key there" 1 (gt before 0))
+     (testing/nat "the world starts again at the later life" 2 back.life)
+     (testing/nat "with the key that Mesa holds for it" 1 (eq got.at(0) stood.at(1)))
+     (testing/nat "the file of the old key is gone" 0 after)
+     (testing/nat "and the file of the new key is there" 1 (gt kept 0))]
+  + spoiled
+    ' A foot does not start from a file that is not what Mesa wrote, and does
+    ' not replace that file. It gives the reason.
+    \ _=unit
+    ^ row[testing/check]
+    = n0 (foot_tests/fresh 15)
+      alice (foot_tests/of 17 n0.worlds)
+      bob (foot_tests/of 18 n0.worlds)
+      carol (foot_tests/of 19 n0.worlds)
+      junk (add 7 (bex 24))
+      listed (str/cat_all [bob.ring ".manifest"])
+      trusted (str/cat_all [carol.ring ".authority"])
+      ;a_down (foot_tests/down alice)
+      ;b_down (foot_tests/down bob)
+      ;c_down (foot_tests/down carol)
+      ;b_bad (WriteFile listed junk)
+      ;b_up (foot_tests/try 0 0 bob)
+      ;b_still (mesa_wire/took listed)
+      ;c_bad (WriteFile trusted (bex 0))
+      ;c_up (foot_tests/try 0 0 carol)
+      ;c_still (mesa_wire/took trusted)
+      ;a_old (foot_tests/try 0 99 alice)
+      ;a_up (foot_tests/try 0 1 alice)
+    [(testing/text "a manifest that is not whole stops the foot" "Mesa does not take the manifest of the keys: Invalid" b_up.why)
+     (testing/nat "and the file is not replaced" 1 (eq junk b_still))
+     (testing/text "an authority file that is empty stops the foot" "Mesa does not take the file of the authority: Invalid" c_up.why)
+     (testing/nat "and the file is not replaced" 1 (eq (bex 0) c_still))
+     (testing/text "a manifest that is older than the mark allows stops the foot" "Mesa does not take the manifest of the keys: Rollback" a_old.why)
+     (testing/nat "with the floor that its manifest is at, the foot starts" 0 a_up.why.len)]
 
 + tests
   ^ row[testing/case]
@@ -588,4 +815,9 @@
    (testing/case "values that hold pins cross; values that hold code do not" foot_tests/values)
    (testing/case "what is published to a peer is sealed for that peer" foot_tests/sealing)
    (testing/case "a page longer than Mesa carries crosses in slices" foot_tests/long)
+   (testing/case "a transfer that two restarts interrupt goes on" foot_tests/interrupted)
+   (testing/case "an engine that is full is replaced, and its names go on" foot_tests/sustained)
+   (testing/case "a blocked peer comes back only with a later key" foot_tests/barred)
+   (testing/case "a change of key that a stop interrupted is ended at the next start" foot_tests/turning)
+   (testing/case "a foot does not start from a file that is not whole" foot_tests/spoiled)
    (testing/case "more long pages than the foot keeps cross at one time" foot_tests/many)]

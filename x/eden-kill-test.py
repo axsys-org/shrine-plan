@@ -1,5 +1,8 @@
 """Kill a kept world, restart it, and check that nothing it acknowledged was lost.
 
+A second test does the same with the mesa mount: a world that is killed while its foot starts, or while it
+runs, starts again with what Mesa keeps for it, and a start by itself makes no event.
+
 Writes go through the probe mount; the MCP mount only reads old versions by
 their references. Set WISP and run this file. It boots its own disposable world
 and prints what it measured: write latency, disk per event, restart time and the
@@ -35,8 +38,8 @@ RESETS = 30
 
 
 class World:
-    def __init__(self, directory, port):
-        self.directory, self.port = directory, port
+    def __init__(self, directory, port, mounts=('mcp', 'probe')):
+        self.directory, self.port, self.mounts = directory, port, mounts
         self.base = f'http://127.0.0.1:{port}'
         self.launcher = self.wisp = None
         self.boots = 0
@@ -48,7 +51,8 @@ class World:
         with log.open('w') as stream:
             self.launcher = subprocess.Popen(
                 [sys.executable, str(ROOT / 'x/eden'), '--world', str(self.directory),
-                 '--extras-root', str(ROOT / 'extras'), '--mount', 'mcp', '--mount', 'probe',
+                 '--extras-root', str(ROOT / 'extras'),
+                 *[part for mount in self.mounts for part in ('--mount', mount)],
                  '--port', str(self.port), '--startup-timeout', '1500'],
                 env=dict(os.environ, _EDEN_NIX_ROOT=str(ROOT)), stdout=stream, stderr=stream)
         deadline = started + 1600
@@ -208,6 +212,97 @@ class KillTest(unittest.TestCase):
             finally:
                 world.stop()
                 print(json.dumps(measured), flush=True)
+
+    def test_a_world_with_the_mesa_mount_restarts_without_an_event(self):
+        """What Mesa keeps for a world is outside the store. A kill at any moment leaves it whole."""
+        (ROOT / '.check').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='eden-kill-mesa-', dir=ROOT / '.check') as temporary:
+            world = World(Path(temporary) / 'world', free_port(), ('mcp', 'probe', 'mesa'))
+            kept = world.directory / 'src' / 'io' / 'mesa'
+            foot = f'/{NODE}/io/mesa'
+
+            def key():
+                try:
+                    return world.tool('read', path=foot, care='x').get('properties', {}).get('/key')
+                except (RuntimeError, OSError, ValueError, KeyError, http.client.HTTPException):
+                    return None
+
+            def settled(seconds=180, quiet=6):
+                """The epoch of the world once it has not moved for a time, with the key on the foot's record."""
+                deadline, last, since = time.monotonic() + seconds, None, time.monotonic()
+                while time.monotonic() < deadline:
+                    now = world.read('/' + NODE)[1]['epoch']
+                    if now != last:
+                        last, since = now, time.monotonic()
+                    elif key() and time.monotonic() - since >= quiet:
+                        return now
+                    time.sleep(.5)
+                self.fail('the world did not settle')
+
+            def files():
+                return {name: ((kept / name).stat().st_size, (kept / name).stat().st_mtime_ns)
+                        for name in sorted(os.listdir(kept))}
+
+            try:
+                # Killed while the foot starts: its files are being written for the first time.
+                world.boot()
+                world.kill()
+                world.boot()
+                epoch = settled()
+                first = key()
+                self.assertTrue(first)
+                self.assertEqual(sorted(files()), ['mark', 'ring', 'ring.authority', 'ring.manifest'])
+                self.assertEqual(files()['ring'][0], 32)
+                self.assertEqual((kept / 'ring').stat().st_mode & 0o777, 0o600)
+                ring = files()['ring']
+
+                # The world publishes, so that its foot has something to tell.
+                for i, name in enumerate(('', '/note')):
+                    self.assertEqual(world.put('make', f'/{NODE}/our/public{name}', i), 200)
+                epoch = settled()
+
+                # Killed while it runs, then started: the same key, the same key file, and no event.
+                world.kill()
+                world.boot()
+                time.sleep(8)
+                self.assertEqual(world.read('/' + NODE)[1]['epoch'], epoch)
+                self.assertEqual(key(), first)
+                self.assertEqual(files()['ring'], ring)
+
+                # Stopped in order, then started: again no event.
+                world.stop()
+                world.boot()
+                time.sleep(8)
+                self.assertEqual(world.read('/' + NODE)[1]['epoch'], epoch)
+                self.assertEqual(key(), first)
+                self.assertEqual(sorted(files()), ['mark', 'ring', 'ring.authority', 'ring.manifest'])
+
+                # Killed in a burst of publication: what was acknowledged stays, and the foot starts.
+                acknowledged = []
+                killer = threading.Timer(BURST_SECONDS, world.kill)
+                killer.start()
+                while True:
+                    try:
+                        if world.put('make', f'/{NODE}/our/public/b{len(acknowledged)}', 1) != 200:
+                            break
+                    except (OSError, http.client.HTTPException):
+                        break
+                    acknowledged.append(len(acknowledged))
+                killer.join()
+                self.assertGreater(len(acknowledged), 0)
+                world.boot()
+                for i in acknowledged:
+                    self.assertEqual(world.read(f'/{NODE}/our/public/b{i}')[0], 200)
+                after = settled()
+                self.assertEqual(key(), first)
+                self.assertEqual(files()['ring'], ring)
+                world.kill()
+                world.boot()
+                time.sleep(8)
+                self.assertEqual(world.read('/' + NODE)[1]['epoch'], after)
+                print(json.dumps(dict(mesa_restart_epoch=after, mesa_burst_acknowledged=len(acknowledged))), flush=True)
+            finally:
+                world.stop()
 
 
 if __name__ == '__main__':
