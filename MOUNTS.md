@@ -3,6 +3,10 @@
 For a complete notes application using the existing workspace host, see
 [Making a Grove and Goo mount](extras/tutorials/grove-goo-mount.md).
 
+The [native Shrine application mounts](extras/shuin/README.md) provide chat,
+namespace navigation, commentary, a local wallet, agents and a change workbench.
+Their server tests and study setup tools live in `extras/shuin`.
+
 `x/eden` boots Shrine's namespace, Pact, supervisor, filesystem driver and HTTP
 transport. It does not install a browser application or build browser assets.
 Unregistered HTTP routes return 404.

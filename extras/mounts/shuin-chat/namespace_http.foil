@@ -1,0 +1,148 @@
+- helm
+- grove_install
+- json
+
+' Generic HTTP effect adapter. Requests and results are ordinary namespace data;
+' credentials are supplied by the registered foot, never stored in those records.
++ namespace_http
+  + bar
+    \ text=str
+    ^ nat
+    | add (str/to_atom text) (bex (mul 8 text.len))
+  + unbar
+    \ bytes=nat
+    ^ str
+    ? (le bytes 1) ""
+    | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + request
+    \ url=str body=str credential=str
+    ^ myth
+    | (myth/sing ['method] (pails/t "POST")).put(system_vocabulary/lede (pails/t "HTTP request")).put(system_vocabulary/help (pails/t "An outbound request and its recorded response. Credentials are held by the HTTP actor.")).put(['url] (pails/t url)).put(['body] (pails/t body)).put(['credential] (pails/t credential)).put(['state] (pails/t "pending"))
+  + perform
+    \ bearer=str request=myth
+    ^ myth
+    = method request.txt_at(['method]) url request.txt_at(['url]) body request.txt_at(['body])
+      headers=row[[nat nat]] [[(namespace_http/bar "Content-Type") (namespace_http/bar "application/json")]]
+      headers (? bearer.len headers.snoc([(namespace_http/bar "Authorization") (namespace_http/bar (str/cat_all ["Bearer " bearer]))]) headers)
+      ;result (Fetch [(namespace_http/bar method) (namespace_http/bar url) headers [(namespace_http/bar body)]] [[5000] 120000 0 [1048576]])
+    ? result
+     > (./err code) (myth/sing ['state] (pails/t "failed")).put(['error] (pails/t (str/cat_all ["HTTP transport error " (nat/show code)])))
+     > (./ok response)
+      = [status final_url headers bytes] response
+      | (myth/sing ['state] (pails/t "complete")).put(['status] (pails/n status)).put(['response] (pails/t (namespace_http/unbar bytes)))
+  + get
+    \ name=str value=json
+    ^ str
+    ?> (./obj fields) value ""
+    = found fields.keep((\ field (eq field.k name)))
+    ? !(found.len) ""
+    ?> (./str text) found.at(0).v ""
+    text
+  + decode
+    \ text=str
+    ^ json
+    ?> (./ok value end) (parse text) jnull
+    value
+  + write
+    \ target=path card=myth state=namespace
+    ^ namespace
+    ?> (./ok next) (grove_install/change target (writ/poke card) state) (Seq[namespace] (error (pails/t "HTTP namespace write rejected")) state)
+    next
+  + claim
+    \ state=namespace
+    ^ [namespace nat str]
+    = root=path [state.self 'io 'http 'outbound]
+    % entries=row[[path myth]] (sovereign_care .z root state).tap
+    ^ [namespace nat str]
+    ? !(entries.len) [state 204 ""]
+    = [relative card] entries.at(0)
+    ? !(eq card.txt_at(['state]) "pending") (_ entries.drop(1))
+    = target root.weld(relative)
+      next (namespace_http/write target (myth/sing ['state] (pails/t "inflight")) state)
+      job (json/obj [(jkv "path" (json/str (path_show target))) (jkv "version" (json/str (nat/show (next.case(.x target)).fall(0)))) (jkv "url" (json/str card.txt_at(['url]))) (jkv "method" (json/str card.txt_at(['method]))) (jkv "body" (json/str card.txt_at(['body]))) (jkv "credential" (json/str card.txt_at(['credential])))])
+    [next 200 (show job)]
+  + complete
+    \ target=path version=nat response=myth state=namespace
+    ^ [namespace nat str]
+    = card (sovereign_care .x target state).fil.fall(myth/new)
+    ? !(and (eq card.txt_at(['state]) "inflight") (eq version (state.case(.x target)).fall(0))) [state 409 "HTTP request changed"]
+    = next (namespace_http/write target response state)
+      next=namespace
+        ?> (./some receiver) card.path_at(['reply_to]) next
+        ? !(maybe/is_some (sovereign_care .x receiver next).fil) next
+        | namespace_http/write receiver (myth/sing ['http_response] (pails/p target)) next
+    [next 200 "HTTP response recorded"]
+  + read
+    \ target=path state=namespace
+    ^ [nat str]
+    = card (sovereign_care .x target state).fil.fall(myth/new)
+      status card.txt_at(['state])
+    ? !(row/has[str] status ["complete" "failed"]) [202 ""]
+    [200 (show (json/obj [(jkv "state" (json/str status)) (jkv "status" (json/str (nat/show card.nat_at(['status] 0)))) (jkv "response" (json/str card.txt_at(['response]))) (jkv "error" (json/str card.txt_at(['error])))]))]
+  + reply
+    \ request=nat
+    ^ [nat str]
+    = ;[message caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? message
+     > (./develop id status body)
+      ? (eq id request) [status body]
+      | _ request
+    | _ request
+  + wait
+    \ ignored=nat
+    ^ nat
+    = ;[message caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? message
+     > (./fact binding) 0
+    | _ ignored
+  + loop
+    \ parent=nat endpoint=str credential=str sequence=nat
+    ^ nat
+    ; (Send parent (feet/gift/transact sequence namespace_http/claim))
+    = ;[status body] (namespace_http/reply sequence)
+    ? !(eq status 200)
+      ; (namespace_http/wait 0)
+      | _ parent endpoint credential sequence.inc
+    = job (namespace_http/decode body)
+      target (path_parse (namespace_http/get "path" job)).fall([])
+      auth (namespace_http/get "credential" job)
+      url (namespace_http/get "url" job)
+      body (namespace_http/get "body" job)
+      method (namespace_http/get "method" job)
+      request (namespace_http/request url body auth).put(['method] (pails/t method))
+      ;response=myth
+        ? (gt body.len 524288) (myth/sing ['state] (pails/t "failed")).put(['error] (pails/t "HTTP request body exceeds 512 KiB."))
+        ? auth.len
+          ? !(and (eq auth "openrouter") (and (eq url endpoint) credential.len))
+            | (myth/sing ['state] (pails/t "failed")).put(['error] (pails/t "OpenRouter credential unavailable or not valid for this endpoint. Set OPENROUTER_API_KEY, restart Shrine, then Resume."))
+          | namespace_http/perform credential request
+        | namespace_http/perform "" request
+    ; (Send parent (feet/gift/transact sequence.inc (namespace_http/complete target (nat/parse (namespace_http/get "version" job)).fall(0) response)))
+    = ;ack (namespace_http/reply sequence.inc)
+    | _ parent endpoint credential (add sequence 2)
+  + run
+    \ endpoint=str keyfile=str initial=feet/task/init actor=nat
+    ^ nat
+    = ;bytes (ReadFile keyfile)
+    | namespace_http/loop initial.parent endpoint (namespace_http/unbar bytes) 1
+  + start
+    \ server=nat home=path endpoint=str keyfile=str
+    ^ nat
+    ; (SendCaps server (helm/supervisor/register home (namespace_http/run endpoint keyfile)) [0])
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ?> (./ack err) reply (error (pails/t "HTTP service registration failed"))
+    ? (maybe/is_some err) (error (pails/t "HTTP service registration rejected"))
+    server
+  + await
+    \ parent=nat target=path sequence=nat
+    ^ myth
+    ; (Send parent (feet/gift/snapshot sequence (namespace_http/read target)))
+    = ;[status body] (namespace_http/reply sequence)
+    ? !(eq status 200)
+      ; (namespace_http/wait 0)
+      | _ parent target sequence.inc
+    = result (namespace_http/decode body)
+    | (myth/sing ['state] (pails/t (namespace_http/get "state" result))).put(['status] (pails/n (nat/parse (namespace_http/get "status" result)).fall(0))).put(['response] (pails/t (namespace_http/get "response" result))).put(['error] (pails/t (namespace_http/get "error" result)))

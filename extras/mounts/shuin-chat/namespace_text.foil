@@ -1,0 +1,252 @@
+- grove_install
+- rex
+- json
+- goo_paths
+- show
+- tyshow
+
+' Data-only namespace text. No evaluator and no show/value fallback.
++ namespace_text
+  + quoted_path
+    \ root=path target=path
+    ^ str
+    ? !(target.len) "[]"
+    ? (pith_prefix root target)
+      | str/cat_all ["'~" (path_show target.drop(root.len))]
+    | str/cat_all ["'" (path_show target)]
+  + constructor
+    \ descriptor=type
+    ^ str
+    ?> (./rec brand fields) descriptor ""
+    ?> (./some reference) (definition_reference/parse brand) ""
+    = absolute (path_show reference.path)
+    | absolute.slice 1 absolute.len.dec
+  + indent
+    ' Offset continuation lines when embedding a Rex literal in a larger form.
+    \ columns=nat text=str
+    ^ str
+    | str/join (str/cat_all [(str/from_atom 10) (str/repeat columns " ")]) (str/split_byte 10 text)
+  + text_literal
+    \ text=str
+    ^ str
+    = needs_atom
+        % i=nat 0
+        ^ bool
+        ? (eq i text.len) .false
+        = byte text.at(i)
+        ? (and (eq i 0) (eq byte 10)) .true
+        ? (and (lt byte 32) !(eq byte 10)) .true
+        | _ i.inc
+    ' A leading newline selects Rex's whitespace-normalizing tape syntax.
+    ' The packed text atom is an exact Foil literal even for that edge case.
+    ? needs_atom (str/cat_all ["(" (str/from_atom 10) " ^ str" (str/from_atom 10) " " (nat/show (str/to_atom text)) ")"])
+    | (rex/cord text).print
+  + name
+    \ brand=nat
+    ^ either[str str]
+    ?> (./some reference) (definition_reference/parse brand) (./err "Unknown constructor identity.")
+    = parts (reference.path.map((\ part=iota (? (eq (aura_tag part) "ts") (str/from_atom (quip_val part)) (str/from_atom (iota_show part))))))
+    | ./ok (str/join "/" parts)
+  + descriptor
+    \ identity=nat state=namespace
+    ^ either[str type]
+    ?> (./some reference) (definition_reference/parse identity) (./err "Missing nominal type identity.")
+    ?> (./known records) (namespace/page .x (./some reference.case) reference.path state) (./err "Type definition version is unavailable.")
+    ?> (./some record) records.fil (./err "Type definition record is unavailable.")
+    ?> (./some held) (unpin record.myth).get(system_vocabulary/mold) (./err "Type definition has no reflected descriptor.")
+    ?> descriptor=pails/ty held (./err "Invalid reflected type descriptor.")
+    | ./ok descriptor.t
+  + substitute
+    \ bindings=row[[nat type]] shape=type
+    ^ type
+    = sub (namespace_text/substitute bindings)
+    ? shape
+     > (./var name)
+       % i=nat 0
+       ? (eq i bindings.len) shape
+       = [key value] bindings.at(i)
+       ? (eq name key) value
+       | _ i.inc
+     > (./arr item) (./arr (sub item))
+     > (./pin item) (./pin (sub item))
+     > (./fun args ret) (./fun args.map(sub) (sub ret))
+     > (./sum options) (./sum options.map(sub))
+     > (./rec brand fields) (./rec brand (fields.map((\ [face item] [face (sub item)]))))
+     > (./ref brand args) (./ref brand args.map(sub))
+     > (./nom path args) (./nom path args.map(sub))
+    shape
+  + instantiate
+    \ shape=type args=row[type]
+    ^ either[str type]
+    ? shape
+     > (./gen parameters body)
+       ? !(eq parameters.len args.len) (./err "Erased generic arguments; supply a concrete type descriptor.")
+       = bindings=row[[nat type]]
+           % i=nat 0 out=row[[nat type]] []
+           ? (eq i parameters.len) out
+           = [constant name constraint] parameters.at(i)
+           | _ i.inc out.snoc([name args.at(i)])
+       | ./ok (namespace_text/substitute bindings body)
+    ? args.len (./err "Unexpected generic type arguments.")
+    | ./ok shape
+  + form
+    \ open=str close=str fields=row[str]
+    ^ either[str str]
+    = compact (str/cat_all [open (? fields.len " " "") (str/join " " fields) close])
+    ? (and (le compact.len 100) (equal[maybe[nat]] (str/find (str/from_atom 10) compact) .none)) (./ok compact)
+    = body (str/cat_all [open (? fields.len (str/from_atom 10) "")
+        (str/join (str/from_atom 10) (fields.map((\ field=str (str/cat_all ["  " (namespace_text/indent 2 field)]))))) close])
+    ? (gt body.len 262144) (./err "Encoded value exceeds 256 KiB.")
+    | ./ok body
+  + identity
+    \ shape=type
+    ^ nat
+    ? shape
+     > (./ref brand args) brand
+     > (./rec brand fields) brand
+    0
+  + walk
+    \ state=namespace root=path shape=type value=any fuel=nat
+    ^ either[str str]
+    ? !(fuel) (./err "Value or type nesting exceeds 128 levels.")
+    ? (rep_pin value) (./err "Pinned values need an explicit identity-preserving representation.")
+    ? (rep_law value) (./err "Executable functions and closures are not data.")
+    = recur (\ shape=type value=any (namespace_text/walk state root shape value fuel.dec))
+    ? shape
+     > .any
+       ? (nominal_brand value) (recur .pail value)
+       ? !(rep_app value) (recur (./nat 0) value)
+       ? (eq (rep_hd value) 0) (recur (./arr .any) value)
+       | ./err "Opaque applications and closures are not data."
+     > .pail
+       = brand (nominal_brand value)
+       ? !(brand) (./err "Value has no reflected data constructor.")
+       < descriptor (namespace_text/descriptor brand state)
+       < concrete (namespace_text/instantiate descriptor [])
+       | recur concrete value
+     > (./ref brand args)
+       ? (eq brand (namespace_text/identity (^ path)))
+         ? !(and (eq (rep_hd value) 0) (le (rep_sz value) 4096)) (./err "Invalid path representation.")
+         < checked (recur (./arr (^ iota)) value)
+         | ./ok (namespace_text/quoted_path root value)
+       < descriptor (namespace_text/descriptor brand state)
+       < concrete (namespace_text/instantiate descriptor args)
+       | recur concrete value
+     > (./nat aura)
+       ? (rep_app value) (./err "Expected a scalar atom.")
+       ? (eq aura "tu") (./ok (namespace_text/indent 1 (namespace_text/text_literal (str/from_atom value))))
+       | ./ok (nat/show value)
+     > (./cst expected)
+       ? !(eq value expected) (./err "Value differs from its literal type.")
+       | ./ok (nat/show expected)
+     > (./arr item)
+       ? !(eq (rep_hd value) 0) (./err "Expected an unbranded row.")
+       ? (gt (rep_sz value) 4096) (./err "Row exceeds 4096 items.")
+       = encoded=either[str row[str]]
+           % i=nat 0 out=row[str] []
+           ^ either[str row[str]]
+           ? (eq i (rep_sz value)) (./ok out)
+           ? (recur item (rep_ix i value))
+            > (./err why) (./err (str/cat_all ["item " (nat/show i) ": " why]))
+            > (./ok text) (_ i.inc out.snoc(text))
+       < fields encoded
+       | namespace_text/form "[" "]" fields
+     > (./rec brand fields)
+       ? !(and (eq (rep_hd value) brand) (eq (rep_sz value) fields.len)) (./err "Record does not match its reflected shape.")
+       ? (gt fields.len 4096) (./err "Record exceeds 4096 fields.")
+       = encoded=either[str row[str]]
+           % i=nat 0 out=row[str] []
+           ^ either[str row[str]]
+           ? (eq i fields.len) (./ok out)
+           = [face item] fields.at(i)
+           ? (recur item (rep_ix i value))
+            > (./err why) (./err (str/cat_all ["field " (str/from_atom (tyshow/atom_text face)) ": " why]))
+            > (./ok text) (_ i.inc out.snoc(text))
+       < parts encoded
+       ? !(brand) (namespace_text/form "[" "]" parts)
+       ? (show/aura_tag brand)
+         | namespace_text/form (str/cat_all ["($" (str/from_atom brand)]) ")" parts
+       ? (nominal_brand brand)
+         < name (namespace_text/name brand)
+         | namespace_text/form (str/cat_all ["(" name]) ")" parts
+       = segments (str/split_byte 47 (str/from_atom brand))
+         word segments.at(segments.len.dec)
+       ?> (./some _) (str/sym word) (./err "Unrepresentable structural constructor.")
+       | namespace_text/form (str/cat_all ["(./" word]) ")" parts
+     > (./sum options)
+       ? (gt options.len 256) (./err "Type exceeds 256 variants.")
+       % rest=row[type] options why=str "No reflected variant can encode this value as data."
+       ^ either[str str]
+       ? !(rest.len) (./err why)
+       ? (recur rest.at(0) value)
+        > (./ok text) (./ok text)
+        > (./err reason) (_ rest.drop(1) (str/cat_all [why " " reason]).slice(0 2048))
+     > (./gen params body)
+       < concrete (namespace_text/instantiate shape [])
+       | recur concrete value
+     > (./fun args ret) (./err "Executable function fields are not data.")
+     > (./pin item) (./err "Pins require an explicit identity-preserving representation.")
+     > (./var name) (./err "Unresolved generic argument; supply a concrete type descriptor.")
+    | ./err "Opaque or unresolved type cannot be exported losslessly."
+  + value
+    \ state=namespace root=path held=pail
+    ^ either[str str]
+    | namespace_text/walk state root .pail held 128
+  + record
+    \ encode={\ path pail}either[str str] root=path target=path card=myth
+    ^ either[str str]
+    = relative target.drop(root.len)
+      heading (str/cat_all ["+ " (? relative.len (path_show relative).slice(1 (path_show relative).len.dec) ".") (str/from_atom 10)])
+    % entries=row[mop/kv[path pail]] card.tap out=str heading
+    ^ either[str str]
+    ? !(entries.len) (./ok out)
+    = entry entries.at(0)
+    ? (encode root entry.val)
+     > (./err why) (./err (str/cat_all [(path_show target) " slot " (path_show entry.key) ": " why]))
+     > (./ok text)
+      = prefix (str/cat_all ["  = " (path_show entry.key) " "])
+      | _ entries.drop(1) (str/cat_all [out prefix (namespace_text/indent prefix.len text) (str/from_atom 10)])
+  + encode_care_with
+    \ encode={\ path pail}either[str str] care=care root=path state=namespace
+    ^ either[str str]
+    = entries (sovereign_care care root state).tap
+    ? (gt entries.len 512) (./err "Namespace export exceeds 512 records.")
+    % entries=row[[path myth]] entries out=str ""
+    ^ either[str str]
+    ? !(entries.len) (./ok out)
+    = [relative card] entries.at(0)
+    < text (namespace_text/record encode root root.weld(relative) card)
+    = out (str/cat_all [out text (str/from_atom 10)])
+    ? (gt out.len 262144) (./err "Namespace export exceeds 256 KiB; narrow the root.")
+    | _ entries.drop(1) out
+  + encode_with
+    \ encode={\ path pail}either[str str] root=path state=namespace
+    ^ either[str str]
+    | namespace_text/encode_care_with encode .z root state
+  + encode_care
+    \ selection=hunt state=namespace
+    ^ either[str str]
+    | namespace_text/encode_care_with (namespace_text/value state) selection.c selection.p state
+  + encode
+    \ root=path state=namespace
+    ^ either[str str]
+    | namespace_text/encode_with (namespace_text/value state) root state
+  + data
+    ' Tool input uses typed JSON literals, never evaluates model-supplied Foil.
+    \ kind=str value=json
+    ^ either[str pail]
+    ? (eq kind "text")
+      ?> (./str text) value (./err "text requires a JSON string")
+      | ./ok (pails/t text)
+    ? (eq kind "number")
+      ?> (./num negative n) value (./err "number requires an integer")
+      ? negative (./err "number must be nonnegative")
+      | ./ok (pails/n n)
+    ? (eq kind "boolean")
+      ?> (./boo b) value (./err "boolean requires true or false")
+      | ./ok (pails/b b)
+    ? (eq kind "path")
+      ?> (./str text) value (./err "path requires an absolute path string")
+      ?> (./some target) (path_parse text) (./err "Invalid path")
+      | ./ok (pails/p target)
+    | ./err "Supported write types: text, number, boolean, path."

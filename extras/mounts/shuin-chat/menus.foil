@@ -1,0 +1,102 @@
+- shuin_navigation
+- http_foot
+- goo_runtime
+- json
+
+' Generic custom-menu extension. Providers and transaction continuations live in the namespace.
++ shuin_menus
+  + slot
+    ^ path
+    ['sys 'slot 'context_menu]
+  + commit_slot
+    ^ path
+    ['sys 'menu 'commit]
+  + closed_slot
+    ^ path
+    ['sys 'menu 'closed]
+  + provider
+    : open={\ path path str namespace}either[str [namespace path]]
+  + committer
+    : apply={\ path namespace namespace}either[str namespace]
+  + render
+    \ renderer={\ path path namespace}either[str json] target=path state=namespace
+    ^ either[str json]
+    ?> (./some card) (goo_runtime/record .x target state) (./err "Menu record is unavailable.")
+    ?> (./some view) card.path_at(shuin_menus/slot) (./err "Menu record has no custom-menu view.")
+    ?> (./some recipe) (goo_runtime/record .x view state) (./err "Menu view is unavailable.")
+    < published (goo_runtime/published recipe)
+    ? !(equal published.view.slot shuin_menus/slot) (./err "The custom menu must use /sys/slot/context_menu.")
+    = closed=bool
+        ?> (./some value) card.get(shuin_menus/closed_slot) .false
+        ?> value=pails/b value .false
+        value.b
+    < source (renderer target view state)
+    | ./ok (json/obj [(jkv "slot" (json/str (path_show shuin_menus/slot))) (jkv "target" (json/str (path_show target))) (jkv "view" (json/str (path_show view))) (jkv "closed" (json/boo closed)) (jkv "source" source)])
+  + open
+    \ fields=row[[str str]] state=namespace
+    ^ either[str [namespace path]]
+    = get (\ key=str (http_foot/field key fields))
+    ?> (./some target) (path_parse (get "target")) (./err "Invalid menu target.")
+    ?> (./some scope) (path_parse (? (get "scope").len (get "scope") (get "target"))) (./err "Invalid menu scope.")
+    ?> (./some card) (goo_runtime/record .x scope state) (./ok [state []])
+    ?> (./some held) card.get(shuin_menus/slot) (./ok [state []])
+    ? (and (get "revision").len !(eq (get "revision") (nat/show (state.case(.x scope)).fall(0)))) (./err "Context changed; reopen its menu.")
+    ? held
+     > view=pails/p (./ok [state scope])
+    ?> provider=shuin_menus/provider held (./err "Invalid custom-menu slot.")
+    ? !(shuin_navigation/identity (get "id")) (./err "Invalid menu identity.")
+    = open provider.open
+    < result (open scope target (get "id") state)
+    = [next menu] result
+    | ./ok [next menu]
+  + invoke
+    \ fields=row[[str str]] state=namespace
+    ^ either[str namespace]
+    = get (\ key=str (http_foot/field key fields))
+    ?> (./some target) (path_parse (get "target")) (./err "Invalid menu target.")
+    ?> (./some subject) (path_parse (get "subject")) (./err "Invalid menu subject.")
+    ?> (./some view) (path_parse (get "view")) (./err "Invalid menu view.")
+    ?> (./some card) (goo_runtime/record .x target state) (./err "Menu record is unavailable.")
+    = prior ((goo_runtime/journal state).keep((\ entry (eq entry.identity (get "invocation")))))
+    ? (and prior.is_nil !(equal card.path_at(shuin_menus/slot) (maybe/some[path] view))) (./err "Menu view changed; reopen it.")
+    = route ((str/split_byte 46 (get "control")).map((\ n (nat/parse n).fall(99999))))
+      inputs (fields.keep((\ [key value] (eq key.slice(0 6) "input:"))).map((\ [key value] [key.slice(6 (sub key.len 6)) value])))
+      inputs inputs.snoc(["$invocation" (get "invocation")])
+      query (goo_runtime/request "act" target subject view route (nat/parse (get "expected")).fall(0) (nat/parse (get "displayed")).fall(0) (nat/parse (get "publication")).fall(0) inputs 0)
+      [next status body] (goo_runtime/act query state)
+    ? !(eq status 200) (./err body)
+    ? !(prior.is_nil) (./ok next)
+    ?> (./some held) card.get(shuin_menus/commit_slot) (./ok next)
+    ?> commit=shuin_menus/committer held (./err "Invalid menu transaction continuation.")
+    = apply commit.apply
+    | apply target state next
+  + prepare
+    \ fields=row[[str str]] state=namespace
+    ^ either[str [namespace path]]
+    = get (\ key=str (http_foot/field key fields))
+    ? (eq (get "operation") "open") (shuin_menus/open fields state)
+    ?> (./some target) (path_parse (get "target")) (./err "Invalid menu target.")
+    ? (eq (get "operation") "read") (./ok [state target])
+    ? !(eq (get "operation") "invoke") (./err "Unknown menu operation.")
+    ? !((get "invocation").len) (./err "Menu actions require a retry identity.")
+    < next (shuin_menus/invoke fields state)
+    | ./ok [next target]
+  + run
+    \ renderer={\ path path namespace}either[str json] fields=row[[str str]] state=namespace
+    ^ [namespace nat str]
+    ? (shuin_menus/prepare fields state)
+     > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
+     > (./ok result)
+      = [next target] result
+      ? !(target.len) [next 200 "null"]
+      ? (shuin_menus/render renderer target next)
+       > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
+       > (./ok value) [next 200 (show value)]
+  + http
+    \ renderer={\ path path namespace}either[str json] body=str
+    ^ http_foot/action
+    ? (gt body.len 65536) (./reply (http_driver/response 413 "Menu request too large"))
+    = fields (http_foot/fields body)
+      allowed=row[str] ["operation" "target" "scope" "revision" "id" "subject" "view" "control" "expected" "displayed" "publication" "invocation" "wire"]
+    ? !(fields.all((\ [key value] (and (allowed.has(key) || (eq key.slice(0 6) "input:")) (eq (fields.keep((\ [other _] (eq key other)))).len 1))))) (./reply (http_driver/response 400 "Unknown or duplicate menu field"))
+    | ./transact (shuin_menus/run renderer fields)

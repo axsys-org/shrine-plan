@@ -1,0 +1,231 @@
+- shuin_wallet
+- json
+- helm
+
++ shuin_wallet_driver
+  + bar
+    \ text=str
+    ^ nat
+    | add (str/to_atom text) (bex (mul 8 text.len))
+  + unbar
+    \ bytes=nat
+    ^ str
+    | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + rpc
+    \ port=nat method=str params=row[json]
+    ^ json
+    = body (show (json/obj [(jkv "jsonrpc" (json/str "2.0")) (jkv "id" (json/num .false 1)) (jkv "method" (json/str method)) (jkv "params" (json/arr params))]))
+      url (str/cat_all ["http://127.0.0.1:" (nat/show port)])
+      ;reply (Fetch [(shuin_wallet_driver/bar "POST") (shuin_wallet_driver/bar url) [[(shuin_wallet_driver/bar "Content-Type") (shuin_wallet_driver/bar "application/json")]] [(shuin_wallet_driver/bar body)]] [[2000] 10000 0 [1048576]])
+    ?> (./ok response) reply (Seq[json] (error (pails/t "Cannot reach local Anvil. Start it, then refresh.")) jnull)
+    = [status final_url headers bytes] response
+    ; (shuin_wallet/require (eq status 200) "Anvil returned an HTTP error")
+    ?> (./ok value end) (parse (shuin_wallet_driver/unbar bytes)) (Seq[json] (error (pails/t "Invalid JSON from Anvil")) jnull)
+    = err (shuin_wallet/get "error" value)
+    ? !(equal err jnull) (Seq[json] (error (pails/t (str/cat_all ["Anvil: " (shuin_wallet/text (shuin_wallet/get "message" err))]))) jnull)
+    | shuin_wallet/get "result" value
+  + identity
+    \ port=nat
+    ^ str
+    = ;chain (shuin_wallet_driver/rpc port "eth_chainId" [])
+    ; (shuin_wallet/require (eq (shuin_wallet/unhex (shuin_wallet/text chain)) 31337) "Only local development chain 31337 is supported")
+    = ;metadata (shuin_wallet_driver/rpc port "anvil_metadata" [])
+      instance (shuin_wallet/text (shuin_wallet/get "instanceId" metadata))
+    ; (shuin_wallet/require (and instance.len (equal (shuin_wallet/get "forkedNetwork" metadata) jnull)) "Use an unforked local Anvil chain")
+    instance
+  + balance
+    \ port=nat address=str
+    ^ nat
+    = ;reply (shuin_wallet_driver/rpc port "eth_getBalance" [(json/str address) (json/str "pending")])
+    | shuin_wallet/unhex (shuin_wallet/text reply)
+  + receipt
+    \ port=nat instance=str tx=shuin_wallet/transfer
+    ^ shuin_wallet/transfer
+    ? !(eq instance tx.instance) tx.set_status("Previous Anvil instance")
+    ? !(row/has[str] tx.status ["Pending" "Confirmed" "Reverted"]) tx
+    = ;receipt (shuin_wallet_driver/rpc port "eth_getTransactionReceipt" [(json/str tx.hash)])
+    ? (equal receipt jnull) tx.set_status("Pending").set_block("")
+    ; (shuin_wallet/require (eq (shuin_wallet/text (shuin_wallet/get "transactionHash" receipt)) tx.hash) "Unexpected transaction receipt")
+    = succeeded (eq (shuin_wallet/unhex (shuin_wallet/text (shuin_wallet/get "status" receipt))) 1)
+      block (nat/show (shuin_wallet/unhex (shuin_wallet/text (shuin_wallet/get "blockNumber" receipt))))
+    | tx.set_status((? succeeded "Confirmed" "Reverted")).set_block(block)
+  + refresh
+    \ port=nat state=shuin_wallet/machine
+    ^ shuin_wallet/machine
+    = ;instance (shuin_wallet_driver/identity port)
+      ;result (shuin_wallet_driver/rpc port "eth_accounts" [])
+    ?> (./arr addresses) result (Seq[shuin_wallet/machine] (error (pails/t "Anvil returned no account list")) state)
+    ; (shuin_wallet/require (and addresses.len (le addresses.len 64)) "Expected between 1 and 64 development accounts")
+    = ;accounts
+        % rest=row[json] addresses out=row[shuin_wallet/account] []
+        ? !(rest.len) out
+        = address (shuin_wallet/text rest.at(0))
+        ; (shuin_wallet/require (shuin_wallet/address address) "Invalid Anvil account")
+        = ;balance (shuin_wallet_driver/balance port address)
+        | _ rest.drop(1) out.snoc((shuin_wallet/account address balance))
+      ;transfers
+        % rest=row[shuin_wallet/transfer] state.transfers out=row[shuin_wallet/transfer] []
+        ? !(rest.len) out
+        = ;tx (shuin_wallet_driver/receipt port instance rest.at(0))
+        | _ rest.drop(1) out.snoc(tx)
+      phase=str (? (and transfers.len (eq state.phase "pending")) (? (eq transfers.at(0).status "Pending") "pending" "idle") state.phase)
+      phase=str (? (and state.instance.len !(eq state.instance instance)) "idle" phase)
+    | state.set_instance(instance).set_accounts(accounts).set_transfers(transfers).set_phase(phase).set_message("Balances and receipts are up to date.")
+  + prepare
+    \ port=nat card=myth self=iota state=shuin_wallet/machine
+    ^ shuin_wallet/machine
+    = schema (shuin_wallet/schema self)
+      ;state (shuin_wallet_driver/refresh port state)
+      sender card.txt_at(schema.snoc('sender))
+      sender (? sender.len sender state.accounts.at(0).address)
+      recipient card.txt_at(schema.snoc('recipient))
+      value (shuin_wallet/wei (card.txt_at(schema.snoc('amount))))
+    ; (shuin_wallet/require (state.accounts.any((\ a=shuin_wallet/account (eq a.address sender)))) "Sender must be one of this Anvil node's accounts")
+    ; (shuin_wallet/require (and (shuin_wallet/address recipient) !(eq recipient "0x0000000000000000000000000000000000000000")) "Enter a nonzero Ethereum recipient address")
+    = ;code (shuin_wallet_driver/rpc port "eth_getCode" [(json/str recipient) (json/str "latest")])
+    ; (shuin_wallet/require (eq (shuin_wallet/text code) "0x") "This wallet sends native ETH to accounts, not contracts")
+    = ;available (shuin_wallet_driver/balance port sender)
+    ; (shuin_wallet/require (ge available value) "Insufficient test ETH for amount and network fee")
+    = ;nonce (shuin_wallet_driver/rpc port "eth_getTransactionCount" [(json/str sender) (json/str "pending")])
+      ;price (shuin_wallet_driver/rpc port "eth_gasPrice" [])
+      tx=json (json/obj [(jkv "from" (json/str sender)) (jkv "to" (json/str recipient)) (jkv "value" (json/str (shuin_wallet/hex value)))])
+      ;gas (shuin_wallet_driver/rpc port "eth_estimateGas" [tx])
+      fee (mul (shuin_wallet/unhex (shuin_wallet/text gas)) (shuin_wallet/unhex (shuin_wallet/text price)))
+      ;balance (shuin_wallet_driver/balance port sender)
+    ; (shuin_wallet/require (ge balance (add value fee)) "Insufficient test ETH for amount and network fee")
+    = tx (json/obj [(jkv "from" (json/str sender)) (jkv "to" (json/str recipient)) (jkv "value" (json/str (shuin_wallet/hex value))) (jkv "gas" gas) (jkv "gasPrice" price) (jkv "nonce" nonce) (jkv "chainId" (json/str "0x7a69"))])
+      ;signed (shuin_wallet_driver/rpc port "eth_signTransaction" [tx])
+      raw (shuin_wallet/text signed)
+    ; (shuin_wallet/require (and (eq raw.slice(0 2) "0x") (gt raw.len 10)) "Anvil did not return a signed transaction")
+    = ;hash (shuin_wallet_driver/rpc port "web3_sha3" [(json/str raw)])
+      hash (shuin_wallet/text hash)
+    ; (shuin_wallet/require (eq hash.len 66) "Anvil did not return a transaction hash")
+    ; (shuin_wallet/unhex hash)
+    = transfer (shuin_wallet/transfer hash raw sender recipient value fee state.instance "Ready to send" "")
+    = history state.transfers.keep((\ prior=shuin_wallet/transfer !(eq prior.hash hash)))
+    | state.set_transfers(history.take((? (gt history.len 19) 19 history.len)).cons(transfer)).set_phase("review").set_message("Review the addresses, amount and maximum fee, then send test ETH.")
+  + acknowledged
+    \ ignored=nat
+    ^ nat
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? reply
+     > (./develop request status body)
+      ; (shuin_wallet/require (eq status 200) "Wallet namespace commit rejected")
+      1
+    | shuin_wallet_driver/acknowledged 0
+  + apply
+    \ sequence=nat self=iota writes=row[[path writ]] original=namespace
+    ^ [namespace nat str]
+    = root (sovereign_care .x (shuin_wallet/home self) original).fil.fall(myth/new)
+    ?> (./some held) root.get((shuin_wallet/schema self).snoc('machine)) [original 409 "Wallet removed"]
+    ?> current=shuin_wallet/machine held [original 409 "Wallet replaced"]
+    ? !(eq current.sequence sequence) [original 409 "Wallet changed"]
+    % rest=row[[path writ]] writes state=namespace original
+    ^ [namespace nat str]
+    ? !(rest.len) [state 200 "Committed"]
+    = [target command] rest.at(0)
+      command=writ
+        ?> (./make card) command command
+        ? (maybe/is_some (sovereign_care .x target state).fil) (writ/poke card)
+        command
+    ? (grove_install/change target command state)
+     > (./err why) [original 409 "Wallet write rejected"]
+     > (./ok next) (_ rest.drop(1) next)
+  + account_write
+    \ self=iota writes=row[[path writ]] account=shuin_wallet/account
+    ^ row[[path writ]]
+    = home (shuin_wallet/home self) schema (shuin_wallet/schema self)
+      target=path (path_parse (str/cat_all [(path_show home) "/accounts/a_" account.address])).fall(home.snoc('accounts))
+      card (shuin_wallet/named account.address "An unlocked development account on the local Anvil node.").put(schema.snoc('address) (pails/t account.address)).put(schema.snoc('balance) (pails/n account.balance)).put(system_vocabulary/content (pails/t (str/cat_all [(shuin_wallet/eth account.balance) " ETH"])))
+    = write=[path writ] [target (writ/make card)]
+    | writes.snoc(write)
+  + transfer_write
+    \ self=iota writes=row[[path writ]] tx=shuin_wallet/transfer
+    ^ row[[path writ]]
+    = home (shuin_wallet/home self) schema (shuin_wallet/schema self)
+      target=path (path_parse (str/cat_all [(path_show home) "/transfers/tx_" tx.hash])).fall(home.snoc('transfers))
+      card (shuin_wallet/named (str/cat_all [(shuin_wallet/eth tx.value) " ETH to " tx.recipient]) "A transaction prepared by Shrine. Retry always uses the same signed bytes.").put(schema.snoc('transaction) tx).put(system_vocabulary/content (pails/t (str/cat_all [tx.status (str/from_atom 10) tx.hash])))
+    = write=[path writ] [target (writ/make card)]
+    | writes.snoc(write)
+  + commit
+    \ parent=nat self=iota state=shuin_wallet/machine
+    ^ nat
+    = home (shuin_wallet/home self) schema (shuin_wallet/schema self)
+      writes=row[[path writ]] [[home (writ/poke (shuin_wallet/record self state))]]
+      writes (row/fold[shuin_wallet/account row[[path writ]]] writes (shuin_wallet_driver/account_write self) state.accounts)
+      writes (row/fold[shuin_wallet/transfer row[[path writ]]] writes (shuin_wallet_driver/transfer_write self) state.transfers)
+    ; (Send parent (feet/gift/transact 0 (shuin_wallet_driver/apply state.sequence self writes)))
+    | shuin_wallet_driver/acknowledged 0
+  + send
+    \ port=nat parent=nat self=iota state=shuin_wallet/machine
+    ^ shuin_wallet/machine
+    = tx state.transfers.at(0)
+      ;instance (shuin_wallet_driver/identity port)
+    ; (shuin_wallet/require (eq instance tx.instance) "Anvil was reset. Prepare a new transfer on this instance.")
+    = pending state.set_phase("pending").set_transfers(state.transfers.drop(1).cons(tx.set_status("Pending"))).set_message("Broadcast requested; checking the exact transaction hash.")
+    ' This durable checkpoint must be acknowledged before broadcasting.
+    ; (shuin_wallet_driver/commit parent self pending)
+    = ;result (shuin_wallet_driver/rpc port "eth_sendRawTransaction" [(json/str tx.raw)])
+    ; (shuin_wallet/require (eq (shuin_wallet/text result) tx.hash) "Unexpected broadcast hash; refresh to reconcile")
+    | shuin_wallet_driver/refresh port pending
+  + work
+    \ port=nat parent=nat self=iota card=myth state=shuin_wallet/machine
+    ^ shuin_wallet/machine
+    ? (eq state.operation "cancel") state.set_message("Review cancelled.")
+    ? (eq state.operation "prepare") (shuin_wallet_driver/prepare port card self state)
+    ? (eq state.operation "send") (shuin_wallet_driver/send port parent self state)
+    | shuin_wallet_driver/refresh port state
+  + process
+    \ port=nat parent=nat self=iota card=myth state=shuin_wallet/machine
+    ^ nat
+    = ;result (Try (shuin_wallet_driver/work port parent self card) state)
+      next
+        ? result
+         > (./ok next) next
+         > (./err cause)
+          = message=str
+              ?> text=pails/t cause "Wallet operation failed; refresh to reconcile."
+              text.t
+            phase=str (? (eq state.operation "send") "pending" (? (eq state.operation "prepare") "idle" state.phase))
+            transfers (? (and (eq state.operation "send") state.transfers.len) state.transfers.drop(1).cons(state.transfers.at(0).set_status("Pending")) state.transfers)
+          | state.set_phase(phase).set_transfers(transfers).set_message(message)
+      next next.set_completed(state.sequence).set_busy(.false).set_operation("")
+    | shuin_wallet_driver/commit parent self next
+  + loop
+    \ port=nat parent=nat self=iota floor=nat
+    ^ nat
+    = ;[message caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? message
+     > (./fact binding)
+      ?> (./some version) binding.fil (_ port parent self floor)
+      = card (unpin version.myth)
+      ?> (./some held) card.get((shuin_wallet/schema self).snoc('machine)) (_ port parent self floor)
+      ?> state=shuin_wallet/machine held (_ port parent self floor)
+      ? !(and state.busy (gt state.sequence floor)) (_ port parent self floor)
+      ; (shuin_wallet_driver/process port parent self card state)
+      | _ port parent self state.sequence
+    | _ port parent self floor
+  + run
+    \ port=nat self=iota initial=feet/task/init actor=nat
+    ^ nat
+    ?> (./some version) initial.ax.fil (error (pails/t "Missing wallet root"))
+    = card (unpin version.myth)
+    ?> (./some held) card.get((shuin_wallet/schema self).snoc('machine)) (error (pails/t "Missing wallet machine"))
+    ?> state=shuin_wallet/machine held (error (pails/t "Invalid wallet machine"))
+    ' A resumed in-flight send is reconciled, never automatically rebroadcast.
+    = state (? (eq state.operation "send") state.set_operation("refresh").set_phase("pending") state)
+    ; (shuin_wallet_driver/process port initial.parent self card state)
+    | shuin_wallet_driver/loop port initial.parent self state.sequence
+  + start
+    \ server=nat arguments=row[str]
+    ^ nat
+    ?> (./some port) (nat/parse arguments.at(0)) (error (pails/t "Invalid Anvil port"))
+    ?> (./some home) (path_parse arguments.at(1)) (error (pails/t "Invalid wallet home"))
+    ; (SendCaps server (helm/supervisor/register home (shuin_wallet_driver/run port home.at(0))) [0])
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ?> (./ack err) reply (error (pails/t "Wallet driver registration failed"))
+    ; (shuin_wallet/require !(maybe/is_some err) "Wallet driver registration rejected")
+    server

@@ -1,0 +1,160 @@
+- shuin_namespace
+- goo_value
+
+' Discover receiver-compatible Grove actions without invoking stored code.
++ shuin_actions
+  + compatible
+    \ declaration=myth current=myth state=namespace
+    ^ maybe[[grove_action_schema lash]]
+    < held declaration.get(system_vocabulary/grove/action)
+    ?> schema=grove_action_schema held .none
+    < held declaration.get(system_vocabulary/grove/action_handler)
+    ?> handler=grove_action_handler held .none
+    < role (goo_runtime/record .x schema.receiver state)
+    < held role.get(system_vocabulary/grove/role_contract)
+    ?> contract=lash held .none
+    ? (maybe/is_some (fit_check current.put(system_vocabulary/lash contract))) .none
+    | ./some [schema contract]
+  + writable
+    \ target=path state=namespace
+    ^ bool
+    | and (pith_prefix [state.self 'app] target) (state.permitted(target))
+  + list
+    \ fields=row[[str str]] state=namespace
+    ^ either[str json]
+    = get (\ key=str (http_foot/field key fields))
+    < target (shuin_namespace/target (get "target"))
+    ? !(value_read/physical target) (./err "Actions require a physical namespace record.")
+    ?> (./some current) (goo_runtime/record .x target state) (./err "This path has no live record.")
+    ?> (./some history) state.history(target) (./err "Unknown namespace authority.")
+    ? (and (get "sourceEpoch").len !(eq (get "sourceEpoch") (nat/show history.top))) (./err "This listing changed; refresh before opening actions.")
+    = epoch (nat/show state.local.rec.len)
+    ? (and (get "epoch").len !(eq epoch (get "epoch"))) (./err "Namespace changed; refresh before opening actions.")
+    ?> (./some offset) (nat/parse (? (get "after").len (get "after") "0")) (./err "Invalid action cursor.")
+    ? (and offset !((get "epoch").len)) (./err "Action continuation requires its snapshot.")
+    = prefix=path [state.self 'gov]
+      catalog=row[[path myth]] (sovereign_care .z prefix state).tap.map((\ [relative record] [prefix.weld(relative) record]))
+      matches=row[[path myth]] (catalog.keep((\ [path record] (maybe/is_some (shuin_actions/compatible record current state)))))
+      remaining=row[[path myth]] matches.drop(offset)
+      page=row[[path myth]] remaining.take((? (gt remaining.len 24) 24 remaining.len))
+      entries
+        | page.map
+        \ [path record]
+        = [schema contract] (shuin_actions/compatible record current state).fall([(grove_action_schema [] (grove_role_schema [] [])) lash/new])
+          [title _] (physical_projection/label record)
+          [description _ _] (physical_projection/help record)
+          arguments
+            | schema.arguments.fields.map
+            \ field
+            = named (shuin_namespace/name [field.slot state]).fall(jnull)
+            | json/obj [(jkv "slot" (json/str (path_show field.slot)))
+                (jkv "name" (json/str field.name)) (jkv "optional" (json/boo field.optional))
+                (jkv "title" (goo_runtime/json_field "title" named))
+                (jkv "description" (goo_runtime/json_field "description" named))]
+        | json/obj [(jkv "path" (json/str (path_show path)))
+            (jkv "title" title) (jkv "description" description)
+            (jkv "publication" (json/str (nat/show (state.case(.x path)).fall(0))))
+            (jkv "roleVersion" (json/str (nat/show (state.case(.x schema.receiver)).fall(0))))
+            (jkv "arguments" (json/arr arguments))]
+    ?> (./ok key) (physical_key/encode target) (./err "Invalid action target.")
+    | ./ok (json/obj [(jkv "version" (json/num .false 1))
+        (jkv "targetKey" (json/str key)) (jkv "target" (json/str (physical_key/display target).fall(key)))
+        (jkv "life" (json/str (nat/show (goo_runtime/lifetime target state))))
+        (jkv "recordVersion" (json/str (nat/show (state.case(.x target)).fall(0))))
+        (jkv "epoch" (json/str epoch)) (jkv "writable" (json/boo (shuin_actions/writable target state)))
+        (jkv "actions" (json/arr entries))
+        (jkv "next" (? (gt matches.len (add offset page.len)) (json/str (nat/show (add offset page.len))) jnull))])
+  + read
+    \ fields=row[[str str]] state=namespace
+    ^ [nat str]
+    ? (shuin_actions/list fields state)
+     > (./ok value) [200 (show value)]
+     > (./err why) [409 (show (json/obj [(jkv "error" (json/str why))]))]
+  + arguments
+    \ schema=row[grove_role_field] fields=row[[str str]] state=namespace
+    ^ either[str myth]
+    % rest=row[grove_role_field] schema out=myth myth/new
+    ^ either[str myth]
+    ? !(rest.len) (./ok out)
+    = field rest.at(0)
+      source (http_foot/field (str/cat_all ["arg:" (path_show field.slot)]) fields)
+    ? !(source.len)
+      ? field.optional (_ rest.drop(1) out)
+      | ./err (str/cat_all ["Missing argument: " field.name])
+    ? (gt source.len 16384) (./err "Argument exceeds 16 KiB.")
+    < value (goo_value/decode (pails/n 0) "foil" source [] state)
+    | _ rest.drop(1) out.put(field.slot value)
+  + execute
+    \ declaration=myth arguments=myth current=myth
+    ^ either[str myth]
+    ?> (./some held) declaration.get(system_vocabulary/grove/action_handler) (./err "Action has no handler.")
+    ?> handler=grove_action_handler held (./err "Invalid action handler.")
+    = invoke handler.apply
+    ?> (./ok result) (Try (invoke arguments) current) (./err "Action failed; the record was not changed.")
+    ?> (./some next) result (./err "The action rejected its arguments or receiver.")
+    | ./ok next
+  + apply
+    \ fields=row[[str str]] state=namespace
+    ^ either[str namespace]
+    = get (\ key=str (http_foot/field key fields))
+    < target (shuin_namespace/target (get "target"))
+    ? !(shuin_actions/writable target state) (./err "This record is read-only.")
+    ? !(eq (get "life") (nat/show (goo_runtime/lifetime target state))) (./err "The action target was removed or replaced.")
+    ? !(eq (get "recordVersion") (nat/show (state.case(.x target)).fall(0))) (./err "The record changed; reopen its action menu.")
+    ?> (./some current) (goo_runtime/record .x target state) (./err "The record no longer exists.")
+    ?> (./some action) (path_parse (get "action")) (./err "Invalid action declaration.")
+    ? !(pith_prefix [state.self 'gov] action) (./err "Action is outside the publication tree.")
+    ? !(eq (get "publication") (nat/show (state.case(.x action)).fall(0))) (./err "The action changed; reopen its menu.")
+    ?> (./some declaration) (goo_runtime/record .x action state) (./err "The action no longer exists.")
+    ?> (./some compatible) (shuin_actions/compatible declaration current state) (./err "This action no longer matches the record.")
+    = [schema contract] compatible
+    ? !(eq (get "roleVersion") (nat/show (state.case(.x schema.receiver)).fall(0))) (./err "The action's role changed; reopen its menu.")
+    = names=row[str] (schema.arguments.fields.map((\ field (str/cat_all ["arg:" (path_show field.slot)]))))
+    ? !(fields.all((\ [key value] (? (eq key.slice(0 4) "arg:") names.has(key) .true)))) (./err "Undeclared action argument.")
+    < arguments (shuin_actions/arguments schema.arguments.fields fields state)
+    < next (shuin_actions/execute declaration arguments current)
+    ? (maybe/is_some (fit_check next.put(system_vocabulary/lash contract))) (./err "The action result violates its receiver role.")
+    | shuin_navigation/change target (writ/make next) state
+  + receipt
+    : identity=str request=str response=str
+  + receipts
+    : entries=row[shuin_actions/receipt]
+  + run
+    \ body=str fields=row[[str str]] state=namespace
+    ^ [namespace nat str]
+    = get (\ key=str (http_foot/field key fields))
+      identity (get "id")
+      home=path [state.self 'weft 'shuin_action_receipts]
+      record (goo_runtime/record .x home state).fall(myth/new)
+      entries=row[shuin_actions/receipt]
+        ?> (./some held) record.get(system_vocabulary/content) []
+        ?> held=shuin_actions/receipts held []
+        held.entries
+      prior entries.keep((\ entry (eq entry.identity identity)))
+      fail (\ why=str [state 409 (show (json/obj [(jkv "error" (json/str why))]))])
+    ? prior.len
+      ? (eq body prior.at(0).request) [state 200 prior.at(0).response]
+      | fail "Invocation ID was reused with different content."
+    ? (ge entries.len 1024) (fail "Action receipt journal is full.")
+    ? (shuin_actions/apply fields state)
+     > (./err why) (fail why)
+     > (./ok next)
+      = response (show (json/obj [(jkv "accepted" (json/boo .true)) (jkv "id" (json/str identity))]))
+        receipt (shuin_actions/receipt identity body response)
+        record record.put(system_vocabulary/content (shuin_actions/receipts entries.snoc(receipt)))
+      ? (shuin_navigation/change home (writ/make record) next)
+       > (./err _) (fail "Unable to retain action receipt; no changes were committed.")
+       > (./ok committed) [committed 200 response]
+  + http
+    \ body=str
+    ^ http_foot/action
+    ? (gt body.len 65536) (./reply (http_driver/response 413 "Action request too large"))
+    = fields (http_foot/fields body)
+      get (\ key=str (http_foot/field key fields))
+      allowed=row[str] ["operation" "target" "sourceEpoch" "epoch" "after" "life" "recordVersion" "action" "publication" "roleVersion" "id"]
+    ? !(fields.all((\ [key value] (and (allowed.has(key) || (eq key.slice(0 4) "arg:")) (eq (fields.keep((\ [other _] (eq key other)))).len 1)))))
+      | ./reply (http_driver/response 400 "Unknown or duplicate action field")
+    ? (eq (get "operation") "list") (./snapshot (shuin_actions/read fields))
+    ? !(and (eq (get "operation") "invoke") (shuin_navigation/identity (get "id")))
+      | ./reply (http_driver/response 400 "Invalid action operation or ID")
+    | ./transact (shuin_actions/run body fields)

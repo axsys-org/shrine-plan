@@ -1,0 +1,360 @@
+- shuin_path_search
+- shuin_menus
+- shuin_commentary
+- shuin_scenes
+- http_foot
+- shuin_navigation
+- shuin_namespace
+- shuin_actions
+- shuin_presentation
+- goo_bridge
+- shuin_profile
+- goo_bounded
+- goo_context
+- goo_browser
+
+' Read-only binding in one namespace snapshot. Shuin prepares the resulting
+' source with its own pinned Parley/fonts; no Mash geometry crosses this API.
++ shuin_views
+  + has_paths
+    \ nodes=list[goo/node]
+    ^ bool
+    | nodes.any((\ node=goo/node ((and (eq node.constructor "input") (eq (goo_vocabulary/attr "kind" node) "path")) || (shuin_views/has_paths node.children))))
+  + consumes
+    \ fields=list[rex]
+    ^ row[json]
+    % rest=list[rex] fields out=row[json] []
+    ^ row[json]
+    ? rest.is_nil out
+    ?> (./nest _ _ rune kids) rest.head (_ rest.tail out)
+    ? !(and (eq rune "=") (eq kids.len 2)) (_ rest.tail out)
+    ? !(goo_runtime/mentions "input" kids.at(1)) (_ rest.tail out)
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (_ rest.tail out)
+    | _ rest.tail out.snoc((json/str (path_show slot)))
+  + attributes
+    \ node=goo/node
+    ^ row[jkv]
+    = names=row[str] ["treatment" "significance" "label" "key" "context"]
+    | names.fold []
+      \ fields=row[jkv] key=str
+      ?> (./some value) (goo_runtime/named key node.arguments) fields
+      | fields.snoc((jkv key (json/str (goo_vocabulary/word value))))
+  + track
+    ' Grove tracks use an integer, .content, or fr(integer), on the existing Rex AST.
+    \ value=rex
+    ^ either[str json]
+    < parsed (goo_vocabulary/track value)
+    = [kind number] parsed
+    ? (eq kind "content") (./ok (json/obj [(jkv "kind" (json/str kind))]))
+    | ./ok (json/obj [(jkv "kind" (json/str kind)) (jkv "value" (json/num .false number))])
+  + tracks
+    \ node=goo/node
+    ^ either[str row[json]]
+    ? !(eq node.constructor "columns") (./ok [])
+    ?> (./some value) (goo_vocabulary/named "tracks" node) (./err "columns requires tracks")
+    % rest=list[rex] value.children.stream out=row[json] []
+    ^ either[str row[json]]
+    ? rest.is_nil (./ok out)
+    < track (shuin_views/track rest.head)
+    | _ rest.tail out.snoc(track)
+  + nodes
+    \ published=goo/published card=myth nodes=list[goo/node] parent=row[nat] scope=goo_runtime/scope depth=nat target=path state=namespace
+    ^ either[str row[json]]
+    ? (gt depth 24) (./err "Shuin view nesting exceeds 24.")
+    % rest=list[goo/node] nodes index=nat 0 out=row[json] []
+    ^ either[str row[json]]
+    ? rest.is_nil (./ok out)
+    < node (shuin_views/node published card rest.head parent.snoc(index) scope depth target state)
+    | _ rest.tail index.inc out.snoc(node)
+  + node
+    \ published=goo/published card=myth node=goo/node route=row[nat] scope=goo_runtime/scope depth=nat target=path state=namespace
+    ^ either[str json]
+    = kind node.constructor
+      scope (goo_runtime/enter scope node)
+      containers=row[str] ["row" "col" "group" "present" "columns" "lines"]
+      leaves=row[str] ["text" "time" "number" "duration" "boolean" "input" "action"]
+    ? ((eq kind "repeat") || (eq kind "chain"))
+      | shuin_views/bounded published card node route depth target state
+    = input_kind=str (goo_vocabulary/attr "kind" node)
+    ? (and (eq kind "input") (and input_kind.len !(row/has[str] input_kind ["text" "path"])))
+      | ./err "Native adapter unavailable for this typed control; rich text is never flattened to plain input."
+    ? (and (eq kind "input") (eq input_kind "path"))
+      ? !(and (eq (goo_vocabulary/attr "many" node) "1") (and (eq (goo_vocabulary/attr "care" node) "choose") (row/has[str] (goo_vocabulary/attr "access" node) ["read" "write"]))) (./err "Unsupported path input capability.")
+      | shuin_views/path_node published card node route scope depth target state
+    | shuin_views/path_node published card node route scope depth target state
+  + path_node
+    \ published=goo/published card=myth node=goo/node route=row[nat] scope=goo_runtime/scope depth=nat target=path state=namespace
+    ^ either[str json]
+    = kind node.constructor input_kind (goo_vocabulary/attr "kind" node)
+      containers=row[str] ["row" "col" "group" "present" "columns" "lines"]
+      leaves=row[str] ["text" "time" "number" "duration" "boolean" "input" "action"]
+    ? (and (eq kind "action") (maybe/is_some (goo_runtime/named "write" node.arguments)))
+      | ./err "Native context-write adapter is unavailable; interaction is disabled."
+    ? !(containers.has(kind) || leaves.has(kind)) (./err (str/cat_all ["Unsupported Shuin constructor: " kind]))
+    ? (and leaves.has(kind) (gt node.children.len 0)) (./err "Shuin leaves cannot have children.")
+    < tracks (shuin_views/tracks node)
+    < children (shuin_views/nodes published card node.children route scope depth.inc target state)
+    = text=either[str str]
+        ? containers.has(kind) (./ok "")
+        ? (eq node.arguments.len 0) (./err "Shuin leaf requires a value.")
+        ? (eq kind "input")
+          ?> (./some slot) (goo_runtime/read_path node.arguments.head) (./err "Input requires a bound slot.")
+          ? (maybe/is_some scope.make)
+            = bound (goo_bridge/creation_inputs scope.values (list/one node)).head
+            | ./ok (goo_bridge/input_default bound.arguments.head).fall("")
+          ?> (./some value) card.get(slot) (./ok "")
+          ? (eq input_kind "path")
+            ?> selections=goo_paths/hunts value (./err "Path input requires typed hunts.")
+            | ./ok (show (goo_paths/wire selections))
+          | goo_bridge/text value
+        < value (goo_bridge/evaluate published card node.arguments.head)
+        ?> (./some value) value (./err "Required Shuin value is absent.")
+        | goo_bridge/formatted kind value
+    < text text
+    = role=either[str str]
+        ? (and (eq kind "group") (maybe/is_some scope.make)) (./ok "body")
+        ? (maybe/is_some (goo_runtime/named "role" node.arguments)) (./ok (goo_vocabulary/attr "role" node))
+        ? !(and leaves.has(kind) (gt node.arguments.len 1)) (./ok "body")
+        ? ((eq kind "input") || (eq kind "action")) (./ok "body")
+        | goo_bridge/slot published card node.arguments.at(1)
+    < role role
+    = input (eq kind "input")
+      action (eq kind "action")
+      slot=path (? input (goo_runtime/read_path node.arguments.head).fall([]) [])
+      multi (goo_runtime/named "multiline" node.arguments)
+      submit (goo_runtime/named "submit" node.arguments)
+      multiline=bool (? (maybe/is_some multi) (eq multi.fall((rex/word "0")).print "1") .false)
+    ? (and (maybe/is_some multi) !(eq multi.fall((rex/word "0")).print "1")) (./err "multiline must be 1.")
+    ? (and (maybe/is_some submit) !(eq submit.fall((rex/cord "")).print (rex/cord "enter").print)) (./err "submit must be enter.")
+    ? (and action (maybe/is_some (goo_runtime/named "become" node.arguments))) (./err "Shuin v1 does not admit become.")
+    = invoke=bool
+        ? !action .false
+        | either/is_ok (goo_runtime/bound_control published.view.binding [node scope])
+      id (str/join "." route.map(nat/show))
+    = extra=row[jkv]
+        ? !(and input (eq input_kind "path")) []
+        ?> (./some value) card.get(slot) []
+        ?> selections=goo_paths/hunts value []
+        [(jkv "pathInput" (json/obj [(jkv "version" (json/num .false 1)) (jkv "many" (json/boo .true))
+          (jkv "care" (json/str "choose")) (jkv "access" (json/str (goo_vocabulary/attr "access" node)))
+          (jkv "items" (json/arr (shuin_path_search/selected selections state)))]))]
+    = captures=row[jkv]
+        ? !action []
+        ?> (./ok declared) published.result []
+        ? !(shuin_views/has_paths declared.children) []
+        [(jkv "consumes" (json/arr (shuin_views/consumes scope.values.weld(node.arguments.drop(1).keep(goo_runtime/argument_binding)))))]
+      extra extra.weld(captures)
+    | ./ok (json/obj (extra.weld([(jkv "id" (json/str id)) (jkv "kind" (json/str (? (eq kind "present") "group" kind)))
+        (jkv "text" (json/str text)) (jkv "role" (json/str role)) (jkv "slot" (json/str (path_show slot)))
+        (jkv "multiline" (json/boo multiline)) (jkv "submit" (json/str (? (maybe/is_some submit) "enter" "newline")))
+        (jkv "invoke" (json/boo invoke)) (jkv "children" (json/arr children))
+        (jkv "attributes" (json/obj (shuin_views/attributes node)))
+        (jkv "tracks" (json/arr tracks)) (jkv "indent" (json/num .false (nat/parse (goo_vocabulary/attr "indent" node)).fall(0)))])))
+  + passive
+    \ nodes=list[goo/node]
+    ^ bool
+    | nodes.all
+      \ node=goo/node
+      | and !((eq node.constructor "input") || (eq node.constructor "action")) (shuin_views/passive node.children)
+  + group_json
+    \ route=row[nat] children=row[json] hidden=nat cut=str
+    ^ json
+    | json/obj [(jkv "id" (json/str (str/join "." route.map(nat/show))))
+        (jkv "kind" (json/str "group")) (jkv "text" (json/str "")) (jkv "role" (json/str "body"))
+        (jkv "slot" (json/str "/")) (jkv "multiline" (json/boo .false))
+        (jkv "submit" (json/str "newline")) (jkv "invoke" (json/boo .false))
+        (jkv "hiddenCount" (json/num .false hidden)) (jkv "cut" (json/str cut))
+        (jkv "children" (json/arr children))]
+  + item_view
+    \ target=path slot=path route=row[nat] depth=nat state=namespace
+    ^ either[str json]
+    ?> (./some card) (goo_runtime/record .x target state) (./err "Repeated subject is unavailable.")
+    = catalog (goo_browser/catalog (sovereign_care .z [state.self 'gov] state))
+      matches (catalog.keep((\ view=goo/published (and !(view.view.is_pane) (and (equal view.view.slot slot) (goo_browser/matches card view))))))
+    ? !(eq matches.len 1) (./err "Repeat/chain requires one ordinary view for its slot.")
+    = published matches.head
+    < view (goo_runtime/matching_view published card)
+    ? !(goo_bounded/owner_free view.children) (./err "Ownership requires @pane or an explicit attachment with declared ports.")
+    ? !(shuin_views/passive view.children) (./err "This native bounded-surface adapter does not yet admit per-item controls; interaction is disabled.")
+    < children (shuin_views/nodes published card view.children route (goo_runtime/scope .none .none .nil .none .none .none) depth.inc target state)
+    | ./ok (shuin_views/group_json route children 0 "")
+  + bounded
+    \ published=goo/published card=myth node=goo/node route=row[nat] depth=nat target=path state=namespace
+    ^ either[str json]
+    ? !(node.arguments.len) (./err "repeat/chain requires a value.")
+    = value=either[str maybe[pail]]
+        ? (eq node.arguments.head.print published.view.binding) (./ok (./some (pails/p target)))
+        | goo_bridge/evaluate published card node.arguments.head
+    < value value
+    ?> (./some value) value (./err "Bounded source is absent.")
+    = slot_expr=maybe[rex]
+        ? (goo_runtime/named "slot" node.arguments)
+         > (./some slot) (./some slot)
+        ? (gt node.arguments.len 1) (./some node.arguments.at(1)) .none
+    ?> (./some slot_expr) slot_expr (./err "repeat/chain requires a slot.")
+    ?> (./some slot) (goo_runtime/read_path slot_expr) (./err "repeat/chain slot must be a path.")
+    = materialized=either[str [row[path] nat str]]
+        ? (eq node.constructor "repeat")
+          = items=either[str row[path]]
+              ? value
+               > values=goo_context/set (./ok values.keys)
+               > source=pails/p (./ok (sovereign_care .y source.p state).kid_tap.map((\ [key _] source.p.snoc(key))))
+              (./err "repeat requires a namespace source or a typed set of paths.")
+            maximum (nat/parse (goo_vocabulary/attr "max" node)).fall(64)
+          < items items
+          < repeated (goo_bounded/repeat items maximum)
+          | ./ok [repeated.items repeated.hidden ""]
+        ?> start=pails/p value (./err "chain requires a subject path.")
+        ?> (./some via) (goo_runtime/named "via" node.arguments) (./err "chain requires via.")
+        ?> (./some via) (goo_runtime/read_path via) (./err "chain via must be a path.")
+        < chain (goo_bounded/chain start.p via (nat/parse (goo_vocabulary/attr "depth" node)).fall(5) state)
+        | ./ok [chain.items 0 chain.stop]
+    < materialized materialized
+    = [items hidden cut] materialized
+      children=either[str row[json]]
+        % index=nat 0 children=row[json] []
+        ^ either[str row[json]]
+        ? (eq index items.len) (./ok children)
+        < child (shuin_views/item_view items.at(index) slot route.snoc(index) depth state)
+        | _ index.inc children.snoc(child)
+    < children children
+    | ./ok (shuin_views/group_json route children hidden cut)
+  + render
+    \ target=path view=path state=namespace
+    ^ either[str json]
+    ?> (./some card) (goo_runtime/record .x target state) (./err "Subject is unavailable.")
+    ?> (./some record) (goo_runtime/record .x view state) (./err "View is unavailable.")
+    < published (goo_runtime/published record)
+    = valid=either[str unit]
+        ? published.result
+         > (./ok _) (./ok [])
+         > (./err cause)
+          ? cause
+           > (grove/error/syntax span message) (./err (str/cat_all ["View line " (nat/show span.line) ": " message]))
+           > (grove/error/parser _) (./err "Unable to parse the published view.")
+    < checked valid
+    < declaration (goo_runtime/matching_view published card)
+    ? published.view.is_pane (./err "Shuin v1 expects an ordinary view.")
+    < nodes (shuin_views/nodes published card declaration.children [] (goo_runtime/scope .none .none .nil .none .none .none) 0 target state)
+    = query (goo_runtime/request "status" target target view [] 0 0 0 [] 0)
+      order=str
+        ?> (./some value) card.get(system_vocabulary/now) "0"
+        ?> value=pails/dm value "0"
+        | nat/show value.n
+    | ./ok (json/obj [(jkv "version" (json/num .false 1)) (jkv "profile" shuin_profile/metadata)
+        (jkv "order" (json/str order))
+        (jkv "view" (json/str (path_show view))) (jkv "snapshot" (goo_runtime/status_value query state))
+        (jkv "nodes" (json/arr nodes))])
+  + timestamp
+    \ target=path state=namespace
+    ^ nat
+    ?> (./some card) (goo_runtime/record .x target state) 0
+    ?> (./some value) card.get(system_vocabulary/now) 0
+    ?> value=pails/dm value 0
+    value.n
+  + newer
+    \ left=[path nat] right=[path nat]
+    ^ bool
+    = [lp lt] left [rp rt] right
+    ? (eq lt rt) (lte_str (path_show rp) (path_show lp))
+    | ge lt rt
+  + channel
+    \ target=path composer=path entry=path before=str expected=str parent=str parent_life=str life=str state=namespace
+    ^ either[str json]
+    = epoch (nat/show state.local.rec.len)
+    ? (and before.len !(expected.len)) (./err "History continuation requires its epoch.")
+    ? (and expected.len !(eq expected epoch)) (./err "History changed; refresh before loading older messages.")
+    ? (and life.len !(eq life (nat/show (goo_runtime/lifetime target state)))) (./err "Workspace was replaced; retained draft belongs to the previous lifetime.")
+    = root=either[str json]
+        ? !(parent.len) (./ok jnull)
+        ?> (./some source) (path_parse parent) (./err "Invalid workspace parent.")
+        ? !(and (eq target.len source.len.inc) (pith_prefix source target)) (./err "Thread is outside its parent.")
+        ? !(eq parent_life (nat/show (goo_runtime/lifetime source state))) (./err "Thread parent was replaced.")
+        ?> (./some _) (goo_runtime/record .x source state) (./err "Thread parent is unavailable.")
+        | shuin_views/render target entry state
+    < root root
+    < form (shuin_views/render target composer state)
+    = cursor=maybe[path] (path_parse before)
+    ? (and before.len (maybe/is_none cursor)) (./err "Invalid history cursor.")
+    ? (cursor.run((\ path !(and (eq path.len target.len.inc) (pith_prefix target path)))).fall(.false)) (./err "History cursor belongs to another source.")
+    ? (cursor.run((\ path (maybe/is_none (goo_runtime/record .x path state)))).fall(.false)) (./err "History cursor is unavailable.")
+    = tree (sovereign_care .y target state)
+      boundary=maybe[[path nat]] cursor.run((\ path [path (shuin_views/timestamp path state)]))
+      selected=list[[path nat]]
+        ' Inspect ordering metadata, retaining only the next page plus one sentinel.
+        ' View preparation and wire payload remain bounded to 32 records.
+        % rest=list[path] tree.kid.tap.stream.map((\ entry target.snoc(entry.key))) out=list[[path nat]] .nil
+        ? rest.is_nil out
+        = path rest.head
+          candidate=[path nat] [path (shuin_views/timestamp path state)]
+        ? (boundary.run((\ bound (shuin_views/newer candidate bound))).fall(.false)) (_ rest.tail out)
+        | _ rest.tail (out.cons(candidate).sort_by(shuin_views/newer).take(33))
+      page selected.take(32).reverse
+      next=str
+        ? !(gt selected.len 32) ""
+        = [path _] page.head
+        | path_show path
+      entries=either[str row[json]]
+        % rest=list[[path nat]] page out=row[json] []
+        ^ either[str row[json]]
+        ? rest.is_nil (./ok out)
+        = [path _] rest.head
+        < view (shuin_views/render path entry state)
+        | _ rest.tail out.snoc(view)
+    < entries entries
+    | ./ok (json/obj [(jkv "composer" form) (jkv "entries" (json/arr entries)) (jkv "root" root)
+        (jkv "page" (json/obj [(jkv "version" (json/num .false 1)) (jkv "source" (json/str (path_show target)))
+          (jkv "life" (json/str (nat/show (goo_runtime/lifetime target state)))) (jkv "epoch" (json/str epoch))
+          (jkv "parent" (json/str parent)) (jkv "parentLife" (json/str parent_life))
+          (jkv "before" (json/str before)) (jkv "next" (json/str next))
+          (jkv "limit" (json/num .false 32)) (jkv "order" (json/str "time-address-ascending"))]))])
+  + response
+    \ fields=row[[str str]] state=namespace
+    ^ [nat str]
+    = get (\ key=str (http_foot/field key fields))
+      result=either[str json]
+        ?> (./some target) (path_parse (get "target")) (./err "Invalid target.")
+        ?> (./some view) (path_parse (get "view")) (./err "Invalid view.")
+        ? (eq (get "entry").len 0) (shuin_views/render target view state)
+        ?> (./some entry) (path_parse (get "entry")) (./err "Invalid entry view.")
+        | shuin_views/channel target view entry (get "before") (get "epoch") (get "parent") (get "parent_life") (get "life") state
+    ? result
+     > (./ok value) [200 (show value)]
+     > (./err why) [409 (show (json/obj [(jkv "error" (json/str why))]))]
+  + inspect
+    \ fields=row[[str str]] state=namespace
+    ^ [nat str]
+    = get (\ key=str (http_foot/field key fields))
+      result=either[str json]
+        ? !(fields.all((\ [key value] (and (row/has[str] key ["session" "expected" "view" "publication"]) (eq (fields.keep((\ [other _] (eq key other)))).len 1))))) (./err "Unknown or duplicate inspector field.")
+        < location (shuin_namespace/inspected fields state)
+        ?> (./some view) (path_parse (get "view")) (./err "Invalid view path.")
+        ? !(eq (get "publication") (nat/show (state.case(.x view)).fall(0))) (./err "View changed; refresh the inspector.")
+        | shuin_views/render location.subject view state
+    ? result
+     > (./ok value) [200 (show value)]
+     > (./err why) [409 (show (json/obj [(jkv "error" (json/str why))]))]
+  + http
+    \ files=row[[str nat]] state=namespace
+    ^ http_foot/config
+    = frozen (namespace_search/freeze state)
+    ; (DeepSeq[nat] frozen.tree 0)
+    = plan
+        \ request=http_foot/request now=nat
+        ^ http_foot/action
+        ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
+        ? (eq request.target "/shuin/commentary") (shuin_commentary/http request.body)
+        ? (eq request.target "/shuin/paths") (shuin_path_search/http frozen request.body)
+        ? (eq request.target "/shuin/scenes") (./snapshot shuin_scenes/response)
+        ? (eq request.target "/shuin/presentation") (./snapshot (shuin_presentation/response (http_foot/fields request.body)))
+        ? (eq request.target "/shuin/actions") (shuin_actions/http request.body)
+        ? (eq request.target "/shuin/namespace") (shuin_namespace/http request.body)
+        ? (eq request.target "/shuin/context") (shuin_navigation/http request.body)
+        ? (eq request.target "/shuin/menu") (shuin_menus/http shuin_views/render request.body)
+        ? (eq request.target "/shuin/inspect")
+          ? (gt request.body.len 20000) (./reply (http_driver/response 413 "Request too large"))
+          | ./snapshot (shuin_views/inspect (http_foot/fields request.body))
+        ? !(eq request.target "/shuin/render") (./reply (http_driver/response 404 "Unknown Shuin operation"))
+        ? (gt request.body.len 8192) (./reply (http_driver/response 413 "Request too large"))
+        | ./snapshot (shuin_views/response (http_foot/fields request.body))
+    | http_foot/add_routes [(http_foot/route "/shuin" plan)] http_foot/empty
