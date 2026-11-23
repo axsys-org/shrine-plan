@@ -1,0 +1,176 @@
+- goo
+
+' Surface v1 checks over the existing Rex AST, not a second authoring parser.
++ goo_vocabulary
+  + family
+    \ kind=str
+    ^ str
+    ? ((row/has[str] kind ["text" "show" "resource" "image" "number" "time" "duration" "boolean" "link" "path" "code" "avatar" "media"])) "content"
+    ? ((row/has[str] kind ["row" "col" "flow" "stack" "group" "opt" "or" "repeat" "chain" "present"])) "composition"
+    ? ((row/has[str] kind ["columns" "lines"])) "constraint"
+    ? (eq kind "input") "control"
+    ? ((row/has[str] kind ["action" "button"])) "affordance"
+    ? ((row/has[str] kind ["progress" "status" "bar" "presence"])) "value"
+    ? ((row/has[str] kind ["menu" "dialog" "tooltip"])) "scope"
+    ? ((row/has[str] kind ["commentary" "reading_value" "reading_index" "reading_when" "anchored_columns" "reading_stream" "patch" "patch_node" "patch_port" "patch_connection" "patch_label" "patch_handle" "patch_operation" "pane" "_pane_instance" "selection" "list" "diagram_tree" "list_tree" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"])) "workspace"
+    "unknown"
+  + named
+    \ name=str node=goo/node
+    ^ maybe[rex]
+    % rest=list[rex] node.arguments
+    ^ maybe[rex]
+    ? rest.is_nil .none
+    ?> (./nest _ _ rune kids) rest.head (_ rest.tail)
+    ? !(and (eq rune "=") (eq kids.len 2)) (_ rest.tail)
+    ? !(eq kids.at(0).print name) (_ rest.tail)
+    | ./some kids.at(1)
+  + word
+    \ value=rex
+    ^ str
+    ? value
+     > (./leaf _ _ text) text
+     > (./nest _ _ rune kids)
+      ? (and (eq rune ".") (eq kids.len 1)) (goo_vocabulary/word kids.at(0))
+      ""
+    ""
+  + track
+    \ value=rex
+    ^ either[str [str nat]]
+    = word (goo_vocabulary/word value)
+    ? (eq word "content") (./ok ["content" 0])
+    = call=maybe[rex]
+        ?> (./ok node) (goo/head value) .none
+        ? !(and (eq node.constructor "fr") (eq node.arguments.len 1)) .none
+        | ./some node.arguments.head
+      fractional=bool call.is_some
+      digits=str (? fractional call.fall(value).print word)
+    ?> (./some number) (nat/parse digits) (./err "Track must be fixed pixels, .content, or fr(weight).")
+    ? ((gt number (? fractional 256 10000)) || (and fractional !(number))) (./err "Track exceeds its bound.")
+    | ./ok [(? fractional "fractional" "fixed") number]
+  + attr
+    \ name=str node=goo/node
+    ^ str
+    ?> (./some value) (goo_vocabulary/named name node) ""
+    | goo_vocabulary/word value
+  + defaults
+    \ nodes=list[goo/node]
+    ^ nat
+    | nodes.fold 0
+      \ count=nat node=goo/node
+      | add count (add (? (eq (goo_vocabulary/attr "default" node) "1") 1 0) (goo_vocabulary/defaults node.children))
+  + significant
+    \ nodes=list[goo/node]
+    ^ list[str]
+    | nodes.bind
+      \ node=goo/node
+      = here=list[str] (? (eq (goo_vocabulary/attr "significance" node) "significant") (list/one (str/cat_all [node.constructor "@" (nat/show node.span.line) ":" (nat/show node.span.column)])) .nil)
+      ? (maybe/is_some (goo_vocabulary/named "context" node)) here
+      | here.weld((goo_vocabulary/significant node.children))
+  + region
+    \ nodes=list[goo/node] name=str span=rex/source_span
+    ^ either[grove/error unit]
+    = found (goo_vocabulary/significant nodes)
+    ? (gt found.len 1)
+      | goo/fail[unit] span (str/cat_all ["region has " (nat/show found.len) " significant nodes; at most 1 allowed: " (str/join ", " found.row) "; region " name])
+    | ./ok []
+  + check
+    \ node=goo/node
+    ^ either[grove/error unit]
+    = kind node.constructor
+      attr (goo_vocabulary/attr)
+      has (\ key=str (maybe/is_some (goo_vocabulary/named key node)))
+    ? ((has "current") || (has "selected"))
+      | goo/fail[unit] node.span "Current state is derived from the accepted context pail; it cannot be authored."
+    ? ((row/has[str] kind ["icon" "divider"]))
+      | goo/fail[unit] node.span (str/cat_all [kind " is retired; use text/resource or group(treatment = rule)."])
+    ? (and (has "context") !((row/has[str] kind ["row" "col" "group"])))
+      | goo/fail[unit] node.span "context is allowed only on row, col and group"
+    ? (and (has "context") !((row/has[str] (attr "context" node) ["compact" "regular" "reading"])))
+      | goo/fail[unit] node.span "context must be compact, regular or reading"
+    ? (and (has "significance") !((row/has[str] (attr "significance" node) ["quiet" "default" "strong" "significant"])))
+      | goo/fail[unit] node.span "Unknown significance."
+    ? (and (eq (attr "treatment" node) "button") !(row/has[str] kind ["action" "button"]))
+      | goo/fail[unit] node.span "treatment button belongs to action; style cannot change a family"
+    ? (and (eq kind "action") (and (has "invoke") (has "write")))
+      | goo/fail[unit] node.span "action takes exactly one of invoke or write"
+    ? (and (eq kind "action") (and (has "write") !(has "pail")))
+      | goo/fail[unit] node.span "write requires pail"
+    ? (and (eq kind "resource") !(has "alt"))
+      | goo/fail[unit] node.span "resource requires alt; empty alt only with role = .decorative"
+    ? (and (eq kind "resource") (and (has "kind") !(eq (attr "kind" node) "image")))
+      | goo/fail[unit] node.span "resource supports images only"
+    = bound (attr "max" node)
+      depth (attr "depth" node)
+    ' PROVISIONAL: truncate at max; runtime missing/depth/cycle cuts.
+    ? (and (eq kind "repeat") (and bound.len (gt (nat/parse bound).fall(257) 256)))
+      | goo/fail[unit] node.span (str/cat_all ["max " bound " exceeds 256; an unbounded list is a topos, not a repeat"])
+    ? (and (eq kind "chain") (and depth.len (gt (nat/parse depth).fall(17) 16)))
+      | goo/fail[unit] node.span (str/cat_all ["depth " depth " exceeds 16"])
+    ? (and (eq kind "menu") !(node.children.all((\ child=goo/node (eq child.constructor "action")))))
+      | goo/fail[unit] node.span "menu children must be actions"
+    ? (and (eq kind "dialog") !(eq (goo_vocabulary/defaults node.children) 1))
+      | goo/fail[unit] node.span "dialog needs one action marked default"
+    = typed (and (eq kind "input") (has "kind"))
+      input_kind (attr "kind" node)
+    ? (and typed !(row/has[str] input_kind ["text" "rich" "scalar" "boolean" "choice" "colour" "path"]))
+      | goo/fail[unit] node.span "Unknown input kind."
+    ? (and typed (and (eq input_kind "scalar") !(and (has "min") (has "max"))))
+      | goo/fail[unit] node.span "scalar requires min and max"
+    ? (and typed (and (eq input_kind "choice") !(has "options")))
+      | goo/fail[unit] node.span "choice requires options"
+    ? (has "context") (goo_vocabulary/region node.children kind node.span)
+    | ./ok []
+  + literal
+    \ value=rex
+    ^ str
+    ?> (./leaf _ _ text) value ""
+    | text
+  + row_label
+    \ node=goo/node
+    ^ str
+    ? node.children.is_nil ""
+    = first node.children.head
+    ? !(and (eq first.constructor "text") (eq (goo_vocabulary/attr "role" first) "label")) ""
+    ? first.arguments.is_nil ""
+    | goo_vocabulary/literal first.arguments.head
+  + tree
+    \ nodes=list[goo/node] columns=nat borrowed=str
+    ^ either[grove/error unit]
+    % rest=list[goo/node] nodes
+    ^ either[grove/error unit]
+    ? rest.is_nil (./ok [])
+    = node rest.head
+      kind node.constructor
+      typed (and (eq kind "input") (maybe/is_some (goo_vocabulary/named "kind" node)))
+      label (goo_vocabulary/attr "label" node)
+    ? (and typed (and !(label.len) !(borrowed.len)))
+      | goo/fail[unit] node.span "input needs a label; it is not in a columns row that opens with label text"
+    ? (and (eq kind "resource") (and !((goo_vocabulary/attr "alt" node).len) !(eq (goo_vocabulary/attr "role" node) "decorative")))
+      | goo/fail[unit] node.span "resource requires alt; empty alt only with role = .decorative"
+    ? (and (eq kind "row") (and columns !(eq node.children.len columns)))
+      | goo/fail[unit] node.span (str/cat_all ["row has " (nat/show node.children.len) " child; tracks declare " (nat/show columns)])
+    = tracks=nat
+        ? !(eq kind "columns") 0
+        ?> (./some value) (goo_vocabulary/named "tracks" node) 0
+        | value.children.len
+      next_label=str (? (and (eq kind "row") columns) (goo_vocabulary/row_label node) "")
+    ? (and (eq kind "columns") !(tracks))
+      | goo/fail[unit] node.span "columns requires tracks"
+    ? (and (eq kind "columns") ((gt tracks 64) || !(node.children.all((\ row=goo/node (eq row.constructor "row"))))))
+      | goo/fail[unit] node.span "columns requires rows and at most 64 tracks"
+    = checked_tracks=either[grove/error unit]
+        ? !(eq kind "columns") (./ok [])
+        ?> (./some value) (goo_vocabulary/named "tracks" node) (./ok [])
+        % rest=list[rex] value.children.stream
+        ^ either[grove/error unit]
+        ? rest.is_nil (./ok [])
+        ? (goo_vocabulary/track rest.head)
+         > (./err why) (goo/fail[unit] node.span why)
+        | _ rest.tail
+    < checked_tracks checked_tracks
+    ? (and (eq kind "lines") (node.children.is_nil || !(node.children.all((\ row=goo/node (eq row.constructor "row"))))))
+      | goo/fail[unit] node.span "lines requires explicit rows"
+    ? (and (maybe/is_some (goo_vocabulary/named "indent" node)) (gt (nat/parse (goo_vocabulary/attr "indent" node)).fall(65) 64))
+      | goo/fail[unit] node.span "Line indent exceeds 64"
+    < checked (goo_vocabulary/tree node.children tracks next_label)
+    | _ rest.tail

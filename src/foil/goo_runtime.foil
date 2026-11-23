@@ -1,3 +1,4 @@
+- goo_paths
 - system_vocabulary
 - grove_role_runtime
 - grove_install
@@ -5,6 +6,7 @@
 - json
 - goo_value
 - physical_key
+- goo_composition
 
 ' Browser requests identify published controls. Only source-declared arguments
 ' can be supplied, and all writes pass through the namespace event loop.
@@ -13,7 +15,7 @@
     : operation=str target=path subject=path view=path control=row[nat]
       expected=nat displayed=nat publication=nat inputs=row[[str str]] now=nat
   + scope
-    : receiver=maybe[rex] action=maybe[rex] values=list[rex] make=maybe[rex] role=maybe[rex]
+    : receiver=maybe[rex] action=maybe[rex] values=list[rex] make=maybe[rex] role=maybe[rex] allocation=maybe[rex]
   + read_path
     \ expression=rex
     ^ maybe[path]
@@ -69,12 +71,14 @@
       values (goo_runtime/named "myth" node.arguments)
       make (goo_runtime/named "make" node.arguments)
       role (goo_runtime/named "role" node.arguments)
+      allocation (goo_runtime/named "allocation" node.arguments)
     | goo_runtime/scope
       (? (maybe/is_some receiver) receiver scope.receiver)
       (? (maybe/is_some action) action scope.action)
       scope.values.weld(values.run(goo_runtime/fields).fall((list/nil[rex])))
       (? (maybe/is_some make) make scope.make)
       (? (maybe/is_some role) role scope.role)
+      (? (maybe/is_some allocation) allocation scope.allocation)
   + locate
     \ nodes=list[goo/node] indices=row[nat] scope=goo_runtime/scope
     ^ maybe[[goo/node goo_runtime/scope]]
@@ -498,12 +502,15 @@
     ^ either[str goo/view]
     ? (maybe/is_some (fit_check current.put(system_vocabulary/lash published.contract))) (./err "Object no longer matches this view.")
     ?> (./ok lowered) published.result (./err "View has compiler errors.")
-    | ./ok lowered
+    < children (goo_composition/nodes published current lowered.children 0)
+    | ./ok lowered.set_children(children)
   + bound_control
     \ binding=str found=[goo/node goo_runtime/scope]
     ^ either[str [goo/node goo_runtime/scope]]
     = [node scope] found
     ? !(eq node.constructor "action") (./err "Expected an action control.")
+    ? (maybe/is_some (goo_runtime/named "write" node.arguments))
+      | ./err "Context writes require the authenticated context bridge; this invoke adapter cannot execute them."
     ? (maybe/is_some scope.make)
       ? ((maybe/is_some scope.receiver) || (maybe/is_some scope.action)) (./err "make cannot be combined with on or action.")
       ? (maybe/is_none scope.role) (./err "make requires a role.")
@@ -515,7 +522,7 @@
     \ query=goo_runtime/request published=goo/published current=myth
     ^ either[str [goo/node goo_runtime/scope]]
     < lowered (goo_runtime/matching_view published current)
-    = empty=goo_runtime/scope (goo_runtime/scope .none .none .nil .none .none)
+    = empty=goo_runtime/scope (goo_runtime/scope .none .none .nil .none .none .none)
     ?> (./some found) (goo_runtime/locate lowered.children query.control empty)
       | ./err "Unknown control."
     | goo_runtime/bound_control published.view.binding found
@@ -534,33 +541,109 @@
     ?> (./ok result) (Try (invoke arguments) current) (./err "Action failed during execution; the object was not changed.")
     ?> (./some next) result (./err "Action rejected its arguments or receiver.")
     | ./ok next
+  + argument_binding
+    ' Surface metadata never becomes domain operation input.
+    \ arg=rex
+    ^ bool
+    ?> (./nest _ _ rune kids) arg .true
+    ? !(and (eq rune "=") (eq kids.len 2)) .true
+    = keys=row[str] ["become" "invoke" "write" "pail" "role" "treatment" "significance" "label" "key" "default" "context"]
+    | !(keys.has(kids.at(0).print))
+  + path_input
+    \ slot=path nodes=list[goo/node]
+    ^ maybe[goo/node]
+    % rest=list[goo/node] nodes
+    ^ maybe[goo/node]
+    ? rest.is_nil .none
+    = node rest.head
+    ? (and (eq node.constructor "input") (and node.arguments.len (equal (goo_runtime/read_path node.arguments.head) (maybe/some[path] slot)))) (./some node)
+    ? (goo_runtime/path_input slot node.children)
+     > (./some found) (./some found)
+    | _ rest.tail
+  + typed_arguments
+    \ nodes=list[goo/node] arguments=myth current=myth state=namespace
+    ^ either[str myth]
+    % rest=row[mop/kv[path pail]] arguments.tap out=myth arguments
+    ^ either[str myth]
+    ? !(rest.len) (./ok out)
+    = entry rest.at(0)
+    ?> (./some node) (goo_runtime/path_input entry.key nodes) (_ rest.drop(1) out)
+    ? !(eq (goo_vocabulary/attr "kind" node) "path") (_ rest.drop(1) out)
+    ? !(and (eq (goo_vocabulary/attr "many" node) "1") (and (eq (goo_vocabulary/attr "care" node) "choose") (row/has[str] (goo_vocabulary/attr "access" node) ["read" "write"]))) (./err "Unsupported path input capability.")
+    ?> text=pails/t entry.val (./err "Expected a versioned path input payload.")
+    < values (goo_paths/decode text.t)
+    = write (eq (goo_vocabulary/attr "access" node) "write")
+    < valid (goo_paths/validate values write state)
+    = checked=either[str unit]
+        ?> (./some held) current.get(['sys 'goo 'path_policy]) (./ok [])
+        ?> policy=goo_paths/policy held (./err "Invalid path input policy.")
+        = check policy.check
+        | check values write state
+    < checked checked
+    | _ rest.drop(1) out.put(entry.key values)
   + prepared
     \ query=goo_runtime/request published=myth current=myth state=namespace
     ^ either[str myth]
     < view (goo_runtime/published published)
     < found (goo_runtime/control query view current)
     = [node scope] found
-      bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
+      bindings=list[rex] (node.arguments.drop(1).keep(goo_runtime/argument_binding))
     < lowered (goo_runtime/matching_view view current)
     < nodes (goo_runtime/bind_sources view current lowered.children)
     < bound (goo_runtime/bound_captures nodes query.control scope.values.weld(bindings) query.inputs)
     < validated (goo_runtime/validate_captures query.inputs scope.values.weld(bindings) state)
-    | goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings)
+    < arguments (goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings))
+    | goo_runtime/typed_arguments nodes arguments current state
   + updated
     \ query=goo_runtime/request published=myth current=myth state=namespace
     ^ either[str myth]
     < view (goo_runtime/published published)
     < found (goo_runtime/control query view current)
     = [node scope] found
-    ?> (./some action) scope.action (./err "Action group requires an action.")
+    = own_action (goo_runtime/named "invoke" node.arguments)
+      operation (? (maybe/is_some own_action) own_action scope.action)
+    ?> (./some action) operation (./err "Action group requires an action.")
     < arguments (goo_runtime/prepared query published current state)
     | goo_runtime/dispatch action arguments current view.contract state
+  + child_identity
+    ' A single bounded, canonical component; the client cannot supply a path.
+    \ identity=str
+    ^ bool
+    ? ((eq identity.len 0) || (gt identity.len 96)) .false
+    % i=nat 0
+    ? (eq i identity.len) .true
+    = c identity.at(i)
+    ? !((eq c 45) || ((and (ge c 48) (le c 57)) || (and (ge c 97) (le c 122)))) .false
+    | _ i.inc
+  + child_key
+    \ identity=str
+    ^ iota
+    = component=str
+        % i=nat 0 out=list[str] .nil
+        ? (eq i identity.len) (str/cat_all out.row)
+        | _ i.inc out.snoc((? (eq identity.at(i) 45) "_" identity.slice(i 1)))
+    | $ts (str/to_atom (str/cat_all ["entry_" component]))
+  + creation_target
+    \ query=goo_runtime/request base=path allocation=maybe[rex]
+    ^ either[str path]
+    ?> (./some mode) allocation (./ok base)
+    ? !(eq mode.print (rex/cord "child").print) (./err "Unknown creation allocation.")
+    ? !(equal base query.subject) (./err "Child creation must be anchored to the bound receiver.")
+    = identities (query.inputs.keep((\ [key value] (eq key "$invocation"))))
+    ? !(eq identities.len 1) (./err "Child creation requires one invocation identity.")
+    = [key identity] identities.at(0)
+    ? !(goo_runtime/child_identity identity) (./err "Invalid child creation identity.")
+    | ./ok base.snoc((goo_runtime/child_key identity))
   + create
     \ query=goo_runtime/request published=myth current=myth state=namespace scope=goo_runtime/scope
     ^ either[str namespace]
     < view (goo_runtime/published published)
     ?> (./some expression) scope.make (./err "Missing creation destination.")
-    ?> (./some target) (goo_runtime/source_path view current expression) (./err "Creation destination must have a path value.")
+    = destination=maybe[path]
+        ? (eq expression.print view.view.binding) (./some query.subject)
+        | goo_runtime/source_path view current expression
+    ?> (./some target) destination (./err "Creation destination must be the bound receiver or have a path value.")
+    < target (goo_runtime/creation_target query target scope.allocation)
     ? !(and state.permitted(target) (pith_prefix [state.self 'app] target)) (./err "Creation destination is outside application authority.")
     ? (sovereign_peek target state).wyt (./err "Creation destination is occupied.")
     ?> (./some expression) scope.role (./err "Missing creation role.")
@@ -574,6 +657,16 @@
     ? (grove_install/change target (writ/make next) state)
      > (./ok next) (./ok next)
      > (./err why) (./err (str/from_atom (iota_show why)))
+  + commit_hook
+    ' Trusted receiver continuation, inside admission and the exact-retry receipt.
+    : apply={\ path namespace namespace}either[str namespace]
+  + committed
+    \ target=path current=myth original=namespace next=namespace
+    ^ either[str namespace]
+    ?> (./some held) current.get(['sys 'goo 'commit]) (./ok next)
+    ?> hook=goo_runtime/commit_hook held (./err "Invalid receiver commit hook.")
+    = apply hook.apply
+    | apply target original next
   + apply
     \ query=goo_runtime/request state=namespace
     ^ either[str namespace]
@@ -592,7 +685,7 @@
     ? (maybe/is_some scope.make) (goo_runtime/create query published current state scope)
     < next (goo_runtime/updated query published current state)
     ? (grove_install/change target (writ/make next) state)
-     > (./ok next) (./ok next)
+     > (./ok next) (goo_runtime/committed target current state next)
      > (./err why) (./err (str/from_atom (iota_show why)))
   + receipt
     : identity=str request=goo_runtime/request body=str

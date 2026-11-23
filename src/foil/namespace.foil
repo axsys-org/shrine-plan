@@ -1,5 +1,6 @@
 - system_vocabulary
 - shrine
+- idx
 
 ' A trusted publication is immutable for the lifetime of a namespace.
 ' Its pin is the publication identity; revision selects its own store's
@@ -28,27 +29,38 @@
 + namespace
   : self=iota local=sov system=pin[system_publication]
 
+  + empty_tree
+    (@ v)
+    \ tree=axal[v]
+    ^ bool
+    ? tree.fil.is_some .false
+    | tree.kid_tap.all((\ [key child] (namespace/empty_tree child)))
+
+  + confined_tree
+    ' Once the prefix has been reached, every descendant is within it.
+    ' Do not enumerate records, cases or generated index contents there.
+    (@ v)
+    \ root=path tree=axal[v]
+    ^ bool
+    ? !(root.len) .true
+    ? tree.fil.is_some .false
+    | tree.kid_tap.all
+      \ [key child]
+      ? (eq_iota key root.at(0)) (namespace/confined_tree root.drop(1) child)
+      | namespace/empty_tree child
+
   + confined
     \ root=path state=sov
     ^ bool
-    = records
-        | state.idx.tap.all
-          \ [name history]
-          | pith_prefix root name
-      cases
-        | state.cases.tap.all
-          \ [name history]
-          | pith_prefix root name
+    = records (namespace/confined_tree root state.idx)
+      cases (namespace/confined_tree root state.cases)
     ? !records .false
     ? !cases .false
     % epoch=nat 1
     ^ bool
     ? (gt epoch state.rec.len) .true
     ?> (./some entry) state.rec.at(epoch) .false
-    = valid
-        | (unpin entry.held).tap.all
-          \ [name change]
-          | pith_prefix root name
+    = valid (namespace/confined_tree root (unpin entry.held))
     ? !valid .false
     | _ epoch.inc
 
@@ -208,6 +220,39 @@
     ? !(state.owns(name)) .false
     !(pith_prefix [state.self 'log] name)
 
+  + trial
+    ' The pure candidate commit.  An event that changes anything also
+    ' brings the kernel's dependency index declaration up to date, so
+    ' every committed namespace carries it.  Only the kernel writes that
+    ' declaration: callers may neither change nor bury it.
+    \ diffs=axal[note] now=nat block=nat state=namespace
+    ^ verdict[[raw=axal[note] next=sov changes=axal[sign]]]
+    = home (idx/deps/home state.self)
+    ? (diffs.has(home) || (cull/cover home diffs))
+      | ./rejected 'idx_kernel
+    ? (sov/step diffs now block state.local)
+     > (./rejected why) (./rejected why)
+     > (./accepted result=[next=sov changes=axal[sign]])
+       = [next changes] result
+       ? (eq changes.wyt 0) (./accepted [diffs next changes])
+       ?> (./some seed) (idx/deps/seed state.self next)
+         | ./accepted [diffs next changes]
+       = raw | diffs.put home seed
+       ? (sov/step raw now block state.local)
+        > (./rejected why) (./rejected why)
+        > (./accepted again=[next=sov changes=axal[sign]])
+          = [seeded grades] again
+          | ./accepted [raw seeded grades]
+
+  + merge_notes
+    ' Keep the potentially large index tree; derived notes retain precedence.
+    \ raw=axal[note] derived=axal[note]
+    ^ axal[note]
+    | raw.tap.fold derived
+    \ out [name change]
+    ? derived.has(name) out
+    | out.put name change
+
   + step
     ' Check ownership before dispatch to the store and after cull expansion.
     ' The preliminary candidate is pure; only the final complete store returns.
@@ -218,23 +263,31 @@
     = expanded | gate/prepare diffs state.local.top state.local.idx
     ? !(expanded.tap.all((\ [name change] state.permitted(name))))
       | ./rejected 'protected_journal
-    ? (sov/step diffs now block state.local)
+    ? (namespace/trial diffs now block state)
      > (./rejected why) (./rejected why)
-     > (./accepted result=[next=sov changes=axal[sign]])
-       = [next changes] result
+     > (./accepted staged)
+       = [raw next changes] staged
        ' A no-op must not mint a journal record and wake version watchers.
        ? (eq changes.wyt 0)
          | ./accepted (namespace/committed state changes)
-       = address=path [state.self 'log ($u next.top)]
-         event | namespace_event state.system (pin diffs) state.local.top now block
-         record | myth/sing system_vocabulary/content event
-         complete | diffs.put address (note/make record)
-       ? (sov/step complete now block state.local)
-        > (./rejected why) (./rejected why)
-        > (./accepted result=[committed=sov signs=axal[sign]])
-          = [committed signs] result
-          | ./accepted (namespace/committed
-              state.set_local(committed) signs)
+       ' Index content is derived here, in the same epoch as its sources.
+       ' The journal keeps the caller's diffs; replay re-derives the rest.
+       ? (idx/settle raw changes state.local next [state.self 'log])
+        > (./err why) (./rejected why)
+        > (./ok derived)
+          = address=path [state.self 'log ($u next.top)]
+            event | namespace_event state.system (pin diffs) state.local.top now block
+            record | myth/sing system_vocabulary/content event
+            ' Index creation can derive far more notes than the caller wrote.
+            ' Keep that tree and add the small raw set, with derived precedence.
+            merged | namespace/merge_notes raw derived
+            complete | merged.put address (note/make record)
+          ? (sov/step complete now block state.local)
+           > (./rejected why) (./rejected why)
+           > (./accepted result=[committed=sov signs=axal[sign]])
+             = [committed signs] result
+             | ./accepted (namespace/committed
+                 state.set_local(committed) signs)
 
   + replay
     \ event=namespace_event state=namespace

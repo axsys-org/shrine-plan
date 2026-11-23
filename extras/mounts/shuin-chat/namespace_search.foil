@@ -1,0 +1,410 @@
+- idx
+- physical_key
+- system_vocabulary
+
+' Commit-maintained metadata search. Wings see only their source path and record.
++ namespace_search
+  + edition
+    ^ nat
+    5
+  + shards
+    ^ nat
+    16
+  + document
+    : p=path key=str display=str title=str help=str title_lower=str path_lower=str record=bool
+  + stored
+    : value=pin[namespace_search/document] ancestors=row[pin[namespace_search/document]]
+  + frozen
+    : publication=pin[system_publication] generation=nat tree=axal[myth]
+  + posting_group
+    : entries=myth folders=bool
+  + cursor
+    : stage=nat source=maybe[path] skip=nat last=maybe[path]
+  + result
+    : items=row[namespace_search/document] cursor=namespace_search/cursor more=bool limited=bool candidates=nat postings=nat
+  + home
+    \ self=iota
+    ^ path
+    [self 'idx 'path_search]
+  + width
+    \ byte=nat
+    ^ nat
+    ? (lt byte 128) 1
+    ? (lt byte 224) 2
+    ? (lt byte 240) 3
+    4
+  + end
+    \ text=str start=nat count=nat
+    ^ nat
+    % pos=nat start left=nat count
+    ? ((eq left 0) || (ge pos text.len)) pos
+    | _ (add pos (namespace_search/width text.at(pos))) left.dec
+  + clip
+    \ limit=nat text=str
+    ^ str
+    ? (le text.len limit) text
+    % end=nat limit
+    ^ str
+    ? !(end) ""
+    = byte text.at(end)
+    ? (and (ge byte 128) (lt byte 192)) (_ end.dec)
+    | text.slice 0 end
+  + display
+    \ target=path canonical=str
+    ^ str
+    ? !(physical_key/display_fits target) canonical
+    = printable=bool
+        | target.all
+          \ segment=iota
+          ? !(eq (aura_tag segment) (str/to_atom "ts")) .true
+          | (str/sym (str/from_atom (quip_val segment))).is_some
+    ? !printable canonical
+    | (physical_key/display target).fall(canonical)
+  + document_at
+    \ target=path card=maybe[myth]
+    ^ namespace_search/document
+    = key=str
+        ?> (./ok encoded) (physical_key/encode target) ""
+        encoded
+      display (namespace_search/display target key)
+      title (namespace_search/clip 512 (card.run((\ r=myth r.txt_at(system_vocabulary/lede))).fall("")))
+      help (namespace_search/clip 2048 (card.run((\ r=myth r.txt_at(system_vocabulary/help))).fall("")))
+    | namespace_search/document target key display (? title.len title display) help (str/ascii_lower title) (str/ascii_lower display) card.is_some
+  + shard
+    ' Reduce each atom once. Repeated division by 256 copied the shrinking
+    ' arbitrary-precision atom at every byte and caused heavy allocation.
+    \ target=path
+    ^ nat
+    % rest=path target hash=nat 0
+    ^ nat
+    ? !(rest.len) (mod hash namespace_search/shards)
+    = segment rest.at(0)
+      part (add (aura_tag segment) (mod (quip_val segment) 65521))
+    | _ rest.drop(1) (mod (add (mul hash 33) part) 65521)
+  + file_before
+    ' The same path order as lt_pith, with one walk through the common prefix.
+    ' Kept local: changing the ordering constant would change persisted types.
+    \ a=path b=path
+    ^ bool
+    % i=nat 0
+    ? (eq i a.len) (lt i b.len)
+    ? (eq i b.len) .false
+    = x a.at(i) y b.at(i)
+    ? (eq_iota x y) (_ i.inc)
+    | lt_iota x y
+  + union
+    \ mask=nat prior=nat
+    ^ nat
+    % rest=nat mask bit=nat 0 out=nat prior
+    ^ nat
+    ? !(rest) out
+    | _ (div rest 2) bit.inc (? (mod rest 2) (set_bit bit out) out)
+  + add_mask
+    ' Posting values are ancestor-depth bitsets; documents live in metadata.
+    \ key=path mask=nat filings=mop[path pail lt_pith]
+    ^ myth
+    > node=mop/node[path pail lt_pith] filings (myth/sing key (pails/n mask))
+    ? (namespace_search/file_before key node.key)
+      | mop/balance[path pail lt_pith] node.key node.val (namespace_search/add_mask key mask node.l) node.r
+    ? (namespace_search/file_before node.key key)
+      | mop/balance[path pail lt_pith] node.key node.val node.l (namespace_search/add_mask key mask node.r)
+    = prior=nat
+        ?> held=pails/n node.val 0
+        held.n
+    | mop/n[path pail lt_pith] key (pails/n (namespace_search/union mask prior)) node.l node.r
+  + add_many
+    \ key=path targets=row[pin[namespace_search/document]] filings=myth
+    ^ myth
+    = mask=nat
+        % rest=row[pin[namespace_search/document]] targets out=nat 0
+        ^ nat
+        ? !(rest.len) out
+        | _ rest.drop(1) (set_bit (unpin rest.at(0)).p.len out)
+    | namespace_search/add_mask key mask filings
+  + add
+    \ key=path target=pin[namespace_search/document] filings=myth
+    ^ myth
+    | namespace_search/add_many key [target] filings
+  + text_keys
+    ' Title prefixes are compact; full matching is verified against metadata.
+    \ text=str targets=row[pin[namespace_search/document]] path_mode=bool shard=nat filings=myth
+    ^ myth
+    ? path_mode (namespace_search/path_keys text targets shard filings)
+    % end=nat (namespace_search/end text 0 1) count=nat 1 out=myth filings
+    ^ myth
+    ? ((eq end 0) || (gt count 8)) out
+    = out (namespace_search/add_many ['title_prefix ($ts text.slice(0 end)) ($u shard)] targets out)
+    ? (eq end text.len) out
+    | _ (namespace_search/end text end 1) count.inc out
+  + path_keys
+    ' Scope name prefixes by their displayed parent. Shared authority prefixes
+    ' cannot make a full-path lookup scan unrelated folders. Empty names cover
+    ' queries ending with a slash; masks retain all matching descendants.
+    \ text=str targets=row[pin[namespace_search/document]] shard=nat filings=myth
+    ^ myth
+    ' Queries are limited to 256 bytes. Do not walk an arbitrarily long
+    ' physical name just to locate its next separator beyond that limit.
+    = text (namespace_search/clip 256 text)
+    % start=nat 0 out=myth filings
+    ^ myth
+    ? ((gt start text.len) || (gt start 256)) out
+    = end=nat
+        % pos=nat start
+        ^ nat
+        ? ((ge pos text.len) || (eq text.at(pos) 47)) pos
+        | _ pos.inc
+      parent text.slice(0 start)
+      out=myth
+        % pos=nat start count=nat 0 out=myth out
+        ^ myth
+        ? ((gt count 8) || (gt pos 256)) out
+        = reachable (targets.keep((\ held=pin[namespace_search/document] (ge (unpin held).path_lower.len pos))))
+          out (namespace_search/add_many ['path_prefix ($ts parent) ($ts text.slice(start (sub pos start))) ($u shard)] reachable out)
+        ? (eq pos end) out
+        | _ (namespace_search/end text pos 1) count.inc out
+    ? (eq end text.len) out
+    | _ end.inc out
+  + file
+    \ source=path record=myth
+    ^ myth
+    ' The declaration restricts traversal; this guard also protects direct filing.
+    ? (lt source.len 2) myth/new
+    ? !(eq_iota source.at(1) 'app) myth/new
+    = shard (namespace_search/shard source)
+      doc (pin (namespace_search/document_at source (./some record)))
+      ancestors=row[pin[namespace_search/document]]
+        % depth=nat 2 out=row[pin[namespace_search/document]] []
+        ^ row[pin[namespace_search/document]]
+        ? (gt depth source.len) out
+        | _ depth.inc out.snoc((? (eq depth source.len) doc (pin (namespace_search/document_at source.take(depth) .none))))
+      initial (myth/sing ['metadata ($u shard)] (namespace_search/stored doc ancestors)).put(['catalog ($ts "") ($u shard)] (pails/n (sub (bex source.len.inc) 4)))
+      out=myth
+        % rest=row[pin[namespace_search/document]] ancestors out=myth initial
+        ^ myth
+        ? !(rest.len) out
+        = item (unpin rest.at(0))
+        | _ rest.drop(1) (namespace_search/add ['path_exact ($ts item.path_lower) ($u shard)] rest.at(0) out)
+      readable (ancestors.keep((\ held=pin[namespace_search/document] (eq (unpin held).path_lower.at(0) 47))))
+      physical (ancestors.keep((\ held=pin[namespace_search/document] !(eq (unpin held).path_lower.at(0) 47))))
+      out (? readable.len (namespace_search/text_keys (unpin readable.at(readable.len.dec)).path_lower readable .true shard out) out)
+      out (? physical.len (namespace_search/text_keys (unpin physical.at(physical.len.dec)).path_lower physical .true shard out) out)
+      out (? (unpin doc).title_lower.len (namespace_search/add ['exact ($ts (unpin doc).title_lower) ($u shard)] doc out) out)
+    | namespace_search/text_keys (unpin doc).title_lower [doc] .false shard out
+  + declaration
+    ^ myth
+    | (myth/sing ['sys 'limb] (wing namespace_search/file)).put(['sys 'tack] (hunt .z ['app])).put(['sys 'edition] (pails/n namespace_search/edition)).put(system_vocabulary/lede (pails/t "Namespace search index")).put(system_vocabulary/help (pails/t "Commit-maintained titles and paths within this node’s app subtree. Contents belong to the kernel."))
+  + install
+    \ state=namespace
+    ^ either[pail namespace]
+    = home (namespace_search/home state.self)
+      prior (idx/record_at home state.local).fall(myth/new)
+    ? (eq prior.nat_at(['sys 'edition] 0) namespace_search/edition) (./ok state)
+    = notes ((axal/new[note] .none).put(home (note/make namespace_search/declaration)))
+    ; (Trace ["SEARCH-INDEX-LOCAL-START" (Now 0)] 0)
+    ' Initialization is a host boundary. Store its immutable inputs before
+    ' the pure build so copying GC does not repeatedly move published code.
+    = input (pin state) declaration (pin notes)
+    ; (Ice input)
+    ; (Ice declaration)
+    ? (namespace/step (unpin declaration) 0 0 (unpin input))
+     > (./rejected why) (./err (pails/q why))
+     > (./accepted result)
+      ; (DeepSeq[nat] (namespace_search/record ['metadata ($u 0)] result.state) 0)
+      ; (Trace ["SEARCH-INDEX-LOCAL-END" (Now 0)] 0)
+      | ./ok result.state
+  + freeze
+    ' Retain publication identity for cursor/declaration validation, but do not
+    ' enumerate or index the system publication. Search covers local app only.
+    \ state=namespace
+    ^ namespace_search/frozen
+    | namespace_search/frozen state.system (Now 0) (axal/new[myth] .none)
+  + record
+    \ key=path state=namespace
+    ^ myth
+    | (idx/record_at (namespace_search/home state.self).weld((idx/slot key)) state.local).fall(myth/new)
+  + partition
+    ' Descend the common key prefix once, then read its sixteen shard children.
+    ' These are point reads of pinned records, never a walk of their contents.
+    \ prefix=path frozen=namespace_search/frozen state=namespace
+    ^ row[myth]
+    = local state.local.idx.dip((namespace_search/home state.self).weld(prefix))
+      shared frozen.tree.dip(prefix)
+    % shard=nat 0 out=row[myth] []
+    ? (eq shard namespace_search/shards) out
+    = key=iota ($u shard)
+      own (idx/held local.kid_gut(key).fil state.local.top).fall(myth/new)
+      system shared.kid_gut(key).fil.fall(myth/new)
+    | _ shard.inc out.snoc(own).snoc(system)
+  + posting
+    \ family=iota term=str frozen=namespace_search/frozen state=namespace
+    ^ row[myth]
+    | namespace_search/partition [($u 3) family ($ts term)] frozen state
+  + path_posting
+    \ query=str frozen=namespace_search/frozen state=namespace
+    ^ row[myth]
+    = start=nat
+        % pos=nat 0 start=nat 0
+        ^ nat
+        ? (eq pos query.len) start
+        | _ pos.inc (? (eq query.at(pos) 47) pos.inc start)
+      parent query.slice(0 start)
+      name query.slice(start (sub query.len start))
+      prefix name.slice(0 (namespace_search/end name 0 8))
+    | namespace_search/partition [($u 4) 'path_prefix ($ts parent) ($ts prefix)] frozen state
+  + lookup
+    \ fallback=namespace_search/document metadata=row[myth]
+    ^ namespace_search/document
+    = target fallback.p
+      shard (add (mul (namespace_search/shard target) 2) (? (target.starts('sys)) 1 0))
+    ?> (./some held) metadata.at(shard).get(target) fallback
+    ?> stored=namespace_search/stored held fallback
+    | unpin stored.value
+  + rank_one
+    \ query=str text=str
+    ^ nat
+    ? !(query.len) 1
+    ? (eq query text) 0
+    ? (eq query text.slice(0 query.len)) 1
+    2
+  + rank
+    \ query=str doc=namespace_search/document
+    ^ nat
+    = a (namespace_search/rank_one query doc.title_lower) b (namespace_search/rank_one query doc.path_lower)
+    | ? (lt a b) a b
+  + groups
+    \ folders=bool records=row[myth]
+    ^ row[namespace_search/posting_group]
+    | records.keep((\ r=myth (gt r.size 0))).map((\ r=myth (namespace_search/posting_group r folders)))
+  + pool
+    \ query=str stage=nat frozen=namespace_search/frozen state=namespace
+    ^ row[namespace_search/posting_group]
+    ? !(query.len)
+      | namespace_search/groups .false (namespace_search/posting 'catalog "" frozen state)
+    ? (eq stage 0)
+      = own (namespace_search/groups .false (namespace_search/posting 'exact query frozen state))
+        paths (namespace_search/groups .true (namespace_search/posting 'path_exact query frozen state))
+      | own.weld(paths)
+    = titles (namespace_search/groups .false (namespace_search/posting 'title_prefix query.slice(0 (namespace_search/end query 0 8)) frozen state))
+      paths (namespace_search/groups .false (namespace_search/path_posting query frozen state))
+    | titles.weld(paths)
+  + outside
+    ' Seek past a completed structural-folder contribution without walking all
+    ' its descendants. This is only used by the separate exact-path postings.
+    \ prefix=path after=path tree=mop[path pail lt_pith]
+    ^ maybe[mop/kv[path pail]]
+    > node=mop/node[path pail lt_pith] tree .none
+    ? ((pith_prefix prefix node.key) || !(namespace_search/file_before after node.key)) (_ prefix after node.r)
+    = found (_ prefix after node.l)
+    ? found.is_some found
+    | ./some (mop/kv[path pail] node.key node.val)
+  + merge_targets
+    \ left=row[namespace_search/document] right=row[namespace_search/document]
+    ^ row[namespace_search/document]
+    % a=row[namespace_search/document] left b=row[namespace_search/document] right out=row[namespace_search/document] []
+    ^ row[namespace_search/document]
+    ? !(a.len) out.weld(b)
+    ? !(b.len) out.weld(a)
+    ? (equal a.at(0).p b.at(0).p) (_ a.drop(1) b.drop(1) out.snoc(a.at(0)))
+    ? (namespace_search/file_before a.at(0).p b.at(0).p) (_ a.drop(1) b out.snoc(a.at(0)))
+    | _ a b.drop(1) out.snoc(b.at(0))
+  + head
+    \ after=maybe[path] skip=nat last=maybe[path] group=namespace_search/posting_group
+    ^ maybe[mop/kv[path pail]]
+    = record group.entries
+      retained=maybe[mop/kv[path pail]]
+        ? !(and skip after.is_some) .none
+        ?> (./some value) record.get(after.fall([])) .none
+        | ./some (mop/kv[path pail] after.fall([]) value)
+    ? retained.is_some retained
+    = page (record.range_after(after 1))
+    % entry=maybe[mop/kv[path pail]] (? page.len (./some page.at(0)) .none)
+    ^ maybe[mop/kv[path pail]]
+    ?> (./some found) entry .none
+    ? !(group.folders) entry
+    ?> (./some last) last entry
+    ?> mask=pails/n found.val entry
+    ? !(mask.n) entry
+    = depth=nat
+        % depth=nat 0
+        ^ nat
+        ? (get_bit depth mask.n) depth
+        | _ depth.inc
+      target found.key.take(depth)
+    ? (namespace_search/file_before last target) entry
+    | _ (namespace_search/outside target found.key record)
+  + advance
+    \ source=path last=maybe[path] groups=row[namespace_search/posting_group] heads=row[maybe[mop/kv[path pail]]]
+    ^ row[maybe[mop/kv[path pail]]]
+    % i=nat 0 out=row[maybe[mop/kv[path pail]]] heads
+    ^ row[maybe[mop/kv[path pail]]]
+    ? (eq i heads.len) out
+    ?> (./some entry) heads.at(i) (_ i.inc out)
+    ? !(equal[path] entry.key source) (_ i.inc out)
+    | _ i.inc out.put_at(i (namespace_search/head (./some source) 0 last groups.at(i)))
+  + next
+    ' One cached head per shard; only a consumed shard performs another seek.
+    \ heads=row[maybe[mop/kv[path pail]]] metadata=row[myth]
+    ^ maybe[[path row[namespace_search/document]]]
+    % rest=row[maybe[mop/kv[path pail]]] heads best=maybe[[path row[namespace_search/document]]] .none
+    ^ maybe[[path row[namespace_search/document]]]
+    ? !(rest.len) best
+    ?> (./some entry) rest.at(0) (_ rest.drop(1) best)
+    = later=bool
+        ?> (./some old) best .false
+        = [prior _] old
+        | namespace_search/file_before prior entry.key
+    ? later (_ rest.drop(1) best)
+    ?> mask=pails/n entry.val (_ rest.drop(1) best)
+    = shard (add (mul (namespace_search/shard entry.key) 2) (? (entry.key.starts('sys)) 1 0))
+    ?> (./some held) metadata.at(shard).get(entry.key) (_ rest.drop(1) best)
+    ?> stored=namespace_search/stored held (_ rest.drop(1) best)
+    = documents (stored.ancestors.keep((\ doc=pin[namespace_search/document] (get_bit (unpin doc).p.len mask.n))).map((\ doc=pin[namespace_search/document] (unpin doc))))
+      chosen=maybe[[path row[namespace_search/document]]]
+        ?> (./some old) best (./some [entry.key documents])
+        = [prior docs] old
+        ? (equal prior entry.key) (./some [prior (namespace_search/merge_targets docs documents)])
+        | ./some [entry.key documents]
+    | _ rest.drop(1) chosen
+  + scan
+    \ query=str cursor=namespace_search/cursor pool=row[namespace_search/posting_group] frozen=namespace_search/frozen eligible={\ path namespace}bool state=namespace
+      initial=row[namespace_search/document] checked=nat visited=nat metadata=row[myth]
+    ^ namespace_search/result
+    = heads (pool.map((\ group=namespace_search/posting_group (namespace_search/head cursor.source cursor.skip cursor.last group))))
+    % stage=nat cursor.stage after=maybe[path] cursor.source skip=nat cursor.skip last=maybe[path] cursor.last
+      items=row[namespace_search/document] initial candidates=nat checked postings=nat visited heads=row[maybe[mop/kv[path pail]]] heads
+    ^ namespace_search/result
+    = current (namespace_search/cursor stage after skip last)
+    ? (ge stage 2) (namespace_search/result items current .false .false candidates postings)
+    ? (eq items.len 20) (namespace_search/result items current .true .false candidates postings)
+    ?> (./some hit) (namespace_search/next heads metadata)
+        (namespace_search/result items (namespace_search/cursor (? query.len stage.inc 2) .none 0 .none) .false .false candidates postings)
+    = [source targets] hit
+      postings (add postings pool.len)
+    = processed
+        % i=nat skip last=maybe[path] last items=row[namespace_search/document] items candidates=nat candidates
+        ^ [nat maybe[path] row[namespace_search/document] nat]
+        ? ((ge i targets.len) || (eq items.len 20)) [i last items candidates]
+        = fallback targets.at(i)
+          target fallback.p
+          passed=bool
+            ?> (./some prior) last .true
+            | namespace_search/file_before prior target
+        ? !passed (_ i.inc last items candidates)
+        = doc (namespace_search/lookup fallback metadata)
+          rank (namespace_search/rank query doc)
+          match (and (eq rank (? query.len stage 1)) (eligible target state))
+        | _ i.inc (./some target) (? match items.snoc(doc) items) candidates.inc
+      [offset last items candidates] processed
+    | _ stage (./some source) (? (ge offset targets.len) 0 offset) last items candidates postings
+        (? (ge offset targets.len) (namespace_search/advance source last pool heads) heads)
+  + query
+    \ query=str cursor=namespace_search/cursor frozen=namespace_search/frozen eligible={\ path namespace}bool state=namespace
+    ^ namespace_search/result
+    = metadata (namespace_search/partition [($u 2) 'metadata] frozen state)
+    % cursor=namespace_search/cursor cursor items=row[namespace_search/document] [] checked=nat 0 visited=nat 0
+    ^ namespace_search/result
+    ? (ge cursor.stage 2) (namespace_search/result items cursor .false .false checked visited)
+    = pool (namespace_search/pool query cursor.stage frozen state)
+      result (namespace_search/scan query cursor pool frozen eligible state items checked visited metadata)
+    ? result.more result
+    | _ result.cursor result.items result.candidates result.postings

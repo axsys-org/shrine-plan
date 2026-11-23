@@ -5,10 +5,12 @@
 ' Shared declarative HTTP host. The manifest is schema-checked by Eden before
 ' import; the compiled entry contract is checked in the publication candidate.
 + goo_workspace_mount
+  + destination
+    : pane=path spec=goo/route
   + registration
     : name=str route=str declaration=path source_slot=path initial=path
-      record_only=bool title=str brand=str subtitle=str stylesheet=str
-      breadcrumbs=bool navigation=row[[str path]] footer=str
+      route_roots=row[path] record_only=bool title=str brand=str subtitle=str stylesheet=str
+      breadcrumbs=bool navigation=row[[str path]] footer=str panes=row[path] routes=row[goo_workspace_mount/destination]
   + bundle
     : registrations=row[goo_workspace_mount/registration] validated_at=nat
   + slot
@@ -41,16 +43,22 @@
           (goo_workspace_mount/qualify self (grove_dev/field "entry" item))
           (goo_workspace_mount/qualify self (grove_dev/field "slot" receiver))
           (goo_workspace_mount/qualify self (grove_dev/field "initial" receiver))
+          (grove_dev/items (grove_dev/field "routeRoots" receiver)).map((goo_workspace_mount/qualify self))
           (equal (grove_dev/text (grove_dev/field "admission" receiver)) "record")
           (? title.len title "Goo workspace") (? brand.len brand route)
           (grove_dev/text (grove_dev/field "subtitle" shell))
           (grove_dev/text (grove_dev/field "stylesheet" shell))
           (equal (grove_dev/field "breadcrumbs" shell) (json/boo .true)) navigation
           (grove_dev/text (grove_dev/field "footer" shell))
+          (grove_dev/items (grove_dev/field "panes" item)).map((goo_workspace_mount/qualify self)) []
   + query_valid
     \ target=str
     ^ bool
     | goo_workspace/query_valid target
+  + roots
+    \ registration=goo_workspace_mount/registration
+    ^ row[path]
+    ? registration.route_roots.len registration.route_roots [registration.initial]
   + admit
     \ registration=goo_workspace_mount/registration selected=axal[myth]
     ^ maybe[str]
@@ -91,21 +99,39 @@
     ? !(goo_browser/matches card published) (./err "Workspace receiver does not satisfy its role.")
     < description (goo_panes/description (goo_bridge/receiver registration.initial published) card view)
     | ./ok []
+  + export_routes
+    \ registration=goo_workspace_mount/registration state=namespace
+    ^ either[str row[goo_workspace_mount/destination]]
+    = panes registration.panes.cons(registration.declaration)
+    % i=nat 0 routes=row[goo_workspace_mount/destination] []
+    ^ either[str row[goo_workspace_mount/destination]]
+    ? (eq i panes.len) (./ok routes)
+    = pane panes.at(i)
+    ?> (./some record) (goo_runtime/record .x pane state) (./err "Route pane is unavailable.")
+    ?> (./some held) record.get(goo/route/slot)
+      ? (equal pane registration.declaration) (_ i.inc routes) (./err "Exported pane requires #route.")
+    ?> spec=goo/route held (./err "Invalid published #route.")
+    ?> (./ok view) (goo_runtime/published record) (./err "Invalid route pane.")
+    ?> (./ok lowered) view.result (./err "Route pane failed compilation.")
+    ? !(and view.view.is_pane view.view.ports.is_nil) (./err "Route requires a standalone pane.")
+    ? (routes.any((\ route (eq route.spec.name spec.name)))) (./err "Duplicate workspace route.")
+    ? (and (equal pane registration.declaration) !(equal spec.source registration.source_slot))
+      | ./err "Entry route must bind the workspace source first."
+    | _ i.inc routes.snoc((goo_workspace_mount/destination pane spec))
   + publish
     \ home=path manifest=str state=namespace
     ^ either[str namespace]
     = registrations (goo_workspace_mount/decode state.self manifest)
-    < checked
-      | registrations.fold (either/ok[str unit] [])
-        \ prior=either[str unit] registration=goo_workspace_mount/registration
-        < ignored prior
-        ?> (./some record) (goo_runtime/record .x registration.declaration state)
-          | ./err "Workspace declaration is unavailable."
-        ?> (./ok published) (goo_runtime/published record)
-          | ./err "Workspace declaration is not a published Goo view."
-        | goo_workspace_mount/validate_view registration published
-    | ./ok (source_mount/write home (myth/sing goo_workspace_mount/slot
-        (goo_workspace_mount/bundle registrations state.local.top)) state)
+    % i=nat 0 checked=row[goo_workspace_mount/registration] []
+    ^ either[str namespace]
+    ? (eq i registrations.len)
+      | ./ok (source_mount/write home (myth/sing goo_workspace_mount/slot (goo_workspace_mount/bundle checked state.local.top)) state)
+    = registration registrations.at(i)
+    ?> (./some record) (goo_runtime/record .x registration.declaration state) (./err "Workspace declaration is unavailable.")
+    ?> (./ok published) (goo_runtime/published record) (./err "Workspace declaration is not a published Goo view.")
+    < valid (goo_workspace_mount/validate_view registration published)
+    < routes (goo_workspace_mount/export_routes registration state)
+    | _ i.inc checked.snoc(registration.set_routes(routes))
   + registrations
     \ home=path state=namespace
     ^ row[goo_workspace_mount/registration]
@@ -118,17 +144,78 @@
     | (goo_workspace_mount/registrations home state).fold (either/ok[pail namespace] state)
       \ previous=either[pail namespace] registration=goo_workspace_mount/registration
       < next previous
-      | goo_workspace/install (goo_workspace_mount/endpoint registration) goo_browser/talk next
+      = endpoint (goo_workspace_mount/endpoint registration)
+      = roots (goo_workspace_mount/roots registration)
+      < installed (goo_workspace/install_within roots endpoint goo_browser/talk next)
+      | registration.routes.fold (either/ok[pail namespace] installed)
+        \ prior=either[pail namespace] route=goo_workspace_mount/destination
+        < state prior
+        ? (equal route.pane registration.declaration) (./ok state)
+        | goo_workspace/install_within roots endpoint.set_declaration(route.pane).set_source_slot(route.spec.source) goo_browser/talk state
   + request
     \ registration=goo_workspace_mount/registration request=http_foot/request now=nat
     ^ http_foot/action
     ? !(eq request.method "GET") (./reply (http_driver/response 405 "GET required"))
-    = url (http_foot/split 63 request.target).at(0)
-    ? !((equal url registration.route) || (equal url (str/cat registration.route "/")))
-      | ./reply (http_driver/response 404 "Not found")
-    ? !(goo_workspace_mount/query_valid request.target)
-      | ./reply (http_driver/response 400 "Use one canonical absolute namespace path.")
-    | goo_workspace/request (goo_workspace_mount/endpoint registration) request now
+    = parts (http_foot/split 63 request.target)
+      url parts.at(0)
+      base ((equal url registration.route) || (equal url registration.route.cat("/")))
+      query=str (? (eq parts.len 2) parts.at(1) "")
+      bad (http_foot/action/reply (http_driver/response 400 "Invalid workspace destination or arguments."))
+    ? (gt parts.len 2) bad
+    ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields query) bad
+    = alias (fields.any((\ [key value] (eq key "route"))))
+      endpoint (goo_workspace_mount/endpoint registration)
+    ? (and base !(alias))
+      ? !(goo_workspace_mount/query_valid request.target) bad
+      = action (goo_workspace/request endpoint request now)
+      ?> (./wait record) action action
+      = defaults registration.routes.keep((\ r (equal r.pane registration.declaration)))
+      ? !(defaults.len) action
+      | ./wait record.put(['read_slot] (pails/p defaults.at(0).spec.reveal))
+    = name=str (? base (http_foot/field "route" fields) (str/slice registration.route.len.inc url.len url))
+      routes registration.routes.keep((\ r (eq r.spec.name name)))
+    ? !(eq routes.len 1) (./reply (http_driver/response 404 "Unknown workspace route."))
+    = route routes.at(0)
+      spec route.spec
+      get (\ key=str (http_foot/field key fields))
+      at (get "at")
+    ? !(eq (get "format") "json") bad
+    ? !(eq fields.len (add spec.arguments.len (add 1 (add (? base 1 0) (? at.len 1 0))))) bad
+    ? (and at.len !(and spec.reveal.len (goo_workspace_mount/evidence_valid at))) bad
+    = bound=maybe[myth]
+        % i=nat 0 card=myth myth/new
+        ^ maybe[myth]
+        ? (eq i spec.arguments.len) (./some card)
+        = [key slot] spec.arguments.at(i)
+        ?> (./some path) (browser_routes/value_path (get key)) .none
+        ? !(goo_workspace/within (goo_workspace_mount/roots registration) path) .none
+        | _ i.inc card.put(slot (pails/p path))
+    ?> (./some card) bound bad
+    = source spec.source
+      target (card.path_at(source)).fall([])
+      endpoint endpoint.set_declaration(route.pane).set_source_slot(source)
+      canonical (str/cat_all [registration.route "?format=json&path=" (value_read/percent (path_show target))])
+      action (goo_workspace/request endpoint request.set_target(canonical) now)
+    ?> (./wait record) action action
+    = watch (crew/sing ['view] (dep .y target)).put(['catalog] (dep .x [route.pane.at(0) 'weft 'view_catalog_cache]))
+      watch
+        | spec.arguments.fold watch
+          \ w=crew binding=[str path]
+          = [key slot] binding
+          | w.put(['argument ($ts key)] (dep .y (card.path_at(slot)).fall([])))
+    | ./wait record.put(crew_slot (cpail watch)).put(['bindings] (goo_workspace/bindings card spec)).put(['read_slot] (pails/p spec.reveal)).put(['destination] (pails/t name)).put(['at] (pails/t at))
+  + evidence_valid
+    \ wire=str
+    ^ bool
+    ?> (jres/ok data rest) (parse wire) .false
+    ?> (json/arr a) data .false
+    ? !(and (eq rest "") (eq a.len 4)) .false
+    ?> (json/str doc) a.at(0) .false
+    ?> (json/num neglo lo) a.at(1) .false
+    ?> (json/num neghi hi) a.at(2) .false
+    ?> (json/str quote) a.at(3) .false
+    ? (neglo || neghi || !(lt lo hi)) .false
+    | and (maybe/is_some (browser_routes/value_path doc)) (eq (sub hi lo) quote.len)
   + asset
     \ home=path url=str filename=str request=http_foot/request now=nat
     ^ http_foot/action

@@ -101,8 +101,20 @@ still requires the regular verified import and asset revision update.
 | `group` | None; grouping does not require a separate accessibility element |
 | `button` | None; activation comes from the control binding |
 | `textbox` | `value`, `editable:true`, `multiline:false` |
+| `slider` | `value`, `editable:true`, `multiline:false`, `range:{minimum:0,maximum,value}` |
+| `colorwell` | `value`, `editable:true`, `multiline:false`; opaque sRGB, no range |
 | `image` | None; covers image, avatar, presence and media presentations |
 | `progressbar` | `range:null` when no semantic value exists, otherwise `{minimum:0,maximum,value}` |
+
+A bound Grove input can request a native editor, for example
+`input(%/width, "slider", {[max]: 12, [label]: "Stroke width (px)"})`
+or `input(%/ink, "colorwell", {[label]: "Stroke color"})`. Both remain
+ordinary input bindings. A slider uses whole steps and requires an integer
+maximum of 1–65535. Its string is the nonnegative decimal value, or `""` for
+no override; in that case the numeric range value is zero for positioning
+only. A color is `#RRGGBB` (case insensitive) or `""`. Clients must preserve
+the distinction between inherited, explicit zero, and explicit black. Plain
+and rich text inputs keep their existing contracts.
 
 Names match the existing HTML intent: inputs and progress bars use the explicit
 nonempty config label or slot; image-like primitives use the explicit label,
@@ -112,6 +124,28 @@ its own single-line/composition behavior. A fallback painted bar does not invent
 a semantic progress value. Neither `editable:true` nor a button role grants
 action authority. Busy, selection, disabled state, focus and accessibility
 notifications derive from the admitted local session state.
+
+## World theme rules
+
+For live preparations served by Explorer, the immutable Mash profile supplies
+the baseline. A world may also publish design rules in direct children of
+`/<world>/app/goo_theme`. A rule's `/sys/goo/theme_design_slot` is a path to
+a typed, validated `goo/design` on that same record. Only this registry is
+consulted; a design on an ordinary application record is not a global default.
+
+After resolving semantic kinds and roles, before measurement, Reaver applies
+each optional design property in order: shared kind (button, text, code or
+input), then `text_<role>` for text, then an explicit node design. An absent
+property inherits; zero and black are explicit. This changes prepared
+geometry, wrapping and paint, not the pinned base profile or font identity.
+There is no client palette to merge. An ordinary preparation uses one
+namespace snapshot for theme rules and data.
+
+The zoo presents two other declarations inside its theme editor; a draft
+replaces only the selected rule in memory for that preparation. Publish is
+an ordinary action targeting the rule record, with the normal expected
+version and invocation receipt. A fresh preparation in any app sees the new
+defaults. Publishing does not push a replacement into a mounted editor.
 
 ## Explorer control bindings
 
@@ -234,6 +268,51 @@ The endpoint URL remains explicit host configuration; the descriptor does not
 discover endpoints. After entry, send `target`, `view`, and `workspace=view` to
 `/goo/render`. Validate the resulting host/declaration and context before mounting.
 Navigation stages another entry and preparation before retiring local owners.
+
+### Pane routes
+
+A Grove pane can publish a route alongside its receiver role. For example:
+
+```grove
+comparison =
+  @pane
+  #on ; %/pair
+  #for ; /sys/slot/chunk_compare
+  #route ;
+    name: compare
+    left: %/left
+    right: %/right
+  ...
+```
+
+Each argument binds a required query value to a path-typed receiver slot. All required
+receiver fields must be bound. The first binding supplies the workspace entry's
+`source`. An optional `reveal: /sys/slot/...` enables citation evidence for that
+source. The workspace automatically exposes its entry pane's route. Its mount
+manifest may also export additional declarations with `"panes": [[...], ...]`.
+The host checks the published declarations and rejects duplicate route names.
+
+Use `/<workspace>/<name>?left=…&right=…` for a shareable location. The native
+session entry request adds `format=json`. Encode values once as query arguments.
+The older `/<workspace>?route=<name>&...` form also resolves. Reaver checks the
+argument names, paths, workspace root and each subject's admission before
+allocating the pane receiver. Entry JSON echoes `destination` and `arguments`,
+alongside the ordinary workspace fields. A reveal-enabled route also returns
+`readSlot` and optionally `at`, the tuple
+`[documentPath,startByte,endByte,exactQuote]` with exclusive UTF-8 offsets.
+
+A routed text run carries a `/sys/link` path, matching `/sys/navigate` path,
+`/sys/route` text naming the route, and one path pail per argument under
+`/sys/route/<key>`. The link target must occur among the arguments. A citation
+can also carry `/sys/navigate_at` text containing the evidence tuple. The reader
+checks the revision, boundaries and quotation against its prepared text and
+displays a stale quotation as unresolved. Route entry grants no action binding.
+
+Native Back and Forward keep a local cursor and a scroll viewport per visit.
+Opening, revisiting, and pasting stage an admitted session and a freshly
+prepared workspace. The cursor moves after editor guards and installation
+succeed. Copied locations can be opened in another egui session configured
+with the same server and workspace endpoint.
 
 The earlier `workspace-subject` descriptor described
 the pre-main synthetic receiver and must not be emitted for stored sessions. Operations identify the supported host workflow, not an
@@ -459,6 +538,76 @@ Rich/plain encoding changes and removed formatting support are incompatible
 re-preparations: retain dirty owners and stage the change behind the existing
 loss-of-work guard. Compatible refresh/resize must retain run metadata, caret,
 composition, selection, typing style, undo history and pending invocations.
-Current scope is English/ASCII, bundled fonts, inline modifiers and links;
+Current scope includes ASCII and the unpointed Hebrew run-font extension, bundled fonts, inline modifiers and links;
 clipboard interchange is plain text. No browser/HTML rich editor or UIKit rich
 editor is included.
+
+### Unpointed Hebrew run font
+
+The optional `hebrew` run face covers ASCII and U+05D0–U+05EA. Its identity
+and font hash are in `run-fonts/hebrew.json`. Plain source runs containing
+Hebrew acquire the resolved `/sys/font/hebrew` fallback during preparation;
+an incompatible explicit face is diagnosed. Logical UTF-8 text and run offsets
+are preserved. Reaver measures a Hebrew scalar once and breaks lines only at
+scalar boundaries, including for widths smaller than one glyph. Consumers
+must validate the font identity before painting. The native folio uses one
+logical run per mixed-direction paragraph and applies Unicode bidi ordering
+after line breaking. This does not introduce support for niqqud, cantillation,
+general complex-script shaping or arbitrary rich-text bidi across styled runs.
+
+### Word-selection overlays
+
+A static text node can declare a versioned passage by attaching a
+`/sys/selection` path pail to its source run(s). In this edition the whole node
+names one document; its payload is canonical LF-normalized logical text with
+no tabs. Its ordinary prepared fragments supply hit geometry. Highlights track
+half-open UTF-8 byte offsets in that payload, never screen coordinates, a
+word number, or the first substring matching the quote. A selection retains the
+receiver identity, incarnation, publication, source path and source text; it may
+be projected again at another width, but never rebound to changed content.
+
+A source may supply a separate local composer slot in a
+`/sys/selection_composer` path pail. All source runs must agree on the
+document and composer. When omitted, the document path is the composer slot.
+The capture always retains the original document identity.
+
+The range overlay can surface an independently declared, presented local
+`become` button whose destination slot matches the composer slot. In the new
+recipe, only an exact document/receiver match and a presented plain input whose
+slot matches the annotated node's slot can receive the capture. The input wire
+value is the JSON tuple `[documentPath,startByte,endByte,exactQuote]`. A save
+is an ordinary, separately bound Goo invocation. A descriptor alone grants no
+navigation or write capability. The Torah action validates the tuple against
+the actual manuscript before storing it.
+
+In the egui workspace, a prepared namespace link can request read-only
+navigation with a `/sys/navigate` path matching the same run's `/sys/link`
+path. Following it uses the workspace's declared address input and normal
+editor transition guards. A descriptive link by itself remains hoverable.
+
+Saved details are ordinary text runs carrying a `/sys/evidence` text pail with
+the same tuple. A renderer can underline a saved span and list its details only
+when the document, both offsets, and exact logical slice match. A historical
+quote alone is never sufficient to move an annotation to a new occurrence.
+
+
+A selectable source may additionally carry `/sys/selection_preview`, a path to
+an ordinary published view. The receiver must contain a `goo_selection/provider`
+pail at that same path. Its pure `project` function receives the validated range
+wire and receiver myth and returns an ephemeral myth for that view. This is a
+read-only projection, never a notebook mutation. Application calculations and
+popup content belong in that provider and Goo view.
+
+POST `/goo/render` with `selection`, `sourceNode`, source `view`, `target`,
+`life`, `expected`, `displayed`, `publication`, `sourceWidth`, preview render context and
+`wire=protobuf-v2` requests the projection. Reaver rereads the source, verifies
+its identity and the exact whole-word range, resolves the source-declared
+provider, and prepares its declared view. The result uses the ordinary typed
+protobuf presentation contract. Only local `become` controls are supported in
+this preview edition. Inputs and domain invocations are rejected.
+
+Clients own placement, highlighting and request lifetimes. A preview completion
+is usable only for its originating owner, exact range, source text, recipe and
+snapshot. Compatible reflow can retain it. Suspended/stale owners cannot enable
+its controls. Changing selection drops the old completion, including errors.
+The provider metadata grants no write authority.

@@ -72,6 +72,22 @@ they do not execute or claim a pass/fail result. Missing documentation has an
 explicit empty state. Source starts collapsed. All prose and code are escaped
 server-side; Unicode is retained.
 
+## Native code reader
+
+`/goo-code-reader` is a second declarative workspace in the same mount. It
+composes the existing Namespace and Documentation panes as a read-only split.
+Launch shrine-egui with `--docs` (default port 8136). Its default subject is the
+real published lore definition; initial selection is admitted against the first
+tree page, including the member lifetime. Browser editing and other reading
+tabs remain at `/goo-documentation`.
+
+Both documentation slots produce ordinary prepared displays with empty controls.
+The protobuf article encoder works from Goo's preparation, not from article HTML.
+Native articles bound each block to 4096 source bytes, prose to 48 paragraphs,
+and examples to 12 pairs; omissions have visible notices. Non-ASCII bytes are
+shown as hex escapes under the current measured font profile. Full prose,
+examples and Unicode remain available in the browser article.
+
 ## Boundaries
 
 - `documentation.grove` owns the namespace selection, outline, four reading panes (Panes is conditional),
@@ -87,11 +103,9 @@ server-side; Unicode is retained.
   `/sys/slot/documentation` and `/sys/slot/documentation_summary`. They return
   through the same `/goo/render` and prepared-tree response boundaries, with real
   subject evidence and no action controls.
-- The documentation body is semantic HTML produced by Weft, using existing
-  namespace vocabulary and type formatting. It intentionally has `display: null`:
-  it does not claim to be a measured Goo canvas display or a compiled Grove recipe.
-  This allows natural document flow and full Unicode without introducing a second
-  application runtime. Values combines the Goo value renderer with native edit
+- The browser documentation body is semantic HTML produced by Weft. An ordinary
+  prepared Goo display accompanies it for native readers.
+  The HTML preserves natural document flow and full Unicode. Values combines the Goo value renderer with native edit
   forms; Views embeds the existing Goo presentation host.
 - `goo-documentation-bridge.rvr` supplies that metadata adapter using
   `perc-entry-span`, the existing `compiler-inspect/entry-source`,

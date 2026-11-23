@@ -1,0 +1,72 @@
+- goo_wire_browser
+- browser_routes
+
+' A source-declared, pure projection. No writes, input widgets or invocations.
++ goo_selection
+  + descriptor
+    \ node=goo_wire/node key=str
+    ^ maybe[str]
+    < runs node.text_runs
+    ? (eq runs.values.len 0) .none
+    = value={\ goo_wire/text_run}maybe[str]
+        \ run=goo_wire/text_run
+        = entries (run.myth.entries.keep((\ entry (eq entry.path key))))
+        ? !(eq entries.len 1) .none
+        | entries.at(0).pail.path
+    < first (value runs.values.at(0))
+    ? !(runs.values.all((\ run (equal[maybe[str]] (value run) (maybe/some[str] first))))) .none
+    | ./some first
+  + range_valid
+    \ wire=str document=str text=str
+    ^ bool
+    ?> (jres/ok data rest) (parse wire) .false
+    ?> (json/arr a) data .false
+    ? !(and (eq rest "") (eq a.len 4)) .false
+    ?> (json/str doc) a.at(0) .false
+    ?> (json/num neglo lo) a.at(1) .false
+    ?> (json/num neghi hi) a.at(2) .false
+    ?> (json/str quote) a.at(3) .false
+    ? (neglo || neghi || !(eq doc document) || !(lt lo hi) || !(le hi text.len)) .false
+    = space (\ c=nat ((eq c 32) || (eq c 10)))
+    ? !((eq lo 0) || (space text.at(lo.dec))) .false
+    ? !((eq hi text.len) || (space text.at(hi))) .false
+    ? ((space text.at(lo)) || (space text.at(hi.dec))) .false
+    | eq quote text.slice(lo (sub hi lo))
+  + render
+    \ context=goo_bridge/render_context fields=row[[str str]] state=namespace
+    ^ either[str goo_wire/presentation]
+    = get (\ key=str (http_foot/field key fields))
+      target (browser_routes/target (get "target"))
+      view (browser_routes/target (get "view"))
+    ?> (jres/ok width rest) (parse (get "sourceWidth")) (./err "Missing source width")
+    ?> (./some width) (goo_number/nonnegative width) (./err "Invalid source width")
+    ? !(and (eq rest "") (goo_fp/lte width (goo_fp/integer 100000))) (./err "Invalid source width")
+    < source (goo_wire_browser/render context.set_width(width) target view [] [] [] .none state)
+    ?> (./some snapshot) source.snapshot (./err "Missing source identity")
+    ? !(and (eq snapshot.life (get "life")) (and (eq snapshot.expected (get "expected")) (and (eq snapshot.displayed (get "displayed")) (eq snapshot.publication (get "publication")))))
+      | ./err "Selection source is stale; refresh before selecting again."
+    ?> (./some display) source.display (./err "Missing source display")
+    = nodes (display.nodes.keep((\ n (and (eq n.id (get "sourceNode")) (eq n.kind "text")))))
+    ? !(eq nodes.len 1) (./err "Selection source is unavailable")
+    = node nodes.at(0)
+    ?> (./some document) (goo_selection/descriptor node "/sys/selection") (./err "Not a selectable source")
+    ?> (./some preview) (goo_selection/descriptor node "/sys/selection_preview") (./err "No selection preview declared")
+    ? !(goo_selection/range_valid (get "selection") document node.payload) (./err "Selection does not match the source")
+    ?> (./some preview_path) (path_parse preview) (./err "Invalid preview declaration")
+    < card (goo_browser/render_card target [] state)
+    ?> (./some held) card.get(preview_path) (./err "Selection provider unavailable")
+    ?> provider=goo_selection/provider held (./err "Invalid selection provider")
+    < projected (provider.project (get "selection") card)
+    < result (goo_wire_browser/render_card context target preview_path [] [] [] .none state projected)
+    ? (result.controls.any((\ c (c.invoke || !(eq c.binding.kind "become")))))
+      | ./err "Selection previews support only local recipe controls"
+    ?> (./some display) result.display (./err "Preview needs an ordinary display")
+    ? (display.nodes.any((\ n ((eq n.kind "input") || (maybe/is_some n.editing)))))
+      | ./err "Selection previews cannot contain input widgets"
+    | ./ok result
+  + response
+    \ context=goo_bridge/render_context fields=row[[str str]] state=namespace
+    ^ [nat any nat]
+    ? (goo_selection/render context fields state)
+     > (./ok result) [200 (wire_proto/envelope 2 (goo_wire/presentation_bytes result)) "application/x-protobuf"]
+     > (./err why) [409 (wire_proto/failure why) "application/x-protobuf"]

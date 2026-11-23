@@ -60,7 +60,7 @@ def validate_workspaces(data):
         reject('registrations must be an array')
     names, entries = set(), set()
     for item in items:
-        fields(item, ('name', 'route', 'entry', 'receiver', 'shell'), ('name', 'route', 'entry', 'receiver'))
+        fields(item, ('name', 'route', 'entry', 'receiver', 'shell', 'panes'), ('name', 'route', 'entry', 'receiver'))
         key = item['name']
         if not isinstance(key, str) or not re.fullmatch(r'[a-z][a-z0-9_-]*', key) or key in names:
             reject('name must be unique and canonical')
@@ -74,13 +74,29 @@ def validate_workspaces(data):
             reject('entry pane cannot have two hosted receivers')
         entries.add(entry)
         receiver = item['receiver']
-        fields(receiver, ('slot', 'initial', 'admission'), ('slot', 'initial'))
+        fields(receiver, ('slot', 'initial', 'admission', 'routeRoots'), ('slot', 'initial'))
         path(receiver['slot']); path(receiver['initial'], empty=True)
+        if 'routeRoots' in receiver:
+            roots = receiver['routeRoots']
+            if not isinstance(roots, list) or not roots:
+                reject('routeRoots must list namespace prefixes')
+            for root in roots:
+                path(root)
+            if not any(receiver['initial'][:len(root)] == root for root in roots):
+                reject('initial must be within routeRoots')
         if receiver.get('admission', 'namespace') not in ('namespace', 'record'):
             reject('admission must be namespace or record')
         for loc in (item['entry'], receiver['slot']):
             if not any(loc[:len(u['root'])] == u['root'] for u in data.get('grove', [])):
                 reject('entry and receiver slot must belong to this mount’s Grove roots')
+        panes = item.get('panes', [])
+        if not isinstance(panes, list):
+            reject('panes must be an array of declarations')
+        for pane in panes:
+            path(pane)
+            if tuple(pane) in entries or not any(pane[:len(u['root'])] == u['root'] for u in data.get('grove', [])):
+                reject('route pane must be unique and belong to this mount')
+            entries.add(tuple(pane))
         shell = item.get('shell', {})
         fields(shell, ('title', 'brand', 'subtitle', 'stylesheet', 'breadcrumbs', 'navigation', 'footer'), ())
         for key in ('title', 'brand', 'subtitle', 'stylesheet', 'footer'):

@@ -1,0 +1,144 @@
+- goo_runtime
+- shuin_navigation
+- http_foot
+- namespace_search
+- namespace_http
+
+' Declaration binding and domain eligibility; retrieval lives in namespace_search.
++ shuin_path_search
+  + entry
+    : title=str help=str display=str record=bool
+  + clip
+    \ limit=nat text=str
+    ^ str
+    ? (le text.len limit) text
+    % end=nat limit
+    ^ str
+    ? !(end) ""
+    = byte text.at(end)
+    ? (and (ge byte 128) (lt byte 192)) (_ end.dec)
+    | str/slice 0 end text
+  + entry_at
+    \ target=path state=namespace
+    ^ maybe[shuin_path_search/entry]
+    = card (sovereign_care .x target state).fil
+    ? (and (maybe/is_none card) !(goo_paths/exists target state)) .none
+    = title=str card.run((\ card=myth card.txt_at(system_vocabulary/lede))).fall("")
+      help=str card.run((\ card=myth card.txt_at(system_vocabulary/help))).fall("")
+      display (physical_key/display target).fall((goo_paths/key target))
+    | ./some (shuin_path_search/entry (shuin_path_search/clip 512 title) (shuin_path_search/clip 2048 help) display (maybe/is_some card))
+  + item
+    \ target=path entry=shuin_path_search/entry
+    ^ json
+    | json/obj [(jkv "key" (json/str (goo_paths/key target))) (jkv "path" (json/str entry.display))
+        (jkv "title" (json/str (? entry.title.len entry.title entry.display))) (jkv "help" (json/str entry.help))
+        (jkv "record" (json/boo entry.record))]
+  + selected
+    \ values=goo_paths/hunts state=namespace
+    ^ row[json]
+    | values.items.map
+      \ item=hunt
+      = entry (shuin_path_search/entry_at item.p state).fall((shuin_path_search/entry "Unavailable path" "Save will validate this selection." (goo_paths/key item.p) .false))
+      | shuin_path_search/item item.p entry
+  + caller
+    \ fields=row[[str str]] state=namespace
+    ^ either[str [myth bool]]
+    = get (\ key=str (http_foot/field key fields))
+    ? (gt (get "query").len 256) (./err "Search is limited to 256 bytes.")
+    ?> (./some target) (path_parse (get "target")) (./err "Invalid caller.")
+    ?> (./some recipe) (path_parse (get "view")) (./err "Invalid view.")
+    ?> (./some slot) (path_parse (get "slot")) (./err "Invalid input slot.")
+    ? !(state.permitted(target)) (./err "Caller is outside namespace authority.")
+    ?> (./some current) (goo_runtime/record .x target state) (./err "Caller is unavailable.")
+    ? !(eq (get "publication") (nat/show (goo_runtime/publication state))) (./err "View publication changed; refresh the form.")
+    ?> (./some card) (goo_runtime/record .x recipe state) (./err "View unavailable.")
+    < published (goo_runtime/published card)
+    < view (goo_runtime/matching_view published current)
+    ?> (./some input) (goo_runtime/path_input slot view.children) (./err "Input is not published for this caller.")
+    ? !(eq (goo_vocabulary/attr "kind" input) "path") (./err "Input does not declare path search.")
+    | ./ok [current (eq (goo_vocabulary/attr "access" input) "write")]
+  + revision
+    \ frozen=namespace_search/frozen state=namespace
+    ^ str
+    | str/cat_all [(nat/show namespace_search/edition) ":" (nat/show (state.case(.z (namespace_search/home state.self))).fall(0)) ":" (nat/show (unpin frozen.publication).revision) ":" (nat/show frozen.generation)]
+  + binding
+    \ fields=row[[str str]] revision=str state=namespace
+    ^ str
+    = get (\ key=str (http_foot/field key fields))
+    = keys=row[str] ["target" "view" "slot" "publication" "query"]
+    = caller (path_parse (get "target")).fall([])
+      version (nat/show (state.case(.x caller)).fall(0))
+    | show (json/arr (keys.map((\ key=str (json/str (get key))))).snoc((json/str revision)).snoc((json/str version)))
+  + encode
+    \ bound=str cursor=namespace_search/cursor
+    ^ str
+    | show (json/obj [(jkv "bound" (json/str bound))
+        (jkv "stage" (json/str (nat/show cursor.stage)))
+        (jkv "source" (json/str cursor.source.run(goo_paths/key).fall("")))
+        (jkv "skip" (json/str (nat/show cursor.skip)))
+        (jkv "last" (json/str cursor.last.run(goo_paths/key).fall("")))])
+  + decode_path
+    \ text=str
+    ^ either[str maybe[path]]
+    ? !(text.len) (./ok .none)
+    ?> (./some path) (physical_key/decode text) (./err "Invalid search continuation path.")
+    | ./ok (./some path)
+  + decode
+    \ bound=str text=str
+    ^ either[str namespace_search/cursor]
+    ? !(text.len) (./ok (namespace_search/cursor 0 .none 0 .none))
+    ' parse already rejects trailing input and returns zero on complete success.
+    ?> (./ok value _) (parse text) (./err "Invalid search continuation.")
+    = get (\ key=str (namespace_http/get key value))
+    ? !(eq (get "bound") bound) (./err "Search continuation is stale or belongs to another input; restart search.")
+    ?> (./some stage) (nat/parse (get "stage")) (./err "Invalid search stage.")
+    ?> (./some skip) (nat/parse (get "skip")) (./err "Invalid search position.")
+    ? (gt stage 1) (./err "Invalid search stage.")
+    < source (shuin_path_search/decode_path (get "source"))
+    < last (shuin_path_search/decode_path (get "last"))
+    ? (and skip source.is_none) (./err "Invalid search position.")
+    | ./ok (namespace_search/cursor stage source skip last)
+  + run
+    \ frozen=namespace_search/frozen fields=row[[str str]] state=namespace
+    ^ [nat str]
+    = get (\ key=str (http_foot/field key fields))
+      result=either[str json]
+        ? !(eq (get "version") "2") (./err "Unsupported path-search protocol; version 2 is required.")
+        ? !(equal frozen.publication state.system) (./err "System publication changed; refresh the search service.")
+        < caller (shuin_path_search/caller fields state)
+        = [current write] caller
+          home (namespace_search/home state.self)
+        ?> (./some declaration) (idx/record_at home state.local) (./err "Search index is not ready.")
+        ? !(eq declaration.nat_at(['sys 'edition] 0) namespace_search/edition) (./err "Search index edition is incompatible; rebuild required.")
+        ? (idx/claim_at home state.local).is_none (./err "Search index declaration is unavailable.")
+        = revision (shuin_path_search/revision frozen state)
+          bound (shuin_path_search/binding fields revision state)
+        ? (and (get "after").len !(eq (get "revision") revision)) (./err "Search index changed; restart from the first page.")
+        < cursor (shuin_path_search/decode bound (get "after"))
+        = eligible
+            \ path=path state=namespace
+            ^ bool
+            ? (and write !(state.permitted(path))) .false
+            ?> (./some held) current.get(['sys 'goo 'path_policy]) .true
+            ?> policy=goo_paths/policy held .false
+            = eligible policy.eligible
+            | eligible path write state
+          query (str/ascii_lower (str/trim_ascii (get "query")))
+          projection (? write frozen.set_tree((axal/new[myth] .none)) frozen)
+          page (namespace_search/query query cursor projection eligible state)
+          items=row[json]
+            | page.items.map
+              \ doc=namespace_search/document
+              | json/obj [(jkv "key" (json/str doc.key)) (jkv "path" (json/str doc.display)) (jkv "title" (json/str doc.title)) (jkv "help" (json/str doc.help)) (jkv "record" (json/boo doc.record))]
+        | ./ok (json/obj [(jkv "version" (json/num .false 2)) (jkv "revision" (json/str revision))
+            (jkv "next" (json/str (? page.more (shuin_path_search/encode bound page.cursor) "")))
+            (jkv "limited" (json/boo page.limited)) (jkv "items" (json/arr items))
+            (jkv "stats" (json/obj [(jkv "candidates" (json/num .false page.candidates)) (jkv "postings" (json/num .false page.postings))]))])
+    ? result
+     > (./err why) [409 (show (json/obj [(jkv "error" (json/str why))]))]
+     > (./ok payload) [200 (show payload)]
+  + http
+    \ frozen=namespace_search/frozen body=str
+    ^ http_foot/action
+    ? (gt body.len 65536) (./reply (http_driver/response 413 "Search request too large"))
+    | ./snapshot (shuin_path_search/run frozen (http_foot/fields body))

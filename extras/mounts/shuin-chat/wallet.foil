@@ -1,0 +1,151 @@
+- helm
+- json
+- shuin_presentation
+
+' Wallet policy and state live in Shrine. The foot below is the only effectful
+' edge: bounded local JSON-RPC and acknowledged namespace commits.
++ shuin_wallet
+  + account
+    : address=str balance=nat
+  + transfer
+    : hash=str raw=str sender=str recipient=str value=nat fee=nat instance=str status=str block=str
+  + machine
+    : sequence=nat completed=nat operation=str busy=bool phase=str message=str instance=str accounts=row[shuin_wallet/account] transfers=row[shuin_wallet/transfer]
+  + initial
+    ^ shuin_wallet/machine
+    | shuin_wallet/machine 1 0 "refresh" .true "idle" "Connecting to local Anvil..." "" [] []
+  + schema
+    \ self=iota
+    ^ path
+    [self 'gov 'shuin_wallet]
+  + home
+    \ self=iota
+    ^ path
+    [self 'app 'shuin_wallet]
+  + named
+    \ title=str help=str
+    ^ myth
+    | (myth/sing system_vocabulary/lede (pails/t title)).put(system_vocabulary/help (pails/t help))
+  + get
+    \ key=str value=json
+    ^ json
+    ?> (./obj fields) value jnull
+    = found (fields.keep((\ field=jkv (eq key field.k))))
+    ? found.len found.at(0).v jnull
+  + text
+    \ value=json
+    ^ str
+    ?> (./str text) value ""
+    text
+  + require
+    \ condition=bool message=str
+    ^ nat
+    ? condition 1
+    | error (pails/t message)
+  + hex
+    \ value=nat
+    ^ str
+    = digits=str "0123456789abcdef"
+    % value=nat value out=str ""
+    = out (str/cat_all [digits.slice((mod value 16) 1) out])
+    ? (lt value 16) (str/cat_all ["0x" out])
+    | _ (div value 16) out
+  + unhex
+    \ text=str
+    ^ nat
+    ; (shuin_wallet/require (and (eq text.slice(0 2) "0x") (and (gt text.len 2) (le text.len 66))) "Invalid RPC quantity")
+    % i=nat 2 value=nat 0
+    ? (eq i text.len) value
+    ?> (./some digit) (str/find text.slice(i 1) "0123456789abcdef")
+      | error (pails/t "Invalid hexadecimal digit")
+    | _ i.inc (add (mul value 16) digit)
+  + address
+    \ text=str
+    ^ bool
+    ? !(and (eq text.len 42) (eq text.slice(0 2) "0x")) .false
+    % i=nat 2
+    ? (eq i 42) .true
+    ? !(maybe/is_some (str/find text.slice(i 1) "0123456789abcdefABCDEF")) .false
+    | _ i.inc
+  + wei
+    ' Decimal ETH is parsed exactly; never passes through floating point.
+    \ text=str
+    ^ nat
+    ; (shuin_wallet/require (and text.len (le text.len 80)) "Enter an ETH amount")
+    % i=nat 0 value=nat 0 fraction=nat 0 dot=bool .false digits=nat 0
+    ? (eq i text.len)
+      ; (shuin_wallet/require (and digits (and value (!(dot) || fraction))) "Amount must be greater than zero")
+      % n=nat fraction value=nat value
+      ? (eq n 18) value
+      | _ n.inc (mul value 10)
+    = ch text.slice(i 1)
+    ? (eq ch ".")
+      ; (shuin_wallet/require (and !(dot) digits) "Invalid decimal amount")
+      | _ i.inc value fraction .true digits
+    ?> (./some digit) (str/find ch "0123456789") (error (pails/t "Use a decimal ETH amount"))
+    ; (shuin_wallet/require (!(dot) || (lt fraction 18)) "ETH supports at most 18 decimal places")
+    | _ i.inc (add (mul value 10) digit) (? dot fraction.inc fraction) dot digits.inc
+  + eth
+    \ value=nat
+    ^ str
+    = scale=nat 1000000000000000000
+      whole (nat/show (div value scale))
+      rest (mod value scale)
+    ? !(rest) whole
+    = tail (nat/show (add scale rest)).slice(1 18)
+    % n=nat tail.len
+    ? (eq tail.slice(n.dec 1) "0") (_ n.dec)
+    | str/cat_all [whole "." tail.slice(0 n)]
+  + queue
+    \ operation=str state=shuin_wallet/machine
+    ^ shuin_wallet/machine
+    ; (shuin_wallet/require !(state.busy) "Wait for the wallet's current operation")
+    ? (eq operation "prepare")
+      ; (shuin_wallet/require !(eq state.phase "pending") "Resolve the pending transfer before preparing another")
+      | state.set_sequence(state.sequence.inc).set_operation(operation).set_busy(.true).set_phase("idle").set_message("Preparing transfer...")
+    ? (eq operation "send")
+      ; (shuin_wallet/require (and state.transfers.len (row/has[str] state.phase ["review" "pending"])) "Review a transfer before sending")
+      | state.set_sequence(state.sequence.inc).set_operation(operation).set_busy(.true).set_message("Sending the reviewed transaction...")
+    ? (eq operation "cancel")
+      ; (shuin_wallet/require (eq state.phase "review") "Only an unsent review can be cancelled")
+      = tx state.transfers.at(0).set_status("Cancelled")
+      | state.set_sequence(state.sequence.inc).set_operation("cancel").set_busy(.true).set_phase("idle").set_message("Cancelling review...").set_transfers(state.transfers.drop(1).cons(tx))
+    | state.set_sequence(state.sequence.inc).set_operation("refresh").set_busy(.true).set_message("Refreshing balances and receipts...")
+  + status
+    \ state=shuin_wallet/machine
+    ^ str
+    | str/cat_all ["Anvil development network · test ETH only" (str/from_atom 10) state.message]
+  + overview
+    \ state=shuin_wallet/machine
+    ^ str
+    ? !(state.accounts.len) "No accounts loaded. Start Anvil, then refresh."
+    | str/join (str/from_atom 10) (state.accounts.map((\ a=shuin_wallet/account (str/cat_all [a.address "   " (shuin_wallet/eth a.balance) " ETH"]))))
+  + review
+    \ state=shuin_wallet/machine
+    ^ str
+    ? !(state.transfers.len) "Enter a sender, recipient and amount, then review the transfer."
+    = tx state.transfers.at(0)
+    | str/join (str/from_atom 10) [tx.status (str/cat_all ["From  " tx.sender]) (str/cat_all ["To  " tx.recipient]) (str/cat_all ["Amount  " (shuin_wallet/eth tx.value) " ETH"]) (str/cat_all ["Maximum network fee  " (shuin_wallet/eth tx.fee) " ETH"]) tx.hash (? tx.block.len (str/cat_all ["Block " tx.block]) "")]
+
+  + history
+    \ state=shuin_wallet/machine
+    ^ str
+    ? !(state.transfers.len) "No transfers yet."
+    | str/join (str/from_atom 10) (state.transfers.map((\ tx=shuin_wallet/transfer (str/cat_all [tx.status " · " (shuin_wallet/eth tx.value) " ETH · " tx.recipient]))))
+  + record
+    \ self=iota state=shuin_wallet/machine
+    ^ myth
+    = schema (shuin_wallet/schema self)
+    | (myth/sing schema.snoc('machine) state).put(schema.snoc('status) (pails/t (shuin_wallet/status state))).put(schema.snoc('overview) (pails/t (shuin_wallet/overview state))).put(schema.snoc('review) (pails/t (shuin_wallet/review state))).put(schema.snoc('history) (pails/t (shuin_wallet/history state)))
+  + install
+    \ state=namespace
+    ^ either[pail namespace]
+    = self state.self home (shuin_wallet/home self) schema (shuin_wallet/schema self)
+      card (shuin_wallet/named "Ethereum wallet" "Local development accounts, test ETH and transfers. Wallet state and policy are owned by Shrine.").meld((shuin_wallet/record self shuin_wallet/initial))
+      card card.put(schema.snoc('sender) (pails/t "")).put(schema.snoc('recipient) (pails/t "")).put(schema.snoc('amount) (pails/t ""))
+      card card.put((shuin_presentation/slot self) (shuin_presentation/config [schema.snoc('wallet)] [] [] [] "" [schema.snoc('accounts_link) schema.snoc('transfers_link)]))
+      card card.put(schema.snoc('accounts_link) (pails/p home.snoc('accounts))).put(schema.snoc('transfers_link) (pails/p home.snoc('transfers)))
+    ?> (./ok next) (grove_install/change home (writ/make card) state) (./err (pails/t "Wallet installation failed"))
+    ?> (./ok next) (grove_install/change home.snoc('accounts) (writ/make (shuin_wallet/named "Accounts" "Accounts provided by the connected local Anvil instance.")) next) (./err (pails/t "Wallet accounts installation failed"))
+    ?> (./ok next) (grove_install/change home.snoc('transfers) (writ/make (shuin_wallet/named "Transfers" "Reviewed transactions and their receipt states; not the complete chain history.")) next) (./err (pails/t "Wallet transfers installation failed"))
+    | ./ok next

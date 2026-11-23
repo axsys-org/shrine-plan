@@ -1,0 +1,350 @@
+- shuin_navigation
+- physical_projection
+- value_read
+- goo_browser
+
+' A read-only scene over the physical namespace. Navigation is ordinary context
+' state; opaque keys, paging and value previews use the core inspector contracts.
++ shuin_namespace
+  + receipt
+    : id=str body=str
+  + home
+    \ session=str state=namespace
+    ^ path
+    [state.self 'app 'shuin_explorer ($ts (str/cat_all ["session_" session]))]
+  + bridge
+    \ session=str state=namespace
+    ^ path
+    [state.self 'io 'shuin_explorer ($ts (str/cat_all ["session_" session]))]
+  + held
+    \ value=pail
+    ^ either[str goo_context/location]
+    ? value
+     > location=goo_context/location (./ok location)
+     > missing=goo_context/unavailable (shuin_namespace/held missing.value)
+    | ./err "Invalid namespace location."
+  + location
+    \ slot=path card=myth
+    ^ either[str goo_context/location]
+    ?> (./some held) card.get(slot) (./err "No selected namespace location.")
+    | shuin_namespace/held held
+  + target
+    \ text=str
+    ^ either[str path]
+    = decoded (? (eq text.slice(0 2) "v1") (physical_key/decode text) (path_parse text))
+    ?> (./some target) decoded (./err "Invalid namespace path or physical key.")
+    ? !(physical_key/fits target) (./err "Namespace path exceeds the key bound.")
+    | ./ok target
+  + open
+    \ session=str state=namespace
+    ^ either[str namespace]
+    = home (shuin_namespace/home session state)
+      bridge (shuin_namespace/bridge session state)
+    ? (maybe/is_some (sovereign_care .x home state).fil) (./ok state)
+    < declarations (goo_context/declare
+        [(goo_context/slot ['folder] "address" "location" [['places]] "push" [] .true)
+         (goo_context/slot ['selected] "selection" "location" [['entries]] "push" [['folder]] .false)] bridge)
+    < root (goo_context/capture_location [] state)
+    = record (goo_context/record declarations [state.self 'kook 'shuin_context] (myth/sing ['folder] root))
+      record (myth/meld record (root/named "Namespace explorer" "The current folder, selection and navigation history for this explorer."))
+      emitter (myth/sing ['context] (pails/p home)).put(limb_slot (kook [[state.self 'kook 'shuin_context_bridge]]))
+      emitter (myth/meld emitter (root/named "Explorer navigation" "Accepts navigation requests for this namespace explorer."))
+    < next (shuin_navigation/change bridge (writ/make emitter) state)
+    | shuin_navigation/change home (writ/make record) next
+  + encode_location
+    \ location=goo_context/location state=namespace
+    ^ either[str json]
+    ?> (./ok key) (physical_key/encode location.subject) (./err "Location key is too large.")
+    | ./ok (json/obj [(jkv "key" (json/str key))
+        (jkv "display" (json/str (physical_key/display location.subject).fall(key)))
+        (jkv "life" (json/str (nat/show location.life))) (jkv "state" (json/str location.state))
+        (jkv "available" (json/boo !(goo_context/location_stale location state)))])
+  + name
+    \ input=[path namespace]
+    ^ maybe[json]
+    = [target state] input
+    ? !(value_read/physical target) .none
+    ?> (./ok key) (physical_key/encode target) .none
+    = card=maybe[myth]
+        ? !(target.len) (./some (root/named "Namespace" "Browse the system and your local workspace."))
+        ? (equal[path] target ['sys]) (./some (root/named "System" "Shared vocabulary, types and definitions."))
+        | (sovereign_care .x target state).fil
+    ?> (./some card) card .none
+    = [title source] (physical_projection/label card)
+      [description source line] (physical_projection/help card)
+    | ./some (json/obj [(jkv "key" (json/str key))
+        (jkv "display" (json/str (physical_key/display target).fall(key)))
+        (jkv "title" title) (jkv "description" description)])
+  + names
+    \ paths=row[path] state=namespace
+    ^ json
+    = count (? (gt paths.len 128) 128 paths.len)
+    % i=nat 0 seen=row[path] [] out=row[json] [] used=nat 0
+    ^ json
+    ? (eq i count) (json/arr out)
+    = target paths.at(i)
+    ? (seen.any((\ old=path (equal[path] old target)))) (_ i.inc seen out used)
+    = seen seen.snoc(target)
+    ?> (./ok named) (Try shuin_namespace/name [target state]) (_ i.inc seen out used)
+    ?> (./some value) named (_ i.inc seen out used)
+    = cost (show value).len.inc
+    ? (gt (add used cost) 131072) (_ i.inc seen out used)
+    | _ i.inc seen out.snoc(value) (add used cost)
+  + places
+    \ folder=path state=namespace
+    ^ row[path]
+    = count (? (gt folder.len 64) 64 folder.len)
+    % i=nat 0 out=row[path] [[] ['sys] [state.self]]
+    ^ row[path]
+    ? (gt i count) out
+    | _ i.inc out.snoc(folder.take(i))
+  + page_json
+    \ input=[physical_read/page namespace]
+    ^ either[iota str]
+    = [page state] input
+    < body (physical_projection/json page)
+    = paths=row[path]
+        | page.entries.fold (shuin_namespace/places page.pax state)
+          \ out=row[path] entry=physical_read/entry
+          ? entry
+           > (./child key _) out.snoc(page.pax.snoc(key))
+           > (./slot key value)
+            = out out.snoc(key)
+            ? value
+             > reference=pails/p out.snoc(reference.p)
+            out
+      names (show (shuin_namespace/names paths state))
+      result (str/cat_all [body.slice(0 body.len.dec) "," (show_str "names") ":" names "}"])
+    ? (gt result.len 393216) (./err 'response_too_large)
+    | ./ok result
+  + projection
+    \ session=str state=namespace
+    ^ either[str json]
+    = home (shuin_namespace/home session state)
+    ?> (./some card) (sovereign_care .x home state).fil (./err "Open the explorer context first.")
+    < folder (shuin_namespace/location ['folder] card)
+    < folder_json (shuin_namespace/encode_location folder state)
+    = selected=either[str json]
+        ?> (./some held) card.get(['selected]) (./ok (json/nul 0))
+        < location (shuin_namespace/held held)
+        | shuin_namespace/encode_location location state
+    < selected selected
+    ?> (./some held) card.get(goo_context/history_slot) (./err "Missing explorer history.")
+    ?> history=goo_context/history held (./err "Invalid explorer history.")
+    = pane=path [state.self 'gov 'shuin_chat 'namespace_scene]
+      inspector=path [state.self 'gov 'shuin_chat 'namespace_record]
+    ?> (./some pane_record) (goo_runtime/record .x pane state) (./err "Namespace scene is unavailable.")
+    < scene (goo_runtime/published pane_record)
+    ?> (./some inspector_record) (goo_runtime/record .x inspector state) (./err "Record pane is unavailable.")
+    < detail (goo_runtime/published inspector_record)
+    ? !(and scene.view.is_pane (and detail.view.is_pane (and scene.view.ports.has(['folder]) detail.view.ports.has(['selected]))))
+      | ./err "Namespace panes must declare their consumed ports."
+    | ./ok (json/obj [(jkv "version" (json/num .false 1)) (jkv "session" (json/str session))
+        (jkv "context" (json/str (path_show home))) (jkv "revision" (json/str (nat/show (state.case(.x home)).fall(0))))
+        (jkv "folder" folder_json) (jkv "selected" selected)
+        (jkv "names" (shuin_namespace/names (shuin_namespace/places folder.subject state) state))
+        (jkv "historyIndex" (json/num .false history.index)) (jkv "historyLength" (json/num .false history.entries.len))
+        (jkv "pane" (json/str (path_show pane))) (jkv "paneVersion" (json/str (nat/show (state.case(.x pane)).fall(0))))
+        (jkv "inspector" (json/str (path_show inspector))) (jkv "inspectorVersion" (json/str (nat/show (state.case(.x inspector)).fall(0))))])
+  + move
+    \ body=str fields=row[[str str]] state=namespace
+    ^ either[str namespace]
+    = get (\ key=str (http_foot/field key fields))
+      home (shuin_namespace/home (get "session") state)
+      bridge (shuin_namespace/bridge (get "session") state)
+    ?> (./some card) (sovereign_care .x home state).fil (./err "Open the explorer context first.")
+    = replay=maybe[shuin_namespace/receipt]
+        ?> (./some held) card.get(['receipt]) .none
+        ?> receipt=shuin_namespace/receipt held .none
+        | ./some receipt
+    ? (replay.run((\ receipt=shuin_namespace/receipt (eq receipt.id (get "id")))).fall(.false))
+      ? (eq replay.fall((shuin_namespace/receipt "" "")).body body) (./ok state)
+      | ./err "Request ID was reused with different content."
+    ? !(eq (nat/parse (get "expected")).fall(0) (state.case(.x home)).fall(0)) (./err "Context changed; navigation is stale.")
+    ?> (./some held) card.get(goo_context/history_slot) (./err "Missing explorer history.")
+    ?> history=goo_context/history held (./err "Invalid explorer history.")
+    = operation (get "operation")
+      order (history.orders.tap.fold(0 (\ n=nat entry (? (gt n entry.val) n entry.val)))).inc
+      intent=either[str pail]
+        ? (eq operation "back")
+          ? !(history.index) (./err "Beginning of history.")
+          | ./ok (goo_context/traversal history.index.dec)
+        ? (eq operation "forward")
+          ? (ge history.index.inc history.entries.len) (./err "End of history.")
+          | ./ok (goo_context/traversal history.index.inc)
+        < target (shuin_namespace/target (get "target"))
+        < location (goo_context/capture_location target state)
+        ? (eq operation "folder")
+          | ./ok (goo_context/stamp ['places] order (myth/sing ['folder] location))
+        < folder (shuin_namespace/location ['folder] card)
+        ? (goo_context/location_stale folder state) (./err "The source folder is unavailable; reopen it explicitly.")
+        ? !(and (eq target.len folder.subject.len.inc) (equal (target.take(folder.subject.len)) folder.subject))
+          | ./err "Selection is outside the current folder."
+        | ./ok (goo_context/stamp ['entries] order (myth/sing ['selected] location))
+    < intent intent
+    < expected (goo_context/command bridge card intent)
+    < next (shuin_navigation/change bridge (writ/poke (myth/sing goo_context/intent_slot intent)) state)
+    ?> (./some accepted) (sovereign_care .x home next).fil (./err "Missing accepted context.")
+    ? !(and (equal (accepted.get(['folder])) (expected.get(['folder]))) (and (equal (accepted.get(['selected])) (expected.get(['selected]))) (equal (accepted.get(goo_context/history_slot)) (expected.get(goo_context/history_slot)))))
+      | ./err "Context hand did not accept the explorer intent."
+    | shuin_navigation/change home (writ/make accepted.put(['receipt] (shuin_namespace/receipt (get "id") body))) next
+  + response
+    \ session=str accepted=bool why=str state=namespace
+    ^ [nat str]
+    ? (shuin_namespace/projection session state)
+     > (./err error) [409 (show (json/obj [(jkv "error" (json/str error))]))]
+     > (./ok projection) [(? accepted 200 409) (show (json/obj [(jkv "accepted" (json/boo accepted))
+         (jkv "message" (json/str why)) (jkv "state" projection)]))]
+  + run
+    \ body=str fields=row[[str str]] state=namespace
+    ^ [namespace nat str]
+    = get (\ key=str (http_foot/field key fields))
+      operation (get "operation")
+      result=either[str namespace]
+        ? (eq operation "open") (shuin_namespace/open (get "session") state)
+        ? (eq operation "read") (./ok state)
+        | shuin_namespace/move body fields state
+    ? result
+     > (./err why)
+      = [status answer] (shuin_namespace/response (get "session") .false why state)
+      [state status answer]
+     > (./ok next)
+      = refreshed (goo_context/refresh (shuin_namespace/home (get "session") next) next)
+        next=namespace
+          ? refreshed
+           > (./ok fresh) fresh
+           > (./err _) next
+        [status answer] (shuin_namespace/response (get "session") .true "" next)
+      [(? (eq status 200) next state) status answer]
+  + root
+    \ state=namespace
+    ^ physical_read/page
+    = authorities=row[path] [['sys] [state.self]]
+      entries=row[physical_read/entry]
+        | authorities.fold []
+          \ out=row[physical_read/entry] path=path
+          ? (physical_read/namespace_read (physical_read/request path .none 'children .none 1) state)
+           > (./err _) out
+           > (./ok page) out.snoc((physical_read/entry/child path.at(0) page.own))
+    | physical_read/page [] 0 'children .none 40 entries.len .none (physical_read/node .none .none entries.len) entries
+  + encode_value
+    \ chunk=value_read/chunk
+    ^ either[str str]
+    ?> (./ok path_key) (physical_key/encode chunk.pax) (./err "Invalid value path.")
+    ?> (./ok slot_key) (physical_key/encode chunk.slot) (./err "Invalid value slot.")
+    | ./ok (show (json/obj
+        [(jkv "version" (json/num .false 1))
+         (jkv "pathKey" (json/str path_key)) (jkv "slotKey" (json/str slot_key))
+         (jkv "path" (json/str (physical_key/display chunk.pax).fall(path_key)))
+         (jkv "slot" (json/str (physical_key/display chunk.slot).fall(slot_key)))
+         (jkv "epoch" (json/str (nat/show chunk.epoch)))
+         (jkv "recordEpoch" (json/str (nat/show chunk.record_epoch)))
+         (jkv "type" (json/str chunk.kind)) (jkv "encoding" (json/str "hex"))
+         (jkv "total" (json/str (nat/show chunk.total)))
+         (jkv "offset" (json/str (nat/show chunk.offset)))
+         (jkv "next" (chunk.next.run((\ n (json/str (nat/show n)))).fall((json/nul 0))))
+         (jkv "complete" (json/boo !(maybe/is_some chunk.next)))
+         (jkv "hex" (json/str chunk.hex))]))
+  + inspected
+    \ fields=row[[str str]] state=namespace
+    ^ either[str goo_context/location]
+    = get (\ key=str (http_foot/field key fields))
+    ? !(shuin_navigation/identity (get "session")) (./err "Invalid explorer session.")
+    ?> (./some card) (sovereign_care .x (shuin_namespace/home (get "session") state) state).fil (./err "Open the explorer context first.")
+    ? !(eq (get "expected") (nat/show (state.case(.x (shuin_namespace/home (get "session") state))).fall(0))) (./err "Context changed; refresh the inspector.")
+    < location (shuin_namespace/location (? (card.has(['selected])) ['selected] ['folder]) card)
+    ? (goo_context/location_stale location state) (./err "Selected location was removed or replaced.")
+    | ./ok location
+  + views
+    \ fields=row[[str str]] state=namespace
+    ^ either[str json]
+    < location (shuin_namespace/inspected fields state)
+    ?> (./some card) (goo_runtime/record .x location.subject state) (./err "Selected record is unavailable.")
+    = get (\ key=str (http_foot/field key fields))
+      epoch (nat/show state.local.rec.len)
+    ? (and (get "epoch").len !(eq epoch (get "epoch"))) (./err "View catalog changed; refresh before loading more.")
+    ?> (./some offset) (nat/parse (? (get "after").len (get "after") "0")) (./err "Invalid view cursor.")
+    ? (and offset !((get "epoch").len)) (./err "View continuation requires its epoch.")
+    = catalog (goo_browser/catalog (sovereign_care .z [state.self 'gov] state))
+      matches (catalog.keep((\ published (and published.view.ports.is_nil (goo_browser/matches card published)))))
+      page matches.drop(offset).take(32)
+      entries
+        | page.map
+        \ published=goo/published
+        ^ json
+        = target published.view.name
+          record (goo_runtime/record .x target state).fall(myth/new)
+          [title _] (physical_projection/label record)
+          [description _ _] (physical_projection/help record)
+        | json/obj [(jkv "path" (json/str (path_show target)))
+            (jkv "title" title) (jkv "description" description)
+            (jkv "publication" (json/str (nat/show (state.case(.x target)).fall(0))))
+            (jkv "kind" (json/str (? published.view.is_pane "pane" "view")))]
+    ?> (./ok key) (physical_key/encode location.subject) (./err "Invalid inspected path.")
+    | ./ok (json/obj [(jkv "version" (json/num .false 1)) (jkv "pathKey" (json/str key))
+        (jkv "life" (json/str (nat/show location.life))) (jkv "epoch" (json/str epoch))
+        (jkv "recordVersion" (json/str (nat/show (state.case(.x location.subject)).fall(0))))
+        (jkv "views" (json/arr entries.row))
+        (jkv "next" (? (gt matches.len (add offset page.len)) (json/str (nat/show (add offset page.len))) jnull))])
+  + read_page
+    \ fields=row[[str str]] state=namespace
+    ^ [nat str]
+    = get (\ key=str (http_foot/field key fields))
+      home (shuin_namespace/home (get "session") state)
+      result=either[str str]
+        ? (eq (get "operation") "views")
+          < value (shuin_namespace/views fields state)
+          | ./ok (show value)
+        ?> (./some card) (sovereign_care .x home state).fil (./err "Open the explorer context first.")
+        ? !(eq (nat/parse (get "expected")).fall(0) (state.case(.x home)).fall(0)) (./err "Context changed; discard this page.")
+        = operation (get "operation")
+          slot=path (? (eq operation "children") ['folder] (? (card.has(['selected])) ['selected] ['folder]))
+        < location (shuin_namespace/location slot card)
+        ? (goo_context/location_stale location state) (./err "Selected location was removed or replaced.")
+        = epoch (nat/parse (get "epoch"))
+          after (physical_key/decode (get "after"))
+          collection=iota (? (eq operation "children") 'children 'slots)
+        ? (and (get "epoch").len !(maybe/is_some epoch)) (./err "Invalid epoch.")
+        ? (and (get "after").len !(maybe/is_some after)) (./err "Invalid cursor.")
+        ? (and (maybe/is_some after) !(maybe/is_some epoch)) (./err "Continuation requires an epoch.")
+        ? (eq operation "value")
+          ?> (./some epoch) epoch (./err "Value reads require the captured epoch.")
+          ?> (./some key) (physical_key/decode (get "slot")) (./err "Invalid slot key.")
+          ?> (./some offset) (nat/parse (get "offset")) (./err "Invalid byte offset.")
+          ? (value_read/namespace_safe_read (value_read/request location.subject key epoch offset 4096) state)
+           > (./err why) (./err (str/from_atom (iota_show why)))
+           > (./ok chunk) (shuin_namespace/encode_value chunk)
+        = encoded=either[iota str]
+            ? !(location.subject.len)
+              ? !(eq operation "children") (./err 'record_missing)
+              ? ((get "after").len || (get "epoch").len) (./err 'invalid_cursor)
+              | shuin_namespace/page_json [(shuin_namespace/root state) state]
+            < page (physical_read/namespace_read (physical_read/request location.subject epoch collection after 40) state)
+            ? (Try shuin_namespace/page_json [page state])
+             > (./ok answer) answer
+             > (./err _) (./err 'read_failed)
+        ? encoded
+         > (./err why) (./err (str/from_atom (iota_show why)))
+         > (./ok body) (./ok body)
+    ? result
+     > (./err why) [409 (show (json/obj [(jkv "error" (json/str why))]))]
+     > (./ok body) [200 body]
+  + http
+    \ body=str
+    ^ http_foot/action
+    ? (gt body.len 20000) (./reply (http_driver/response 413 "Explorer request too large"))
+    = fields (http_foot/fields body)
+      get (\ key=str (http_foot/field key fields))
+      allowed=row[str] ["session" "operation" "id" "expected" "target" "epoch" "after" "slot" "offset"]
+      operation (get "operation")
+      read (row/has[str] operation ["children" "slots" "value" "views"])
+    ? !(fields.all((\ [key value] (and allowed.has(key) (eq (fields.keep((\ [other _] (eq key other)))).len 1)))))
+      | ./reply (http_driver/response 400 "Unknown or duplicate explorer field")
+    ? !(shuin_navigation/identity (get "session")) (./reply (http_driver/response 400 "Invalid explorer session"))
+    ? !(read || (row/has[str] operation ["open" "read" "folder" "select" "back" "forward"]))
+      | ./reply (http_driver/response 400 "Unknown explorer operation")
+    ? read (./snapshot (shuin_namespace/read_page fields))
+    ? !(row/has[str] operation ["open" "read"])
+      ? !(shuin_navigation/identity (get "id")) (./reply (http_driver/response 400 "Invalid navigation receipt ID"))
+      | ./transact (shuin_namespace/run body fields)
+    | ./transact (shuin_namespace/run body fields)

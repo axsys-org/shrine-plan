@@ -1,0 +1,159 @@
+- grove_actions
+
+' Typed creation declarations, separate from receiver-updating actions.
++ grove_stencils
+  + is_stencil
+    \ body=list[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) (equal kind (grove/tag_kind/stencil))
+    .false
+  + reference
+    \ root=path doc=grove/document lookup={\ path}maybe[myth] role=rex
+    ^ either[grove/error path]
+    < parts (grove_roles/parts role)
+    = imported ((grove_roles/imports doc).any((\ imp (equal parts.at(0) ($ts imp.alias)))))
+      reference (rex/path parts.map((\ part (str/from_atom (quip_val part)))))
+    < resolved (grove_roles/slot root doc lookup reference)
+    | ./ok (? imported resolved root.weld(parts))
+  + analyze
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      span=rex/source_span body=list[grove/statement]
+    ^ either[grove/error [grove_actions/shape rex]]
+    ? (grove_actions/is_action body)
+      | grove_roles/fail[[grove_actions/shape rex]] span "A declaration cannot be both an action and a stencil."
+    = outputs
+        | body.keep
+        \ stmt
+        ? stmt
+         > (grove/directive at kind target) (equal kind (grove/directive_kind/for))
+        .false
+    ? !(eq outputs.len 1)
+      | grove_roles/fail[[grove_actions/shape rex]] span "Stencil requires exactly one #for result role."
+    ?> (grove/directive at kind result) outputs.head
+      (grove_roles/fail[[grove_actions/shape rex]] span "Missing stencil result role.")
+    < checked (grove_roles/parent root doc lookup [] result)
+    = translated
+        | body.keep((\ stmt !(outputs.has(stmt)))).map
+        \ stmt
+        ? stmt
+         > (grove/tag at kind)
+          ? (equal kind (grove/tag_kind/stencil)) (grove/tag at (grove/tag_kind/action))
+          stmt
+        stmt
+    < shape (grove_actions/analyze root doc lookup span translated)
+    ? (shape.fields.fields.any((\ field (eq field.name "created_at"))))
+      | grove_roles/fail[[grove_actions/shape rex]] span "created_at is supplied by Shrine."
+    | ./ok [shape (rex/normalize result)]
+  + code
+    \ root=path doc=grove/document lookup={\ path}maybe[myth] span=rex/source_span
+      name=str shape=grove_actions/shape result=rex
+    ^ either[grove/error row[rex]]
+    = self (rex/path [name])
+      role shape.receiver
+      types shape.fields.fields.map((\ field field.type))
+      labels
+        | (row/range 0 types.len).map
+        \ i
+        | str/join "" ["ARG" (nat/show i)]
+      pairs
+        | (row/range 0 types.len).map
+        \ i
+        [labels.at(i) types.at(i)]
+      params
+        | (row/range 0 types.len).map
+        \ i
+        | str/join "" ["arg" (nat/show i) "=" labels.at(i)]
+      args
+        | (row/range 0 types.len).map
+        \ i
+        | rex/word (str/join "" ["arg" (nat/show i)])
+      implementation (grove_roles/member ["implementation"] self)
+      invoke_body
+        | rex/rune "|"
+          args.cons(implementation).snoc((rex/word "receiver")).snoc((rex/word "created_at"))
+      run
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " "
+                (str/join " " params.snoc("receiver=ROLE").snoc("created_at=nat"))])
+             "^ RESULT" "BODY"])
+          pairs.snoc(["RESULT" result]).snoc(["ROLE" role]).snoc(["BODY" invoke_body])
+      names shape.fields.fields.map((\ field (rex/word field.name)))
+      invoke (grove_roles/member ["run"] self)
+      call
+        | rex/rune "|" names.cons(invoke).snoc((rex/word "receiver")).snoc((rex/word "created_at")).row
+      finish
+        | rex/rune "|" [(grove_roles/member ["to_myth"] result) call]
+      chain
+        | list/fold[grove_roles/field rex] finish
+          (grove_roles/read_step self)
+          shape.fields.fields.reverse
+      apply
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92)
+                " created_at=nat card=myth current=myth"])
+             "^ maybe[myth]"
+             "< receiver (FROM current)"
+             "BODY"])
+          [["FROM" (grove_roles/member ["from_myth"] role)]
+           ["BODY" chain]]
+    < receiver (grove_stencils/reference root doc lookup role)
+    < output (grove_stencils/reference root doc lookup result)
+    = args (grove_roles/schema_code shape.fields)
+      schema
+        | rex/rune "|" [(rex/word "grove_stencil_schema")
+          (grove_roles/path_value receiver) (grove_roles/path_value output) args]
+    | ./ok
+      [(grove_roles/decl "implementation" (rex/group shape.code))
+      (grove_roles/decl "run" run)
+      (grove_roles/decl "fields"
+        (rex/group shape.fields.fields.map(grove_roles/field_code).row))
+      (grove_roles/decl "apply" apply)
+      (grove_roles/decl "schema" schema)]
+  + prepare
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    % rest=list[grove/item] doc.items out=list[grove/item] .nil
+    ^ either[grove/error grove/document]
+    ? (eq rest.len 0) (./ok (grove/document out.reverse))
+    > (grove/declaration span name body) rest.at(0)
+      | _ rest.drop(1) out.cons(rest.at(0))
+    ? !(grove_stencils/is_stencil body)
+      | _ rest.drop(1) out.cons(rest.at(0))
+    > (grove/name/identifier text) name
+      | grove_roles/fail[grove/document] span "Stencils need a name."
+    < analyzed (grove_stencils/analyze root doc lookup span body)
+    = [shape result] analyzed
+    < trees (grove_stencils/code root doc lookup span text shape result)
+    = kept
+        | body.keep
+        \ stmt
+        ? stmt
+         > (grove/comment at text) .true
+         > (grove/block at kind kids)
+          | equal kind (grove/block_kind/meta)
+        .false
+      schema (grove_roles/member ["schema"] (rex/path [text]))
+      prop=grove/statement
+        | grove/property span (rex/cord (path_show system_vocabulary/grove/stencil)) schema
+      handler=grove/statement
+        | grove/property span (rex/cord "/sys/grove/stencil_handler")
+          (rex/rune "|" [(rex/word "grove_stencil_handler")
+            (grove_roles/member ["apply"] (rex/path [text]))])
+      meta=grove/statement
+        | grove/block span (grove/block_kind/meta) ((list/one handler).cons(prop))
+      code=grove/statement
+        | grove/implementation span
+          trees.map((grove_actions/located span))
+      decl=grove/item
+        | grove/declaration span name kept.snoc(meta).snoc(code)
+    | _ rest.drop(1) out.cons(decl)
+  + prepare_all
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    < doc (grove_stencils/prepare root doc lookup)
+    | grove_actions/prepare_all root doc lookup

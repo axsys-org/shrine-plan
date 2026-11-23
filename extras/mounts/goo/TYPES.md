@@ -93,6 +93,9 @@ Rendering recognizes these typed myth slots:
 | `/sys/font` | `pails/p` | Path to a pinned font in the current renderer registry |
 | `/sys/modifiers` | `pails/modifiers { values=list[modifiers] }` | `italic`, `bold`, `underline` |
 | `/sys/link` | `pails/p` or `weblink { href=str }` | Internal target or HTTP(S) target; filled box highlight |
+| `/sys/selection` | `pails/p` | Versioned document for native word-range selection |
+| `/sys/selection_preview` | `pails/p` | Published Goo view and pure provider for a selection preview |
+| `/sys/evidence` | `pails/t` | Anchors this detail to a document, UTF-8 range and exact quote (see PORTABLE.md) |
 
 `modifiers` is the closed sum of the three nullary records. `pails/modifiers`
 boxes the typed list at the myth's pail boundary. The underlying text remains

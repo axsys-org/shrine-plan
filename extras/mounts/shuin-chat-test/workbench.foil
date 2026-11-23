@@ -1,0 +1,90 @@
+- shuin_workbench
+- shuin_agents
+
++ shuin_workbench_test
+  + nodes
+    \ nodes=list[goo/node]
+    ^ row[json]
+    | nodes.row.map((\ node (json/obj [(jkv "kind" (json/str node.constructor)) (jkv "arguments" (json/arr node.arguments.row.map((\ arg (json/str arg.print))))) (jkv "children" (json/arr (shuin_workbench_test/nodes node.children)))])))
+  + inspect
+    \ home=path registration=change_workbench/registration state=namespace
+    ^ json
+    = journal (change_workbench/journal_at home state)
+      card (change_workbench/record registration.control state)
+      candidate (change_workbench/candidate_at journal.candidate state)
+      run (change_workbench/run_at journal.run state)
+      records=row[json]
+        ?> (./some candidate) candidate []
+        | candidate.records.map((\ [path card] (json/str (path_show path))))
+      artifact_matches=bool
+        ?> (./some candidate) candidate .false
+        | candidate.records.all((\ [path card] (equal card (change_workbench/record path state))))
+      source=path registration.units.at(0).source
+      card_source (change_workbench/record source state)
+      tested=bool
+        ?> (./some run) run .false
+        run.passed
+    | json/obj [(jkv "status" (json/str card.txt_at((change_workbench/key 'status))))
+        (jkv "review" (json/str card.txt_at((change_workbench/key 'review))))
+        (jkv "active" (json/num .false journal.revision))
+        (jkv "candidate" (json/str (path_show journal.candidate)))
+        (jkv "run" (json/str (path_show journal.run)))
+        (jkv "passed" (json/boo tested))
+        (jkv "artifactMatches" (json/boo artifact_matches))
+        (jkv "records" (json/arr records))
+        (jkv "versions" (json/arr (journal.active.map((\ path (json/num .false (state.case(.x path)).fall(0)))))))
+        (jkv "sourcePath" (json/str (path_show source)))
+        (jkv "source" (json/str card_source.txt_at(system_vocabulary/content)))]
+  + run
+    \ input=json state=namespace
+    ^ [namespace nat str]
+    = name (shuin_agents/field "target" input)
+      matches ((change_workbench/registrations state).keep((\ [home reg] (eq (str/from_atom (iota_show home.at(home.len.dec))) name))))
+    ? !(matches.len) [state 404 "Target not registered"]
+    = [home registration] matches.at(0)
+      operation (shuin_agents/field "operation" input)
+    ? (eq operation "workbench_view")
+      ?> (./some path) (path_parse (shuin_agents/field "view" input)) [state 400 "Invalid view"]
+      ?> (./ok published) (goo_runtime/published (change_workbench/record path state)) [state 400 "Missing view"]
+      ? published.result
+       > (./ok view) [state 200 (show (json/arr (shuin_workbench_test/nodes view.children)))]
+       > (./err why)
+        ? why
+         > (grove/error/syntax span message) [state 200 (str/cat_all [(nat/show span.line) ": " message])]
+         > (grove/error/parser _) [state 200 "View parser error"]
+    ? (eq operation "workbench_status") [state 200 (show (shuin_workbench_test/inspect home registration state))]
+    ? (eq operation "workbench_command")
+      = command (shuin_agents/field "command" input)
+        next (change_workbench/put registration.control (myth/sing (change_workbench/key 'command) (pails/t command)) state)
+      [next 200 "Requested"]
+    ? (eq operation "workbench_source")
+      = source (shuin_agents/field "source" input)
+        next (change_workbench/put registration.units.at(0).source (myth/sing system_vocabulary/content (pails/t source)) state)
+      [next 200 "Saved source"]
+    ? (eq operation "workbench_slot")
+      ?> (./some path) (path_parse (shuin_agents/field "path" input)) [state 400 "Invalid record"]
+      ?> (./some slot) (path_parse (shuin_agents/field "slot" input)) [state 400 "Invalid slot"]
+      = next (change_workbench/put path (myth/sing slot (pails/t (shuin_agents/field "value" input))) state)
+      [next 200 "Saved fixture slot"]
+    ? (eq operation "workbench_clone")
+      = control=path [state.self 'app 'workbench 'third]
+        source=path control.snoc('source)
+        auxiliary control.snoc('auxiliary)
+        original registration.units.at(0)
+        root=path [state.self 'gov 'workbench_third]
+        auxiliary_root=path [state.self 'gov 'workbench_auxiliary]
+        policy=shuin_workbench/view_policy
+          ?> (./some policy) (shuin_workbench/view_policy_at registration) (shuin_workbench/view_policy [] [] [] [])
+          | policy.set_declaration(root.snoc('variant)).set_role(root.snoc('editor))
+        replacement registration.set_control(control).set_units([(change_workbench/unit source root original.prelude) (change_workbench/unit auxiliary auxiliary_root original.prelude)]).set_outputs([root auxiliary_root]).set_tests(control.snoc('tests)).set_policy((myth/sing (change_workbench/key 'policy) policy)).set_bootstrap(.false)
+        next (change_workbench/put source (shuin_workbench/source_record "Third target source" (change_workbench/record original.source state).txt_at(system_vocabulary/content) control) state)
+        auxiliary_code (str/join (str/from_atom 10) ["#import text=lib/grove/types/text" "#import content=sys/content" "additional =" "  @role" "  content: text"])
+        next (change_workbench/put auxiliary (shuin_workbench/source_record "Auxiliary source" auxiliary_code control) next)
+        cases (sovereign_care .z registration.tests state).tap
+        next=namespace
+          | cases.fold next
+            \ next=namespace [relative card]
+            | change_workbench/put replacement.tests.weld(relative) card next
+        next (shuin_workbench/register 'third "Additional registered view" replacement next)
+      [next 200 "Registered"]
+    [state 400 "Unknown workbench fixture operation"]
