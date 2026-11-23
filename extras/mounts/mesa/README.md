@@ -3,73 +3,81 @@
 Registers the foot at `/<self>/io/mesa`: the one place a world meets other worlds.
 
 - `src/foil/net.foil`: the rules of publication and landing, pure.
-- `src/foil/mesa_foot.foil`: the foot's rules as steps over its state and the world's.
-- `src/foil/mesa_wire.foil`: the actor that gives the foot its socket, and that tells Mesa the cards.
+- `src/foil/mesa_foot.foil`: the foot's rules, as steps over its state and the world's.
+- `src/foil/mesa_wire.foil`: the actor that gives the foot its socket and tells Mesa the cards.
 - `src/reaver/mesa.rvr`: the only file that names a call of the Mesa bridge in the runtime.
 
-## Identity: a trusted setup, not Groundwire identity
+## Identity is a trusted setup
 
-**Whoever writes the card of a peer decides whose key is whose.** The card is a stand-in for a verifier. This
-mount has preconfigured peers only: a person, a script or a hand writes each card. It does no first contact:
-a world that has no card is not heard. It does not find a new key of a peer by itself: a change of key is safe
-once someone writes the new key on the card, and until then the reader lands nothing from that peer. Nothing
-here is Groundwire identity; a verifier of identities takes the place of the one that writes cards later, and
-no rule of this mount changes then.
+**Whoever writes a peer's card decides whose key is whose.** A person, a script or a hand writes each card. The
+foot hands the card to Mesa and Mesa accepts it. There is no verifier and no first contact, so:
 
-What the mount does give: a name of a peer is a name that the system already authenticated. Mesa holds the key
-of the world and signs each page that the world publishes. Mesa (`mesa-jael`) holds the key that it accepted
-for each peer, and examines each page that a peer publishes. No rule of this mount holds a key or examines a
-signature, and no application that uses a name of a peer thinks about keys. A change of key changes no name.
+- a world with no card is not heard
+- when a peer changes its key, someone has to write the new key on its card, and nothing from that peer lands
+  until they do
+- a wrong key written at a new life is accepted, and the right key then needs a later life
+
+This is not Groundwire identity. The card stands in for a verifier. When a verifier exists it takes the place of
+whoever writes the cards, and no rule here changes.
+
+What Mesa does with the keys: it signs every page the world publishes with the world's key, and checks every
+page from a peer against the key it accepted for that peer (`mesa-jael`). The rules of this mount sign nothing
+and check no signature. A world's names do not change when its key changes.
 
 ## What it does
 
-What is published to one peer is sealed for that peer; what is public is sent as it is. A world publishes what
-it writes beneath `/<self>/our/<peer>` to that peer and beneath `/<self>/our/public` to everyone it knows. A
-reader holds a publisher's names under those same names, in a store that it keeps for that publisher beside
-its own (`namespace.peers`): what `A` writes at `/A/our/B/doc`, `B` reads at `/A/our/B/doc`. That store is not
-part of the reader's names, and the reader runs no behaviour and judges no contract in it. What the reader
-knows about it is in the reader's own records below the card: where each root stands
-(`/<self>/io/mesa/<publisher>/stand`) and the version and content hash that the publisher gave each name
-(`.../said/...`).
+A world publishes what it writes beneath `/<self>/our/<peer>` to that peer, and what it writes beneath
+`/<self>/our/public` to every peer it knows. What goes to one peer is sealed for that peer. What is public is
+sent as it is.
 
-A peer is a card with a `key`, a `host` and a `port` (and a `life` and a `rift` when they are not 1 and 0). The
-card is a request: it names the key that this world wants Mesa to accept for the peer. Mesa decides. It does
-not accept a lower life, or a different key at the same life, and it keeps a peer whose card was removed
-blocked until a card with a higher life comes. When Mesa does not accept a card, the foot writes the key and
-the reason beside the card (`barred` and `cause` on `stand`), and the peer is not a peer of the foot. The foot
-reads the card and does not write it.
+A reader holds a publisher's names under the same names, in a store it keeps for that publisher beside its own
+(`namespace.peers`): what `A` writes at `/A/our/B/doc`, `B` reads at `/A/our/B/doc`. That store is not part of
+the reader's own names, and the reader runs no behaviour and judges no contract in it. What the reader knows
+about it is in the reader's own records below the card:
 
-Nothing outside tells a world anything. Mesa keeps four files for a world, in `io/mesa/` under the world's
-file root, outside the world's records: `ring` (the key; only the runtime reads it, and a later key has a file
-of its own, `ring.2`), `ring.manifest` (which key Mesa signs with), `ring.authority` (what Mesa accepted for
-each peer) and `mark` (the rift, the highest epoch announced, and the lowest manifest that the world
-accepts). A restore of the world does not take them back. The foot's record, `/<self>/io/mesa`, can name the
-`ring` and the `mark` elsewhere. A world that has never stated a key gets one from the runtime; a world that
-has stated a key is never given another, and stays silent without its key file. A world changes its key when
-someone writes a later `life` on its record; its peers go on with it when someone writes the new key and that
-life on their cards.
+- where each root stands: `/<self>/io/mesa/<publisher>/stand`
+- the version and content hash the publisher gave each name: `.../said/...`
 
-Packets are UDP datagrams on one socket. The foot makes its socket on the `port` of its record. A packet from
-an address that no card names is discarded.
+A peer is a card with a `key`, a `host` and a `port`, plus a `life` and a `rift` when they are not 1 and 0. The
+card is a request to Mesa. Mesa refuses a lower life, and a different key at the same life. A peer whose card
+was removed stays blocked until a card with a higher life is written. When Mesa refuses a card, the foot writes
+the key and the reason beside the card (`barred` and `cause` on `stand`), and that peer is not a peer of the
+foot. The foot reads cards and never writes them.
+
+Packets are UDP datagrams on one socket, on the `port` of the foot's record. A packet from an address that no
+card names is dropped.
+
+## Files beside the world
+
+Mesa keeps four files for a world in `io/mesa/`. They are in the world's folder but not in the world's store.
+The foot's record, `/<self>/io/mesa`, can name another place for `ring` and `mark`.
+
+- `ring`: the private key. Only the runtime reads it. Each later key gets a file of its own (`ring.2`).
+- `ring.manifest`: which key Mesa signs with.
+- `ring.authority`: what Mesa accepted for each peer, and each block.
+- `mark`: the rift, the highest epoch announced, and the lowest key manifest the world accepts.
+
+A world that has never stated a key gets one from the runtime. A world that has stated a key is never given
+another, and stays silent without its key file. A world changes its key when someone writes a later `life` on
+its record. Its peers follow when someone writes the new key and that life on their cards.
+
+If one of the four files is damaged or unreadable, or a world that has run before has no mark, the foot does
+not start. It says why and overwrites nothing.
 
 ## What this mount does not do
 
-- **No proof of a past publication to a third party.** A reader keeps the version and the content hash that a
-  publisher gave for each name. It keeps no signature: Mesa examines the signature of each page and gives the
-  rules the bytes only. So a reader cannot show a third party later what a publisher said. The smallest
-  addition that restores this is in libmesa: a finished read that also gives the life, the rift, the total, the
-  root and the signature of its page. Shrine makes no signatures of its own in their place.
-- **A card is trusted** (see the first section). A wrong key at a new life is accepted, and the right key then
-  needs a later life.
-- **An engine that is full is replaced.** An engine holds 64 MiB of bound pages. When it has no space left, the
-  foot makes a new engine on the same socket; reads in progress stop and a later hint starts them again. A name
-  always has the same content, so the new engine gives the same page for it. Mesa can instead retire old names
-  (`RETIRE_BEFORE`), which needs page names that sort by version. That is not done here: the names of pages
-  change with Mesa's native paths.
-- **The key is on the machine.** The seed is a file that only the runtime reads, and it is in the memory of the
-  runtime. A host that is taken over can take it. A signer outside the process is not in this mount.
-- **Mesa's files are in the world's folder.** A restore of the store alone (the folder `snap`) keeps them, and
-  then an old key of the world or of a peer does not come back. A restore of the whole folder from a copy takes
-  them back with it; nothing in that folder can prevent this.
-- Not here: first contact with a world that has no card, a verifier of identities, an outside signer, and
-  proofs of history.
+- **No proof of a past publication for a third party.** A reader keeps the version and the content hash a
+  publisher gave for each name. It keeps no signature: Mesa checks the signature of each page and hands the
+  rules only the bytes. The smallest fix is in libmesa: a finished read that also gives the life, the rift,
+  the total, the root and the signature of its page. Shrine makes no signatures of its own in their place.
+- **No verifier, no first contact.** See the first section.
+- **The private key is on the machine.** It is a file only the runtime reads, and it is in the runtime's
+  memory. Someone who takes over the host can take it. There is no signer outside the process.
+- **The key files travel with the folder.** Restoring only the store (the folder `snap`) leaves them alone, so
+  an old key of the world or of a peer does not come back. Restoring the whole folder from a copy rolls them
+  back too, and nothing in that folder can prevent it.
+- **A full engine is replaced.** An engine holds 64 MiB of bound pages. When it is full the foot makes a new
+  engine on the same socket. Reads in progress stop and a later hint starts them again. A name always has the
+  same content, so the new engine gives the same page for it. Mesa could instead retire old names
+  (`RETIRE_BEFORE`), but that needs page names that sort by version, and page names will change with Mesa's
+  native paths.
