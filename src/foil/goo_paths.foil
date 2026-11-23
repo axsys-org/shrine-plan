@@ -1,0 +1,99 @@
+- physical_key
+- json
+- lain_peek
+
+' Shared data contract. Identity is physical; labels never grant authority.
++ goo_paths
+  + policy
+    : eligible={\ path bool namespace}bool check={\ goo_paths/hunts bool namespace}either[str unit]
+  + hunts
+    : items=row[hunt]
+  + word
+    \ c=care
+    ^ str
+    ? c
+     > .x "x"
+     > .y "y"
+     > .z "z"
+  + care
+    \ text=str
+    ^ maybe[care]
+    ? (eq text "x") (./some .x)
+    ? (eq text "y") (./some .y)
+    ? (eq text "z") (./some .z)
+    .none
+  + field
+    \ key=str value=json
+    ^ json
+    ?> (./obj fields) value jnull
+    | fields.fold jnull (\ out entry (? (eq entry.k key) entry.v out))
+  + text
+    \ value=json
+    ^ str
+    ?> (./str text) value ""
+    text
+  + key
+    \ target=path
+    ^ str
+    ?> (./ok key) (physical_key/encode target) ""
+    key
+  + wire
+    \ values=goo_paths/hunts
+    ^ json
+    = items
+        | values.items.map
+        \ item=hunt
+        ^ json
+        = key (goo_paths/key item.p)
+        | json/obj [(jkv "key" (json/str key)) (jkv "care" (json/str (goo_paths/word item.c)))]
+    | json/obj [(jkv "version" (json/num .false 1)) (jkv "hunts" (json/arr items))]
+  + decode
+    \ source=str
+    ^ either[str goo_paths/hunts]
+    ? (gt source.len 16384) (./err "Path selections exceed 16 KiB.")
+    ?> (./ok data _) (parse source) (./err "Invalid path selection JSON.")
+    ?> (./obj fields) data (./err "Path input must be an object.")
+    ? !(and (eq fields.len 2) (and (eq (fields.keep((\ f=jkv (eq f.k "version")))).len 1) (eq (fields.keep((\ f=jkv (eq f.k "hunts")))).len 1))) (./err "Unknown or duplicate path input fields.")
+    ? !(equal (goo_paths/field "version" data) (json/num .false 1)) (./err "Unsupported path selection version.")
+    ?> (./arr items) (goo_paths/field "hunts" data) (./err "Expected a typed hunt collection.")
+    ? (gt items.len 64) (./err "Choose at most 64 paths.")
+    % rest=row[json] items out=row[hunt] []
+    ^ either[str goo_paths/hunts]
+    ? !(rest.len) (./ok (goo_paths/hunts out))
+    = item rest.at(0)
+    ?> (./obj fields) item (./err "A hunt must be an object.")
+    ? !(and (eq fields.len 2) (and (eq (fields.keep((\ f=jkv (eq f.k "key")))).len 1) (eq (fields.keep((\ f=jkv (eq f.k "care")))).len 1))) (./err "Unknown or duplicate hunt fields.")
+    ?> (./some path) (physical_key/decode (goo_paths/text (goo_paths/field "key" item))) (./err "Invalid canonical physical path key.")
+    ?> (./some care) (goo_paths/care (goo_paths/text (goo_paths/field "care" item))) (./err "Care must be File, Folder or Subtree.")
+    ? (out.any((\ other=hunt (equal other.p path)))) (./err "Duplicate selected path.")
+    | _ rest.drop(1) out.snoc((hunt care path))
+  + covers
+    ' Folder reaches through transparent paths, but stops at the first record.
+    ' This also decides creation: an absent target is allowed only before a barrier.
+    \ grant=hunt target=path state=namespace
+    ^ bool
+    ? !(pith_prefix grant.p target) .false
+    ? (equal grant.p target) .true
+    ? grant.c
+     > .x .false
+     > .z .true
+    % depth=nat grant.p.len.inc
+    ^ bool
+    ? (ge depth target.len) .true
+    ? (maybe/is_some (sovereign_care .x target.take(depth) state).fil) .false
+    | _ depth.inc
+  + exists
+    \ target=path state=namespace
+    ^ bool
+    | gt (sovereign_care .y target state).wyt 0
+  + validate
+    \ values=goo_paths/hunts write=bool state=namespace
+    ^ either[str unit]
+    % rest=row[hunt] values.items
+    ^ either[str unit]
+    ? !(rest.len) (./ok [])
+    = item rest.at(0) name (physical_key/display item.p).fall((goo_paths/key item.p))
+    ? !(goo_paths/exists item.p state) (./err (str/cat_all [name ": path no longer exists."]))
+    ? (and (equal item.c care/x) (maybe/is_none (sovereign_care .x item.p state).fil)) (./err (str/cat_all [name ": structural paths require Folder or Subtree."]))
+    ? (and write !(state.permitted(item.p))) (./err (str/cat_all [name ": outside writable namespace authority."]))
+    | _ rest.drop(1)

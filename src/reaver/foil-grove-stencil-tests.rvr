@@ -1,0 +1,114 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Checked action synthesis against the real progression prefix.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (path xs) (map (lambda (x) ("ts" x)) xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result)
+    (error ["action-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define text
+    "#import text=lib/grove/types/text
+#import time=lib/grove/types/time
+#import lede=sys/lede
+#import content=sys/content
+#import now=sys/now
+
+parent =
+  @role
+  lede: text
+
+child =
+  @role
+  content: text
+  now: time
+
+spawn =
+  @stencil
+  #on ; %/parent
+  #for ; %/child
+  content: text
+  ! foil
+  \ text=str parent=parent stamp=nat
+  ^ child
+  | child text stamp myth/new
+")
+  (define records (ok (compile lookup ["gov" "creation"] text)))
+  (define stored (grove_fixture:lookup local (Weld types records)))
+  (define stencil (grove_fixture:record local records (path ["gov" "creation" "spawn"])))
+  (define parent (helper "stencil_parent"))
+  (define args ((helper "stencil_args") 1))
+  (define apply ((helper "export") (path ["apply"]) stencil))
+  (define expected ((abi:option policy "some") ((helper "stencil_value") 123)))
+  assert(Equal expected (apply 123 args parent))
+  assert(Equal expected ((helper "invoke_stencil") 123 args parent stencil))
+  assert(Equal (abi:option policy "none") (apply 123 ((helper "stencil_args") 0) parent))
+  assert(Equal (abi:option policy "none") (apply 123 args (abi:constructor policy ["mop" "empty"])))
+  assert(Equal (map grove_fixture:qualified (map path [["gov" "creation" "parent"] ["gov" "creation" "child"] ["sys" "content"]]))
+    ((helper "stencil_summary") stencil))
+  assert(Equal [] ((helper "action_summary") stencil))
+  ;; Only published code and metadata survive this import into a fresh compiler.
+  (define fresh (backend:prepare code))
+  (define forward (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (path ["gov" "forward_stencil"])) (parse "#import stencil=gov/creation/spawn
+
+forward =
+  ! foil
+  + apply stencil/apply
+"))))
+  (define forwarded ((helper "export") (path ["apply"]) (grove_fixture:record local forward (path ["gov" "forward_stencil" "forward"]))))
+  assert(Equal expected (forwarded 123 args parent))
+  (define (reject text)
+    assert(Eq "err" (Hd (compile stored ["gov" "bad_stencil"] text)))
+    1)
+  assert(Eq 1 (reject "#import parent=gov/creation/parent
+bad =
+  @stencil
+  #on ; %/parent
+  ! foil
+  \ parent=parent stamp=nat
+  parent
+"))
+  assert(Eq 1 (reject "#import parent=gov/creation/parent
+#import child=gov/creation/child
+bad =
+  @stencil
+  #on ; %/parent
+  #for ; %/child
+  #for ; %/child
+  ! foil
+  \ parent=parent stamp=nat
+  parent
+"))
+  assert(Eq 1 (reject "#import parent=gov/creation/parent
+#import child=gov/creation/child
+bad =
+  @stencil
+  #on ; %/parent
+  #for ; %/child
+  ! foil
+  \ parent=parent stamp=nat
+  ^ parent
+  parent
+"))
+  1)
+(#export check)
