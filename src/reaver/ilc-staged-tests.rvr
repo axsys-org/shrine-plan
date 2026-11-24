@@ -1,0 +1,89 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ilc (#module ilc))
+(#import ilc)
+(#bind structural (#module ilc-structural))
+
+;; Reject any runtime dispatch: these calls must be emitted directly, including
+;; a nested law, recursive self, a literal PAP, and the PAP's registered rule.
+(define (reject rules f df args deltas) (error "unexpected staged runtime dispatch"))
+(define (inc-rule x dx) (Ifz dx 0 (replace-change (Inc (apply-change x dx)))))
+(define (d-ifz c a b dc da db)
+  (Ifz dc (Ifz c da db)
+    (replace-change (Ifz (apply-change c dc) (apply-change a da) (apply-change b db)))))
+(define (inner x) (Inc x))
+(define (outer x) (inner (inner x)))
+(define (sum-to x) (Ifz x 0 (Add x (sum-to (Dec x)))))
+(define static-rules [[Inc inc-rule] [Ifz d-ifz]])
+(define direct (derive-staged-with-dispatch reject static-rules outer))
+assert(Equal 0 (direct 3 0))
+assert(Equal 9 (apply-change (outer 3) (direct 3 (replace-change 7))))
+assert(Equal 15 (apply-change (sum-to 2)
+  ((derive-staged-with-dispatch reject static-rules sum-to) 2 (replace-change 5))))
+(define (pap-rule x dx) (Ifz dx 0 (replace-change (Add 2 (apply-change x dx)))))
+assert(Equal 0 ((derive-staged-with-dispatch reject [[(Add 2) pap-rule]] (Add 2)) 3 0))
+assert(Equal 9 (apply-change 5 ((derive-staged-with-dispatch reject [] (Add 2)) 3 (replace-change 7))))
+
+;; Literal PAPs keep their registered rule. Captures constructed from dynamic
+;; arguments carry APP changes, even when their components happen to be zero;
+;; preserve the ordinary dispatcher's precedence rather than normalizing them.
+(define (add-two x) (Add 2 x))
+(define (add-captured offset x) (Add offset x))
+assert(Equal 0 ((derive-staged-with-dispatch reject [[(Add 2) pap-rule]] add-two) 3 0))
+assert(Equal ((derive-with [[(Add 2) pap-rule]] add-captured) 2 3 0 0)
+  ((derive-staged-with [[(Add 2) pap-rule]] add-captured) 2 3 0 0))
+assert(Equal (replace-change 6)
+  ((derive-staged-with [[(Add 2) pap-rule]] add-captured) 3 3 0 0))
+
+;; Original self can still escape unchanged: generated self is used only at
+;; known saturated call sites, never as the primal self value.
+(define self-law (Pin (Law 0 "self" 0)))
+assert(Equal self-law (apply-change (self-law 1) ((derive-staged self-law) 1 (replace-change 2))))
+(define forward-law (Law 0 "forward" (1 3 (1 (0 Inc 1) 2))))
+(define shared-law (Law 0 "shared" (1 (0 (0 Mul 1) 1) (0 (0 Add 2) 2))))
+(define cyclic-law (Law 0 "cyclic" (1 (0 (0 (0 0) 1) 2) 2)))
+(define (changed-cycle ignored)
+  (apply-change (cyclic-law 3) ((derive-staged cyclic-law) 3 (replace-change 8))))
+assert(Equal 8 (_0 (_1 (_1 (changed-cycle 0)))))
+(define (captured x) (define f (Add x)) (f x))
+(define (pair x) [x (Inc x)])
+(define (over x) ((If x Inc Dec) x))
+assert(all (lambda (f)
+  (all (lambda (n)
+    (Equal (f n) (apply-change (f 3) ((derive-staged f) 3 (replace-change n))))) [0 1 5]))
+  [forward-law shared-law captured pair over sum-to])
+
+;; An unknown callee must reach fallback. Its identity AND arity can change.
+(define (call f x) (f x))
+assert(Equal 1 (Hd (Try (lambda (z)
+  ((derive-staged-with-dispatch reject [] call) Inc 2 0 (replace-change 3))) 0)))
+assert(Equal 4 (apply-change (call Add 3)
+  ((derive-staged call) Add 3 (replace-change Inc) 0)))
+assert(Equal 7 ((apply-change (call Inc 3)
+  ((derive-staged call) Inc 3 (replace-change Add) 0)) 4))
+assert(Equal 15 (apply-change (call (Add 2) 3)
+  ((derive-staged call) (Add 2) 3 (replace-change (Mul 3)) (replace-change 5))))
+
+;; Static analysis must never execute saturated source calls or unselected
+;; branches. Even a completely static failing expression must remain lazy.
+(define (fail x) (error "unused source computation forced by staging"))
+(define (branch x) (Ifz x 19 (fail 0)))
+assert(Equal 19 (apply-change (branch 1) ((derive-staged branch) 1 (replace-change 0))))
+(define (keep x y) x)
+(define (keep-rule x y dx dy) dx)
+(define (use-keep x) (keep x (fail 0)))
+assert(Equal 9 (apply-change (use-keep 3)
+  ((derive-staged-with-dispatch reject [[keep keep-rule]] use-keep) 3 (replace-change 9))))
+assert(Equal 9 (apply-change 3
+  ((derive-staged-with [[keep keep-rule]] keep) 3 (fail 0) (replace-change 9) (fail 0))))
+assert(Equal 2 (apply-change (Div 10 0) ((derive-staged (Div 10)) 0 (replace-change 5))))
+
+;; Higher-order structural rules must stage their callbacks as well.
+(define staged-rules (structural:rules-with derive-staged-with))
+(define (mapped r) (map (lambda (x) (Mul x x)) r))
+(define dx (structural:field 1 (replace-change 9)))
+assert(Equal [1 81 9] (apply-change (mapped [1 2 3])
+  ((derive-staged-with staged-rules mapped) [1 2 3] dx)))
+(print "staged ILC dispatch tests passed")

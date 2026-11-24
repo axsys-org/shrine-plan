@@ -1,0 +1,101 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ilc (#module ilc))
+(#bind watch (#module ilc-watch))
+(#bind merkle (#module ilc-watch-merkle))
+(#bind fixture (#module ilc-watch-fixture))
+(#bind bst (#module bst))
+
+(define (check ignored)
+  (define api (fixture:create 0))
+  (define original (fixture:eyes api 8 9))
+  (define cache (merkle:specialize api original))
+  (define (same eyes cache signs)
+    (Equal (watch:observations api (watch:baseline api eyes signs))
+      (watch:observations api ((merkle:program cache) signs))))
+  assert(Equal 1 (Arity (merkle:program cache)))
+  assert(all (lambda (n)
+    (same original cache ((_2 api) (fixture:path 3)
+      ((Ix 6 api) (Mod n 3) (Mod (Div n 3) 3) (Div n 9)) (Ix 4 api))))
+    (gen 27 (lambda (i) i)))
+  assert(same original cache (Ix 4 api))
+  assert(same original cache (fixture:signs api 20 4 15 2))
+  (define special
+    ((_2 api) [] (fixture:subscribers api 5 1)
+      ((_2 api) (fixture:path 0) []
+        ((_2 api) (Weld (fixture:path 1) [("ts" "child")])
+          (Rep 0 ((Ix 7 api) (_0 (Ix 8 api)) []) 3) original))))
+  (define special-signs
+    ((_2 api) [] ((Ix 6 api) 2 1 0)
+      ((_2 api) (Weld (fixture:path 1) [("ts" "child")]) ((Ix 6 api) 2 0 0)
+        (fixture:signs api 8 8 0 2))))
+  (define special-cache (merkle:specialize api special))
+  assert(same special special-cache special-signs)
+  ;; Repeated writes coalesce; deleting a parent keeps its child; deletion
+  ;; of a missing descendant creates no ghost spine; [] is a present bucket.
+  (define edits [[(fixture:path 2) [(fixture:subscribers api 7 2)]]
+                [(fixture:path 3) 0]
+                [(fixture:path 10) [(fixture:subscribers api 4 1)]]
+                [(fixture:path 4) [[]]]
+                [(fixture:path 2) [(fixture:subscribers api 5 0)]]
+                [(fixture:path 1) 0]
+                [[("ts" "missing") ("ts" "child")] 0]
+                [[] 0]])
+  (define next (merkle:update api special-cache (watch:watch-change api edits)))
+  (define eyes2 (watch:patch-eyes api special edits))
+  assert(Equal ((_1 api) eyes2) ((_1 api) (merkle:watching next)))
+  assert(same eyes2 next special-signs)
+  assert(all (lambda (i) (same eyes2 next (fixture:signs api 12 12 i (Mod i 3)))) [0 1 2])
+  assert(Equal cache (merkle:update api cache 0))
+  assert(same eyes2 (merkle:update api cache (ilc:replace-change eyes2)) special-signs)
+  ;; A no-op batch must reuse the entire compiled root, not repartition it.
+  (define noop (merkle:update api cache (watch:watch-change api
+    [[(fixture:path 2) [(fixture:subscribers api 9 2)]]])))
+  assert(Equal [0 1 0 0] (merkle:stats noop))
+  (define absent (merkle:update api cache (watch:watch-change api
+    [[[("ts" "absent") ("ts" "child")] 0]])))
+  assert(Equal [0 1 0 0] (merkle:stats absent))
+  (define one [[(fixture:path 2) [(fixture:subscribers api 10 0)]]])
+  (define changed (merkle:update api cache (watch:watch-change api one)))
+  assert(Equal [3 0 0 1] (merkle:stats changed))
+  ;; The sibling plan is precisely the old pin after a sparse edit.
+  (define (leaf c n)
+    (bst:bst-idx ("ts" (showNat n)) (merkle:node-kids
+      (bst:bst-idx ("ts" "watched") (merkle:node-kids (_1 c))))))
+  assert(Equal (leaf cache 4) (leaf changed 4))
+  (define restored (merkle:update api changed (watch:watch-change api
+    [[(fixture:path 2) [(fixture:subscribers api 9 2)]]])))
+  assert(Equal [0 0 1 0] (merkle:stats restored))
+  assert(Equal (_1 cache) (_1 restored))
+  ;; One child revisits history while another is new: the root cannot hit.
+  (define mixed-edits [[(fixture:path 2) [(fixture:subscribers api 9 2)]]
+                      [(fixture:path 5) [(fixture:subscribers api 11 0)]]])
+  (define mixed (merkle:update api changed (watch:watch-change api mixed-edits)))
+  assert(Equal [3 0 1 1] (merkle:stats mixed))
+  assert(same (watch:patch-eyes api (merkle:watching changed) mixed-edits)
+    mixed special-signs)
+  ;; History eviction cannot discard the active tree or affect correctness.
+  (define tiny (merkle:specialize-with-limit api 0 original))
+  (define tiny-next (merkle:update api tiny (watch:watch-change api one)))
+  assert(Equal [3 0 0 1] (merkle:stats tiny-next))
+  assert(same (watch:patch-eyes api original one) tiny-next special-signs)
+  ;; API identity is part of the memo scope. Changing the fires function
+  ;; requires repartitioning even previously unchanged buckets.
+  (define silent-api (Up 5 (lambda (care sign) 0) api))
+  (define silent (merkle:update silent-api cache (watch:watch-change silent-api one)))
+  assert(Equal [] ((_1 api) (_0 ((merkle:program silent) special-signs))))
+  assert(same (Ix 4 api) (merkle:specialize api (Ix 4 api)) special-signs)
+  (define inserted (merkle:update api (merkle:specialize api (Ix 4 api))
+    (watch:watch-change api one)))
+  assert(same (watch:patch-eyes api (Ix 4 api) one) inserted special-signs)
+  ;; ILC transfers the retained specialization, without evaluating the old
+  ;; watcher input merely to manufacture a cache delta.
+  (define delta (merkle:d-specialize api (error "recomputed old watcher state")
+    (watch:watch-change api one)))
+  assert(same (watch:patch-eyes api original one)
+    (ilc:apply-change cache delta) special-signs)
+  (print "Merkle watcher specialization agrees with production react")
+  1)
+assert(check 0)

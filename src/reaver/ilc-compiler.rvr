@@ -1,0 +1,172 @@
+;; Experimental incremental Foil compiler. The reuse boundary is a module
+;; and its import subgraph, not an individual typechecking judgement.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#bind rex (#module rex))
+(#bind rx (#module foil-rex))
+(#bind source (#module foil-source))
+(#bind sast (#module foil-sast))
+(#bind driver (#module foil-new-env))
+(#bind context (#module foil-context))
+(#bind lore (#module foil-lore))
+(#bind pe (#module pe))
+(#bind ilc (#module ilc))
+
+;; Forest: BST name -> [maybe-text normalized-Rex-pin import-names]. Keeping
+;; text optional avoids silently applying byte offsets to stale text after a
+;; structural Rex edit. Spans are retained in cache keys and diagnostics.
+(define (document text tree)
+  (define normalized (source:new-imports tree))
+  [text (Pin normalized)
+   (map driver:import-module
+     (filter driver:mod-import? (sast:parse-module-sast 0 normalized)))])
+(define (text-document text) (document [text] (rex:ParseRexNormFile text)))
+(define (from-texts pairs)
+  (foldl (lambda (out pair)
+    (If (bst:bst-idx (_0 pair) out) (error ["duplicate compiler source" (_0 pair)])
+      (bst:bst-insert (_0 pair) (text-document (_1 pair)) out))) 0 pairs))
+(define (get-document name forest)
+  (define hit (bst:bst-idx name forest))
+  (If hit hit (error ["missing compiler source" name])))
+(define (seal doc)
+  (If (_1 doc) doc (text-document (_0 (_0 doc)))))
+(define (kids tree)
+  (cond ((rx:rx-nest? tree) (rx:rx-nest-kids tree))
+        ((rx:rx-juxt? tree) (rx:rx-juxt-kids tree))
+        (else (error "rex_diff descends through a leaf"))))
+(define (replace-rex tree path replacement)
+  (Ifz path replacement
+    (let ((children (kids tree)) (index (_0 path)))
+      (If (Or (Nil (IsNat index)) (Ge index (Sz children)))
+        (error ["rex_diff child out of range" index])
+        (Up (If (rx:rx-nest? tree) 3 1)
+          (Up index (replace-rex (Ix index children) (drop 1 path) replacement) children)
+          tree)))))
+
+;; Sequential batch edits:
+;; ["text" name byte-offset delete-bytes inserted-text]
+;; ["rex" name child-index-path replacement-normalized-Rex]
+;; ["set-text" name text] / ["set-rex" name tree] / ["delete" name]
+;; Text splices in the same batch are coalesced before parsing. Positions are
+;; relative to the previous edit, not all to the batch's original document.
+(define (edit-one forest edit)
+  (define tag (_0 edit))
+  (define name (_1 edit))
+  (define doc (get-document name forest))
+  (define next
+    (cond
+      ((Equal tag "set-text") [[(_2 edit)] 0 []])
+      ((Equal tag "set-rex") (document 0 (_2 edit)))
+      ((Equal tag "delete") 0)
+      ((Equal tag "rex")
+        (document 0 (replace-rex (Unpin (_1 (seal doc))) (_2 edit) (_3 edit))))
+      ((Equal tag "text")
+        (define text (_0 (_0 doc)))
+        (define offset (_2 edit))
+        (define remove (_3 edit))
+        (Ifz (_0 doc) (error ["text unavailable after rex_diff" name])
+          (If (Or (Gt offset (Bytes text)) (Gt remove (Sub (Bytes text) offset)))
+            (error ["text_diff range out of bounds" name offset remove])
+            [[(strcat [(lore:str-slice 0 offset text) (_4 edit)
+                       (lore:str-drop (Add offset remove) text)])] 0 []])))
+      (else (error ["unknown compiler edit" tag]))))
+  (bst:bst-insert name next forest))
+(define (patch forest edits)
+  (define changed (foldl edit-one forest edits))
+  (foldl (lambda (out name)
+    (define doc (bst:bst-idx name out))
+    (Ifz doc out (bst:bst-insert name (seal doc) out)))
+    changed (uniq (map _1 edits))))
+(define (change edits) (Ifz edits 0 (ilc:custom-change patch edits)))
+(define (text-diff name offset remove inserted) ["text" name offset remove inserted])
+(define (rex-diff name path replacement) ["rex" name path replacement])
+
+;; Config = [publication-context requested-module-roots history-entry-limit].
+;; Public roots, nominal moments, artifacts, owner and compiler selection all
+;; participate in identity. Only the graph-wide *source* token is replaced by
+;; each module's own source/dependency key. No nominal revisions are invented.
+(define (config ctx roots limit) [(context:require-context ctx) roots limit])
+(define (compile-one template key name tree dependencies)
+  (define ctx (Up 2 key template))
+  (define (import cache imported)
+    (define pin (bst:bst-idx imported dependencies))
+    (If pin [cache (Unpin pin)] (error ["unresolved incremental import" imported])))
+  (define result (Try (lambda (z)
+    (define built (driver:compile-inner ctx import driver:empty-foil-cache name tree))
+    (DeepSeq built (_1 built))) 0))
+  (If (Eq 1 (Hd result)) (error ["foil-in-module" name (_0 result)]) (_0 result)))
+(define (scope cfg)
+  (Pin [compile-one driver:compile-context pe:partial-eval
+        (Up 2 (Pin 0) (_0 cfg))]))
+
+;; Walk state = [completed-name->artifact-pin history [compiled hits external]].
+;; Every source module key includes exact dependency artifact pins. An edit
+;; therefore invalidates transitive importers even when their Rex is unchanged.
+;; The graph walk is still O(reachable modules); expensive compiler work is
+;; skipped. There is no process-global memo to hide work between trials.
+(define (walk cfg forest kernel identity stack state name)
+  (define done (bst:bst-idx name (_0 state)))
+  (cond
+    (done state)
+    ((includes (Equal name) stack) (error ["foil-import-cycle" (snoc name stack)]))
+    ((context:artifact (_0 cfg) name)
+      (define result (driver:compile-context (_0 cfg)
+        (lambda (n) (error ["unexpected artifact source read" n]))
+        driver:empty-foil-cache name))
+      [(bst:bst-insert name (Pin (_1 result)) (_0 state)) (_1 state)
+       (Up 2 (Inc (_2 (_2 state))) (_2 state))])
+    (else
+      (define doc (get-document name forest))
+      (define ready (foldl (walk cfg forest kernel identity (snoc name stack)) state (_2 doc)))
+      (define dependencies (map (lambda (n) [n (bst:bst-idx n (_0 ready))]) (_2 doc)))
+      (define key (Pin [identity name (_1 doc) dependencies]))
+      (define hit (bst:bst-idx key (_1 ready)))
+      (define artifact (If hit hit
+        (Pin (kernel key name (Unpin (_1 doc))
+          (bst:bst-from-pairs-row dependencies)))))
+      [(bst:bst-insert name artifact (_0 ready))
+       (If hit (_1 ready) (bst:bst-insert key artifact (_1 ready)))
+       (Up (If hit 1 0) (Inc (Ix (If hit 1 0) (_2 ready))) (_2 ready))])))
+
+;; Cache = [forest artifacts history scope kernel stats]. Root selection is
+;; not in module keys: requesting another root may reuse compatible modules.
+(define (build cfg forest history)
+  (define kernel (pe:partial-eval (compile-one (_0 cfg))))
+  (define identity (scope cfg))
+  (define result (foldl (walk cfg forest kernel identity []) [0 history [0 0 0]] (_1 cfg)))
+  (DeepSeq result [forest (_0 result) (_1 result) identity kernel (_2 result)]))
+(define (specialize cfg forest) (build cfg forest 0))
+(define (sources cache) (_0 cache))
+(define (stats cache) (_5 cache))
+(define (artifact cache name)
+  (define pin (bst:bst-idx name (_1 cache)))
+  (If pin (Unpin pin) (error ["module not compiled" name])))
+(define (patch-cache cfg old edits)
+  (define history (If (And (Equal (scope cfg) (_3 old))
+    (Le (bst:bst-sz (_2 old)) (_2 cfg))) (_2 old) 0))
+  (build cfg (patch (sources old) edits) history))
+(define (d-specialize cfg forest dx)
+  (cond ((Nil dx) 0)
+    ((And (Equal (Hd dx) "ILC_CUSTOM") (Equal (_0 dx) patch))
+      (ilc:custom-change (patch-cache cfg) (_1 dx)))
+    (else (ilc:replace-change (specialize cfg (ilc:apply-change forest dx))))))
+(define (update cfg old dx)
+  (ilc:apply-change old
+    (ilc:differentiate-with [[(specialize cfg) (d-specialize cfg)]]
+      (specialize cfg) (sources old) dx)))
+
+;; Reference: the ordinary production driver, no incremental reuse. Its
+;; graph-wide source context has different bookkeeping from per-module keys;
+;; compare exported behavior/types/diagnostics, not those provenance tokens.
+(define (production cfg forest)
+  (define ctx (Up 2 (Pin forest) (_0 cfg)))
+  (define (read name) (Unpin (_1 (get-document name forest))))
+  (define result (foldl (lambda (acc name)
+    (driver:compile-with ctx read (_0 acc) name)) [driver:empty-foil-cache 0] (_1 cfg)))
+  (foldl (lambda (out perc) (bst:bst-insert (driver:perc-name perc) (Pin perc) out))
+    0 (driver:cache-results (_0 result))))
+(#export config from-texts get-document patch change text-diff rex-diff
+ specialize update sources stats artifact production d-specialize replace-rex)

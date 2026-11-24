@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Profile retained ILC phases in a frozen copy; optionally sample our own Wisp process."""
+import argparse
+from collections import Counter, defaultdict
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import test_runner as runner
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'))
+    p.add_argument('--variant', choices=['original', 'updates-only', 'input-forced', 'reconstructed', 'detached', 'benchmark'], default='original')
+    p.add_argument('--depth', type=int, default=3)
+    p.add_argument('--updates', type=int, default=8)
+    p.add_argument('--timeout', type=float, default=180)
+    p.add_argument('--counts', action='store_true', help='instrument cache/code-generation events in the disposable source copy')
+    p.add_argument('--native-sample', action='store_true')
+    p.add_argument('--sample-phase', default='reset', help='phase label to sample, e.g. timed.retained for benchmark')
+    p.add_argument('--no-trace', action='store_true', help='time phases without JSON store/zone tracing')
+    a = p.parse_args()
+    if not a.wisp or not os.access(a.wisp, os.X_OK) or not 0 <= a.depth <= 8 or a.updates < 0 or a.timeout <= 0:
+        p.error('executable WISP, depth 0..8, nonnegative updates, positive timeout required')
+    wisp = str(Path(a.wisp).resolve())
+    template = runner.stage(wisp, False, a.timeout)
+    root = Path(tempfile.mkdtemp(prefix='profile-ilc-retained-', dir=runner.ROOT/'.check'))
+    runner.copy_template(template, root/'snap')
+    shutil.copytree(runner.ROOT/'src', root/'src')
+    if a.counts:
+        path = root/'src/reaver/ilc-retained.rvr'
+        text = path.read_text()
+        changes = [
+            ('  [(_0 inner) ("ILC_CALL" children inner)])',
+             '  (Seq (print ("RETAINED-COUNT" "call-init" "")) [(_0 inner) ("ILC_CALL" children inner)]))'),
+            ('  [(_0 result) [(_0 (_1 result)) ("ILC_CALL" (map _1 updates) (_1 result))]])',
+             '  (Seq (print ("RETAINED-COUNT" "call-step" "")) [(_0 result) [(_0 (_1 result)) ("ILC_CALL" (map _1 updates) (_1 result))]]))'),
+        ]
+        for before, after in changes:
+            if text.count(before) != 1:
+                raise RuntimeError('cache counter probe needs updating')
+            text = text.replace(before, after)
+        for function, stop, arity in [('law-init', '(define (law-step', 0),
+                                      ('law-step', ';; A changed callee', 2)]:
+            begin = text.index('(define ('+function+' ')
+            end = text.index(stop, begin)
+            block = text[begin:end]
+            old = f'  (Law {arity} '
+            if block.count(old) != 1:
+                raise RuntimeError('law construction probe needs updating')
+            block = block.replace(old, f'  (Seq (print ("RETAINED-COUNT" "{function}" (Name law)))\n    (Law {arity} ', 1)
+            block = block.rstrip()+')\n'
+            text = text[:begin]+block+text[end:]
+        # Observe compilation without forcing a source result or a cache trace.
+        before = '(define (compile rules f)\n'
+        start = text.index(before)
+        end = text.index('\n;; Public API', start)
+        block = text[start:end]
+        block = block.replace('  (cond\n', '  (Seq (print ("RETAINED-COUNT" "compile" (If (IsLaw law) (Name law) "PAP-or-primitive")))\n    (cond\n', 1)
+        block = block.rstrip() + ')\n'
+        text = text[:start] + block + text[end:]
+        path.write_text(text)
+    source = f'(#bind profile (#module ilc-retained-profile))\n(profile:run "{a.variant}" {a.depth} {a.updates})\n'
+    if a.variant == 'benchmark':
+        path = root/'src/reaver/ilc-retained-bench.rvr'
+        text = path.read_text()
+        old = '(define start (Now 0))'
+        if text.count(old) != 2:
+            raise RuntimeError('benchmark probe needs updating')
+        text = text.replace(old, '(define start (Seq (print ("PROFILE-START" (strWeld "timed." mode))) (Now 0)))', 1)
+        text = text.replace(old, '(define start (Seq (print ("PROFILE-START" (strWeld "init." mode))) (Now 0)))', 1)
+        path.write_text(text)
+        source = f'(#bind bench (#module ilc-retained-bench))\n(bench:run 1 {a.updates} [{a.depth}])\n'
+    (root/'input.rvr').write_text(source)
+    print('Profile artifacts: '+str(root), flush=True)
+    command = [wisp] + ([] if a.no_trace else ['--profile-json', str(root/'trace.json')])
+    command += ['--file-root', str(root/'src'), 'snap', 'root', '_']
+    sampled = False
+    sampler = None
+    begun = time.monotonic()
+    with (root/'out.log').open('w') as out, (root/'sample-command.log').open('w') as sample_log:
+        with subprocess.Popen(command, cwd=root, stdin=subprocess.PIPE, stdout=out, stderr=out,
+                              text=True, start_new_session=True) as proc:
+            try:
+                (root/'pid').write_text(str(proc.pid))
+                proc.stdin.write(source)
+                proc.stdin.close()
+                while proc.poll() is None:
+                    if time.monotonic()-begun > a.timeout:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                        raise RuntimeError('profile timed out: '+str(root))
+                    if a.native_sample and not sampled and f'("PROFILE-START" "{a.sample_phase}")' in (root/'out.log').read_text(errors='replace'):
+                        sampled = True
+                        sampler = subprocess.Popen(['/usr/bin/sample', str(proc.pid), '3', '1', '-file', str(root/'sample.txt')],
+                                                   stdout=sample_log, stderr=sample_log)
+                    time.sleep(.05)
+                code = proc.returncode
+            except BaseException:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                if sampler and sampler.poll() is None:
+                    sampler.terminate()
+                    sampler.wait()
+                raise
+        if sampler:
+            sampler.wait(timeout=30)
+    log = (root/'out.log').read_text(errors='replace')
+    marker = '"RETAINED-BENCH-DONE"' if a.variant == 'benchmark' else '"RETAINED-PROFILE-DONE"'
+    if code or runner.ERROR.search(log) or marker not in log:
+        raise RuntimeError('profile failed: '+str(root/'out.log'))
+    phases = []
+    for m in re.finditer(r'^\("PROFILE-END"\s+'+runner.ATOM+r'\s+'+runner.ATOM+r'\)', log, re.M):
+        label, ns = [runner.decode_atom(x) for x in m.groups()]
+        phases.append(dict(phase=label, ns=int(ns)))
+    if a.variant == 'benchmark':
+        for m in re.finditer(r'^\("RETAINED-INIT"\s+'+r'\s+'.join([runner.ATOM]*3)+r'\)', log, re.M):
+            depth, mode, ns = [runner.decode_atom(x) for x in m.groups()]
+            phases.append(dict(phase='init.'+mode, ns=int(ns)))
+        for m in re.finditer(r'^\("RETAINED-BENCH"\s+'+r'\s+'.join([runner.ATOM]*6)+r'\)', log, re.M):
+            depth, mode, sample, units, ns, checksum = [runner.decode_atom(x) for x in m.groups()]
+            if int(checksum) != a.updates or int(units) != a.updates:
+                raise RuntimeError('invalid benchmark checksum')
+            phases.append(dict(phase='timed.'+mode, ns=int(ns), updates=int(units)))
+    if not any(r['phase'] in ('reset', 'init.reset') for r in phases):
+        raise RuntimeError('missing reset measurement')
+    counts = defaultdict(Counter)
+    names = defaultdict(Counter)
+    current = 'setup'
+    event = re.compile(r'^\("(PROFILE-START|PROFILE-END|RETAINED-COUNT)"\s+'+runner.ATOM+r'(?:\s+'+runner.ATOM+r')?\)', re.M)
+    for m in event.finditer(log):
+        tag, first, second = m.groups()
+        first = runner.decode_atom(first)
+        if tag == 'PROFILE-START':
+            current = first
+        elif tag == 'PROFILE-END':
+            current = 'outside-phases'
+        else:
+            counts[current][first] += 1
+            if first in ('compile', 'law-init', 'law-step'):
+                names[current+' / '+first][runner.decode_atom(second)] += 1
+    report = dict(variant=a.variant, depth=a.depth, updates=a.updates, phases=phases,
+                  runtime=wisp, runtime_sha256=hashlib.sha256(Path(wisp).read_bytes()).hexdigest(),
+                  sources={f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in (root/'src/reaver').glob('*.rvr')},
+                  wall_seconds=time.monotonic()-begun, counts_enabled=a.counts,
+                  counts=dict(counts), compilation_names=dict(names),
+                  trace_enabled=not a.no_trace, native_sample_requested=a.native_sample, sample_phase=a.sample_phase,
+                  native_sample_exit=None if sampler is None else sampler.returncode)
+    (root/'results.json').write_text(json.dumps(report, indent=2)+'\n')
+    for row in phases:
+        print(f'{row["phase"]:22} {row["ns"]/1e6:12.3f} ms')
+    if sampler and sampler.returncode:
+        print('Native sampler failed; see '+str(root/'sample-command.log'))
+    print('Report: '+str(root/'results.json'))
+
+
+if __name__ == '__main__':
+    main()

@@ -148,7 +148,7 @@
 (define (apply-args f args)
   (foldl (lambda (fn arg) (fn arg)) f args))
 
-(define (change-call rules f df args deltas)
+(define (change-call-with recur rules f df args deltas)
   (define rule (find-rule rules f))
   (define law (If (IsPin f) (Unpin f) f))
   (cond
@@ -156,14 +156,16 @@
       (apply-args (apply-args (_0 rule) args) deltas))
     ;; Peeling APP deltas transports changes to already captured arguments.
     ((And (IsApp f) (Or (Nil df) (Equal (Hd df) "ILC_APP")))
-      (change-call rules (Init f) (Ifz df 0 (_0 df))
+      (recur rules (Init f) (Ifz df 0 (_0 df))
         (cons (Last f) args) (cons (Ifz df 0 (_1 df)) deltas)))
     ((And (Nil df) (IsLaw law))
-      (apply-args (apply-args (Memo (make-derivative rules change-call) f) args) deltas))
+      (apply-args (apply-args (Memo (make-derivative rules recur) f) args) deltas))
     ;; Includes changed function values and primitive pins. Recompute only
     ;; the updated call, not the old result; that is essential for laziness.
     (else
       (replace-change (apply-args (apply-change f df) (changed-args args deltas))))))
+(define (change-call rules f df args deltas)
+  (change-call-with change-call rules f df args deltas))
 
 ;; Unary application, including one step of a curried/multi-argument function.
 ;; (differentiate f x) itself is a function from dx to the output change.
@@ -173,22 +175,136 @@
 
 ;; Compile a whole callable: (derive f) x1 .. xn dx1 .. dxn -> delta-result.
 ;; For a PAP/primitive/rule, generate an adapter to the same application rule.
-;; A bare law is transformed immediately; derived laws are memoized.
-(define (derive-with rules f)
+;; A bare law is transformed immediately. Memo is only an optimization request:
+;; the current native runtime does not cache these PAP-keyed, law-valued calls.
+(define (derive-with-dispatch dispatch rules f)
   (define arity (pe:plan-arity f))
   (define law (If (IsPin f) (Unpin f) f))
   (Ifz arity (error ["ilc: derive expects a callable" f])
     (If (And (IsLaw law) (Nil (find-rule rules f)))
-      (Memo (make-derivative rules change-call) f)
+      (Memo (make-derivative rules dispatch) f)
       (Law (Dec (Mul 2 arity)) "delta-call"
-        (body-apply (pe:law-quote change-call)
+        (body-apply (pe:law-quote dispatch)
           [(pe:law-quote rules) (pe:law-quote f) (pe:law-quote 0)
            (body-apply (pe:law-quote 0) (gen arity Inc))
            (body-apply (pe:law-quote 0)
              (gen arity (lambda (i) (Add arity (Inc i)))))])))))
+(define (derive-with rules f) (derive-with-dispatch change-call rules f))
 (define (derive f) (derive-with [] f))
+
+;; Staged dispatch. Only literal heads and original self are known unchanged.
+;; No saturated source call is evaluated by this analysis. Let-bound/dynamic
+;; heads keep runtime dispatch; their callees may change identity or arity.
+(define (call-spine depth body)
+  (If (body-call? depth body)
+    (let ((spine (call-spine depth (_0 body))))
+      [(_0 spine) (Weld (_1 spine) [(_1 body)])])
+    [body []]))
+(define (static-head owner depth head)
+  (If (pe:law-var? depth head) (Ifz head [owner] 0)
+    [(body-const head)]))
+
+;; All arguments here are law-body expressions, never source values to force.
+;; A registered PAP rule wins before peeling its immutable captures, just as
+;; in the ordinary dispatcher. Calls to self use the generated law's self slot.
+(define (staged-known-call build rules dispatch owner f args deltas)
+  (define rule (find-rule rules f))
+  (define law (If (IsPin f) (Unpin f) f))
+  (cond
+    (rule (body-apply (pe:law-quote (_0 rule)) (Weld args deltas)))
+    ((IsApp f)
+      (staged-known-call build rules dispatch owner (Init f)
+        (cons (pe:law-quote (Last f)) args) (cons (pe:law-quote 0) deltas)))
+    ((IsLaw law)
+      (body-apply
+        (If (Equal f owner) 0
+          (pe:law-quote (Memo (build rules dispatch) f)))
+        (Weld args deltas)))
+    (else
+      (body-apply (pe:law-quote replace-change)
+        [(body-apply (pe:law-quote f)
+          (gen (Sz args) (lambda (i)
+            (body-apply (pe:law-quote apply-change) [(Ix i args) (Ix i deltas)]))))]))))
+
+(define (staged-delta-body build rules dispatch owner arity depth body)
+  (define (delta b) (staged-delta-body build rules dispatch owner arity depth b))
+  (define (primal b) (primal-body owner arity depth b))
+  (define (dynamic-call b)
+    (body-apply (pe:law-quote derive-apply)
+      [(pe:law-quote rules) (pe:law-quote dispatch)
+       (primal (_0 b)) (delta (_0 b))
+       (primal (_1 b)) (delta (_1 b))]))
+  (cond
+    ((pe:law-var? depth body)
+      (Ifz body (pe:law-quote 0) (delta-ref arity body)))
+    ((body-call? depth body)
+      (define spine (call-spine depth body))
+      (define known (static-head owner depth (_0 spine)))
+      (define args (_1 spine))
+      (define n (If known (pe:plan-arity (_0 known)) 0))
+      (cond
+        ((And known (And n (Eq (Sz args) n)))
+          (staged-known-call build rules dispatch owner (_0 known)
+            (map primal args) (map delta args)))
+        ;; Known unsaturated applications and constructor spines cannot invoke
+        ;; a law yet. Preserve captured argument deltas without arity dispatch.
+        ((And known (Or (Nil n) (Lt (Sz args) n)))
+          (body-apply (pe:law-quote app-change) [(delta (_0 body)) (delta (_1 body))]))
+        ;; Includes overapplication: its saturated prefix is staged recursively,
+        ;; but the returned function must still be dispatched at runtime.
+        (else (dynamic-call body))))
+    (else (pe:law-quote 0))))
+
+(define (make-staged-derivative rules dispatch f)
+  (define law (If (IsPin f) (Unpin f) f))
+  (define arity (Arity law))
+  (define parts (split-body (Body law)))
+  (define binds (_0 parts))
+  (define depth (Add arity (Sz binds)))
+  (define (primal body) (primal-body f arity depth body))
+  (define (delta body) (staged-delta-body make-staged-derivative rules dispatch f arity depth body))
+  (Law (Dec (Mul 2 arity)) (strWeld "staged-delta-" (Name law))
+    (foldr (lambda (body rest) (1 (primal body) (1 (delta body) rest)))
+      (delta (_1 parts)) binds)))
+
+;; Unknown callees still get staged derivatives when they resolve to laws.
+(define (staged-change-call-with recur rules f df args deltas)
+  (define rule (find-rule rules f))
+  (define law (If (IsPin f) (Unpin f) f))
+  (cond
+    ((And (Nil df) rule)
+      (apply-args (apply-args (_0 rule) args) deltas))
+    ;; Peeling APP deltas transports changes to already captured arguments.
+    ((And (IsApp f) (Or (Nil df) (Equal (Hd df) "ILC_APP")))
+      (recur rules (Init f) (Ifz df 0 (_0 df))
+        (cons (Last f) args) (cons (Ifz df 0 (_1 df)) deltas)))
+    ((And (Nil df) (IsLaw law))
+      (apply-args (apply-args (Memo (make-staged-derivative rules recur) f) args) deltas))
+    ;; Includes changed function values and primitive pins. Recompute only
+    ;; the updated call, not the old result; that is essential for laziness.
+    (else
+      (replace-change (apply-args (apply-change f df) (changed-args args deltas))))))
+(define (staged-change-call rules f df args deltas)
+  (staged-change-call-with staged-change-call rules f df args deltas))
+(define (derive-staged-with-dispatch dispatch rules f)
+  (define arity (pe:plan-arity f))
+  (define law (If (IsPin f) (Unpin f) f))
+  (Ifz arity (error ["ilc: derive expects a callable" f])
+    (If (And (IsLaw law) (Nil (find-rule rules f)))
+      (Memo (make-staged-derivative rules dispatch) f)
+      (Law (Dec (Mul 2 arity)) "staged-delta-call"
+        (staged-known-call make-staged-derivative rules dispatch 0 f
+          (gen arity Inc)
+          (gen arity (lambda (i) (Add arity (Inc i)))))))))
+(define (derive-staged-with rules f)
+  (derive-staged-with-dispatch staged-change-call rules f))
+(define (derive-staged f) (derive-staged-with [] f))
 
 (#export
  differentiable plan-changes
  replace-change app-change custom-change apply-change diff-change nil-change compose-change
- differentiate differentiate-with derive derive-with)
+ differentiate differentiate-with derive derive-with
+ derive-staged derive-staged-with
+ ;; Instrumentation hook: dispatch must preserve change-call-with's behavior.
+ derive-with-dispatch change-call-with
+ derive-staged-with-dispatch staged-change-call-with)

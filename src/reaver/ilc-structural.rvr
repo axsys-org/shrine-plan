@@ -1,0 +1,163 @@
+;; Generic product changes and primitive derivatives. No compiler/typechecker
+;; functions appear in this rule table. Only fixed-shape product edits are
+;; represented sparsely; unknown changes conservatively use replacement.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ilc (#module ilc))
+
+(define (patch-fields old changes)
+  (foldl (lambda (out edit)
+    (define index (_0 edit))
+    (If (Or (Nil (IsNat index)) (Ge index (Sz out)))
+      (error ["ILC field out of bounds" index])
+      (Up index (ilc:apply-change (Ix index out) (_1 edit)) out))) old changes))
+(define (fields changes)
+  (define indexes (map _0 changes))
+  (If (Ne (Sz indexes) (Sz (uniq indexes))) (error "duplicate ILC field")
+    (Ifz changes 0 (ilc:custom-change patch-fields changes))))
+(define (field index delta) (Ifz delta 0 (fields [[index delta]])))
+(define (at-path path delta)
+  (Ifz path delta (field (_0 path) (at-path (drop 1 path) delta))))
+(define (fields? delta)
+  (And (Equal (Hd delta) "ILC_CUSTOM") (Equal (_0 delta) patch-fields)))
+
+;; An APP delta preserves a data constructor when its ultimate head delta is
+;; zero. Do not apply this shortcut to PAPs: a changed head can saturate a call.
+(define (fixed-head? delta)
+  (Or (Nil delta) (And (Equal (Hd delta) "ILC_APP") (fixed-head? (_0 delta)))))
+(define (product? old delta)
+  (Or (fields? delta) (And (IsNat (Hd old)) (fixed-head? delta))))
+(define (project old delta index)
+  (cond
+    ((Nil delta) 0)
+    ((fields? delta)
+      (define found (find (lambda (edit) (Eq index (_0 edit))) (_1 delta)))
+      (If found (_1 (_0 found)) 0))
+    ((And (Equal (Hd delta) "ILC_APP") (product? old delta))
+      (If (Eq index (Dec (Sz old))) (_1 delta)
+        (project (Init old) (_0 delta) index)))
+    (else (ilc:replace-change (Ix index (ilc:apply-change old delta))))))
+(define (d-ix index value di dv)
+  (Ifz di (project value dv index)
+    (ilc:replace-change (Ix (ilc:apply-change index di) (ilc:apply-change value dv)))))
+(define (d-hd value dv)
+  (If (Or (Nil dv) (product? value dv)) 0
+    (ilc:replace-change (Hd (ilc:apply-change value dv)))))
+(define (d-sz value dv)
+  (If (Or (Nil dv) (product? value dv)) 0
+    (ilc:replace-change (Sz (ilc:apply-change value dv)))))
+(define (d-shape f value dv)
+  (If (Or (Nil dv) (product? value dv)) 0
+    (ilc:replace-change (f (ilc:apply-change value dv)))))
+(define (d-project index value dv) (project value dv index))
+(define (d-unary f a da)
+  (Ifz da 0 (ilc:replace-change (f (ilc:apply-change a da)))))
+(define (d-binary f a b da db)
+  (If (And (Nil da) (Nil db)) 0
+    (ilc:replace-change (f (ilc:apply-change a da) (ilc:apply-change b db)))))
+(define (d-if c a b dc da db)
+  (Ifz dc (If c da db)
+    (ilc:replace-change (If (ilc:apply-change c dc)
+      (ilc:apply-change a da) (ilc:apply-change b db)))))
+(define (d-ifz c a b dc da db) (d-if c b a dc db da))
+(define (d-and a b da db) (d-if a b 0 da db 0))
+(define (d-or a b da db) (d-if a a b da da db))
+(define (d-case3 c a b d dc da db dd)
+  (Ifz dc (Case3 c da db dd)
+    (ilc:replace-change (Case3 (ilc:apply-change c dc)
+      (ilc:apply-change a da) (ilc:apply-change b db) (ilc:apply-change d dd)))))
+(define (d-case4 c a b d e dc da db dd de)
+  (Ifz dc (Case4 c da db dd de)
+    (ilc:replace-change (Case4 (ilc:apply-change c dc)
+      (ilc:apply-change a da) (ilc:apply-change b db)
+      (ilc:apply-change d dd) (ilc:apply-change e de)))))
+(define (d-seq a b da db) (Seq (ilc:apply-change a da) db))
+(define (d-deepseq a b da db) (DeepSeq (ilc:apply-change a da) db))
+(define (d-seq2 a b c da db dc)
+  (Seq2 (ilc:apply-change a da) (ilc:apply-change b db) dc))
+
+;; Internally constructed field lists have distinct indices by construction.
+(define (indexed-fields n f)
+  (Ifz n 0 (ilc:custom-change patch-fields (gen n (lambda (i) [i (f i)])))))
+(define (d-last value dv)
+  (If (Or (Nil dv) (product? value dv)) (project value dv (Dec (Sz value)))
+    (ilc:replace-change (Last (ilc:apply-change value dv)))))
+(define (d-init value dv)
+  (Ifz dv 0
+    (If (product? value dv) (indexed-fields (Dec (Sz value)) (project value dv))
+      (ilc:replace-change (Init (ilc:apply-change value dv))))))
+(define (d-up index value row di dv dr)
+  (If (And (Nil di) (And (Lt index (Sz row)) (Or (Nil dr) (product? row dr))))
+    (If (And (Nil dv) (Nil dr)) 0
+      (indexed-fields (Sz row) (lambda (i) (If (Eq i index) dv (project row dr i)))))
+    (ilc:replace-change (Up (ilc:apply-change index di)
+      (ilc:apply-change value dv) (ilc:apply-change row dr)))))
+(define (d-coup head row dh dr)
+  (If (And (Nil dh) (And (IsNat head) (Or (Nil dr) (product? row dr))))
+    (Ifz dr 0 (indexed-fields (Sz row) (project row dr)))
+    (ilc:replace-change (Coup (ilc:apply-change head dh) (ilc:apply-change row dr)))))
+(define (d-weld a b da db)
+  (If (And (Nil da) (Nil db)) 0
+    (If (And (Or (Nil da) (product? a da)) (Or (Nil db) (product? b db)))
+      (indexed-fields (Add (Sz a) (Sz b)) (lambda (i)
+        (If (Lt i (Sz a)) (project a da i) (project b db (Sub i (Sz a))))))
+      (ilc:replace-change (Weld (ilc:apply-change a da) (ilc:apply-change b db))))))
+(define (d-slice offset count row do dc dr)
+  (If (And (Nil do) (And (Nil dc) (Or (Nil dr) (product? row dr))))
+    (Ifz dr 0 (indexed-fields (Sz (Slice offset count row))
+      (lambda (i) (project row dr (Add offset i)))))
+    (ilc:replace-change (Slice (ilc:apply-change offset do)
+      (ilc:apply-change count dc) (ilc:apply-change row dr)))))
+(define (list-project xs dx index)
+  (Ifz dx 0 (Ifz index (project xs dx 0)
+    (list-project (_1 xs) (project xs dx 1) (Dec index)))))
+(define (d-row head count xs dh dn dx)
+  (If (And (Nil dh) (And (Nil dn) (IsNat head)))
+    (Ifz dx 0 (indexed-fields count (list-project xs dx)))
+    (ilc:replace-change (Row (ilc:apply-change head dh)
+      (ilc:apply-change count dn) (ilc:apply-change xs dx)))))
+
+(define primitive-rules
+  (Weld [[Ix d-ix] [Hd d-hd] [Sz d-sz] [If d-if] [Ifz d-ifz]
+         [And d-and] [Or d-or] [Case3 d-case3] [Case4 d-case4]
+         [Ix0 (d-project 0)] [Ix1 (d-project 1)] [Ix2 (d-project 2)]
+         [Ix3 (d-project 3)] [Ix4 (d-project 4)] [Ix5 (d-project 5)]
+         [Ix6 (d-project 6)] [Ix7 (d-project 7)]
+         [Init d-init] [Last d-last] [Up d-up] [Coup d-coup]
+         [Weld d-weld] [Slice d-slice] [Row d-row]
+         [IsApp (d-shape IsApp)] [IsNat (d-shape IsNat)]
+         [IsPin (d-shape IsPin)] [IsLaw (d-shape IsLaw)] [Type (d-shape Type)]
+         [Truth (d-shape Truth)] [Nil (d-shape Nil)]
+         [Seq d-seq] [DeepSeq d-deepseq] [Seq2 d-seq2]]
+    (Weld (map (lambda (f) [f (d-unary f)])
+      [Inc Dec])
+      (map (lambda (f) [f (d-binary f)])
+        [Eq Equal Ne Cmp Lt Le Gt Ge Add Sub Mul Div Mod]))))
+
+;; These are reusable higher-order collection rules. The mapper itself is
+;; differentiated by generic ILC; its implementation is not replaced/cached.
+(define (call f x) (f x))
+(define (d-gen derive get-rules count f dn df)
+  (define d-call (derive (Memo get-rules 0) call))
+  (Ifz dn
+    (Ifz df 0
+      (indexed-fields count (lambda (i)
+        (d-call f i df 0))))
+    (ilc:replace-change (gen (ilc:apply-change count dn) (ilc:apply-change f df)))))
+(define (d-map derive get-rules f xs df dx)
+  (define d-call (derive (Memo get-rules 0) call))
+  (If (And (Nil df) (Nil dx)) 0
+    (If (Or (Nil dx) (product? xs dx))
+      (indexed-fields (Sz xs) (lambda (i)
+        (define di (project xs dx i))
+        (If (And (Nil df) (Nil di)) 0
+          (d-call f (Ix i xs) df di))))
+      (ilc:replace-change (map (ilc:apply-change f df) (ilc:apply-change xs dx))))))
+(define (make-rules derive ignored)
+  (Weld primitive-rules [[gen (d-gen derive (make-rules derive))]
+                        [map (d-map derive (make-rules derive))]]))
+(define (rules-with derive) (make-rules derive 0))
+(define rules (rules-with ilc:derive-with))
+(#export fields field at-path project rules rules-with)

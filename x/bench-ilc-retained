@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Compare full checking, staged ILC, and retained intermediate computations."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import statistics
+import tempfile
+
+import test_runner as runner
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'))
+    parser.add_argument('--samples', type=int, default=5)
+    parser.add_argument('--updates', type=int, default=8)
+    parser.add_argument('--depths', default='0,1,3')
+    parser.add_argument('--timeout', type=float, default=300)
+    args = parser.parse_args()
+    depths = sorted(set(map(int, args.depths.split(','))))
+    if min(args.samples, args.updates, args.timeout) <= 0 or not depths or min(depths) < 0 or max(depths) > 8:
+        parser.error('positive samples/updates/timeout and depths in 0..8 required')
+    if not args.wisp or not os.access(args.wisp, os.X_OK):
+        parser.error('set WISP=/path/to/wisp or use --wisp')
+    wisp = str(Path(args.wisp).resolve())
+    template = runner.stage(wisp, False, args.timeout)
+    root = Path(tempfile.mkdtemp(prefix='ilc-retained-', dir=runner.ROOT / '.check'))
+    runner.copy_template(template, root / 'snap')
+    shutil.copytree(runner.ROOT / 'src', root / 'src')
+    source = ('(#bind bench (#module ilc-retained-bench))\n'
+              f'(bench:run {args.samples} {args.updates} [{" ".join(map(str, depths))}])\n')
+    (root / 'input.rvr').write_text(source)
+    print('Benchmark artifacts: ' + str(root), flush=True)
+    code, completed, seconds = runner.run_process(
+        [wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'], root, source, args.timeout)
+    log = (root / 'out.log').read_text(errors='replace')
+    if code or not completed or runner.ERROR.search(log) or '"RETAINED-BENCH-DONE"' not in log:
+        raise RuntimeError(f'benchmark failed (exit={code}, complete={completed}): {root}/out.log')
+    records, keys = [], set()
+    for match in re.finditer(r'^\("RETAINED-BENCH"\s+' + r'\s+'.join([runner.ATOM] * 6) + r'\)', log, re.M):
+        depth, mode, sample, units, ns, checksum = [runner.decode_atom(x) for x in match.groups()]
+        row = dict(depth=int(depth), mode=mode, sample=int(sample), units=int(units), ns=int(ns), checksum=int(checksum))
+        key = row['depth'], mode, row['sample']
+        if key in keys or row['ns'] <= 0 or row['units'] != args.updates or row['checksum'] != args.updates:
+            raise RuntimeError(f'invalid timing: {row}')
+        records.append(row)
+        keys.add(key)
+    modes = ['full', 'staged', 'retained']
+    expected = {(d, m, i) for d in depths for m in modes for i in range(args.samples)}
+    if keys != expected:
+        raise RuntimeError(f'incomplete timings: {len(keys)}/{len(expected)} records')
+    by_key = {(r['depth'], r['mode'], r['sample']): r for r in records}
+    summary = {}
+    for d in depths:
+        timings = {}
+        for m in modes:
+            values = [by_key[d, m, i]['ns'] / args.updates for i in range(args.samples)]
+            timings[m] = dict(median_ns=statistics.median(values), min_ns=min(values), max_ns=max(values))
+        summary[d] = dict(leaves=2**d, applications=2**d-1, timings=timings,
+            retained_slowdown=timings['retained']['median_ns']/timings['full']['median_ns'],
+            retention_speedup=timings['staged']['median_ns']/timings['retained']['median_ns'])
+    initializations = []
+    for match in re.finditer(r'^\("RETAINED-INIT"\s+' + r'\s+'.join([runner.ATOM] * 3) + r'\)', log, re.M):
+        depth, mode, ns = [runner.decode_atom(x) for x in match.groups()]
+        initializations.append(dict(depth=int(depth), mode=mode, ns=int(ns)))
+    expected_initial = {(d, m) for d in depths for m in ['full', 'retained', 'reset']}
+    if ({(r['depth'], r['mode']) for r in initializations} != expected_initial
+            or len(initializations) != len(expected_initial) or any(r['ns'] <= 0 for r in initializations)):
+        raise RuntimeError('incomplete initialization timings')
+    report = dict(timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        host=platform.platform(), machine=platform.machine(), runtime=wisp,
+        runtime_sha256=hashlib.sha256(Path(wisp).read_bytes()).hexdigest(),
+        samples=args.samples, updates=args.updates, wall_seconds=seconds, artifact_directory=str(root),
+        sources={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (root/'src/reaver').glob('*.rvr')},
+        workload='Production elab-value, including cref expansion and elab-value-go. Balanced add '
+                 'applications with 2^depth literal leaves. Each update changes the leftmost literal '
+                 'to a fresh value using a sparse product delta. Input compiler/environment stays fixed. '
+                 'No module cache, unchanged-input memo or checker-specific derivative rules.',
+        scope='In-VM warmed update timings. Full [compiler-state, typed-IR] output is forced, but '
+              'retained traces are never deeply forced. All updates and their output deltas are checked '
+              'against full checking outside timing. Each sample starts at the same initial state; '
+              'edits are successive within a sample, mode order reverses on alternate samples. '
+              'Initialization/reset timings are single observations per depth, including demanded '
+              'code generation on first use; later depths share generated metadata. Initial full '
+              'checking precedes retained initialization. These are not repeated cold-process measurements. '
+              'Rules match staged ILC; registered map/gen callbacks use staged derivatives, without '
+              'internal retained callback caches. No compiler-specific rule or module memo is used.',
+        summary=summary, records=records, initializations=initializations)
+    (root/'results.json').write_text(json.dumps(report, indent=2)+'\n')
+    print('leaves      full ms       staged ms      retained ms    staged/retained    retained/full')
+    for s in summary.values():
+        t=s['timings']
+        print(f'{s["leaves"]:6} '+ ' '.join(f'{t[m]["median_ns"]/1e6:15.4f}' for m in modes)
+              +f' {s["retention_speedup"]:15.2f}x {s["retained_slowdown"]:14.2f}x')
+    print('Initializations (ms): '+json.dumps([{**r, 'ms':r['ns']/1e6} for r in initializations]))
+    print('Report: '+str(root/'results.json'))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError) as error:
+        raise SystemExit(str(error))

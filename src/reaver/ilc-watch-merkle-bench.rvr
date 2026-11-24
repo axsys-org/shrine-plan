@@ -1,0 +1,103 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind watch (#module ilc-watch))
+(#bind merkle (#module ilc-watch-merkle))
+(#bind fixture (#module ilc-watch-fixture))
+(#bind bench (#module ilc-watch-bench))
+
+;; Identical hierarchy for every strategy: 16 regions, 8 buckets per region,
+;; 16 subscribers per bucket. IDs include the bucket and revision, preventing
+;; accidental content deduplication across unrelated buckets. Every edit is
+;; genuine. Clustered edits cover four regions; scattered edits cover all 16.
+;; Reuse 0: all fresh. Reuse 1: alternate whole configurations. Reuse 2:
+;; 31 buckets alternate; one stays fresh, so only proper subtrees can hit.
+(define (path n)
+  [("ts" "watched") ("ts" (showNat (Div n 8))) ("ts" (showNat (Mod n 8)))])
+(define (subscribers api bucket revision)
+  (gen 16 (lambda (i)
+    ((Ix 7 api) (Ix (Mod (Add i revision) 3) (Ix 8 api))
+      [("ts" "subscriber") ("ts" (showNat bucket))
+       ("ts" (showNat revision)) ("ts" (showNat i))]))))
+(define (eyes api)
+  (foldl (lambda (out i) ((_2 api) (path i) (subscribers api i 0) out))
+    (Ix 4 api) (gen 128 (lambda (i) i))))
+(define (batches api clustered reuse count)
+  (gen count (lambda (cycle)
+    (gen 32 (lambda (i)
+      (define revisited (And reuse (Or (Eq reuse 1) i)))
+      (define revision (Inc (If revisited (Mod cycle 2) cycle)))
+      (define bucket (If clustered i (Add (Mul (Mod i 16) 8) (Div i 16))))
+      [(path bucket) [(subscribers api bucket revision)]])))))
+(define (events api count)
+  (gen count (lambda (i)
+    (foldl (lambda (out j)
+      ((_2 api) (path (Mod (Add (Mul i 13) (Mul j 47)) 128))
+        ((Ix 6 api) 1 1 1) out)) (Ix 4 api) [0 1]))))
+
+;; Mode 0 is production f, 1 the committed flat incremental specialization,
+;; 2 Merkle with history, 3 Merkle with history discarded every batch. All
+;; timed trials start from the same initial cache; validation cannot warm it.
+(define names ["baseline" "flat" "merkle" "merkle-no-history"])
+(define (next api mode state edits)
+  (Ifz mode (watch:patch-eyes api state edits)
+    ((If (Eq mode 1) watch:update merkle:update) api state (watch:watch-change api edits))))
+(define (program api mode state)
+  (Ifz mode (watch:baseline api state)
+    ((If (Eq mode 1) watch:program merkle:program) state)))
+(define (lifecycle api mode state batches events)
+  (Ifz batches 0
+    (let ((fresh (next api mode state (_0 batches))))
+      (define total (DeepSeq fresh (bench:events-work api (program api mode fresh) events)))
+      (Seq total (Add total (lifecycle api mode fresh (drop 1 batches) events))))))
+(define (maintenance api mode state batches)
+  (Ifz batches 0
+    (let ((fresh (next api mode state (_0 batches))))
+      (DeepSeq fresh (Inc (maintenance api mode fresh (drop 1 batches)))))))
+(define (validate api states batches events counts)
+  (Ifz batches counts
+    (let ((fresh (gen 4 (lambda (mode) (next api mode (Ix mode states) (_0 batches))))))
+      (define checked (all (lambda (signs)
+        (define expected (watch:observations api (watch:baseline api (_0 fresh) signs)))
+        (all (lambda (mode) (Equal expected
+          (watch:observations api ((program api mode (Ix mode fresh)) signs)))) [1 2 3])) events))
+      (define stats (merkle:stats (_2 fresh)))
+      (If checked (validate api fresh (drop 1 batches) events
+        (gen 4 (lambda (i) (Add (Ix i counts) (Ix i stats)))))
+        (error "Merkle benchmark notification/rest mismatch")))))
+(define (run samples cycles event-count)
+  (define api (fixture:create 0))
+  (define initial (eyes api))
+  (define states [initial (watch:specialize api initial) (merkle:specialize api initial)
+    (merkle:specialize-with-limit api 0 initial)])
+  (define signs (events api event-count))
+  (define (one-case clustered reuse)
+    (define name (strWeld (If clustered "clustered" "scattered")
+      (Ix reuse ["-fresh" "-revisited" "-subtree-revisited"])))
+    (define edits (batches api clustered reuse cycles))
+    (define counts (DeepSeq edits (validate api states edits signs [0 0 0 0])))
+    (define (timed sample mode)
+      (Seq (bench:measure name sample (Ix mode names) cycles
+        (lambda (z) (lifecycle api mode (Ix mode states) edits signs)))
+        (bench:measure name sample (strWeld "update-" (Ix mode names)) cycles
+          (lambda (z) (maintenance api mode (Ix mode states) edits)))))
+    (define (repeat sample)
+      (If (Eq sample samples) 1
+        (Seq (foldl (lambda (acc mode) (Seq (timed sample mode) 0)) 0
+          (If (Mod sample 2) [3 2 1 0] [0 1 2 3])) (repeat (Inc sample)))))
+    (Seq (print ("MERKLE-STATS" name (showNat (_0 counts)) (showNat (_1 counts))
+      (showNat (_2 counts)) (showNat (_3 counts))))
+      (Seq (print ("WATCH-CASE" name "128" "16" "2" "32" (showNat event-count)))
+        (repeat 0))))
+  (define (build sample)
+    (If (Eq sample samples) 1
+      (Seq (bench:measure "setup" sample "flat" 1
+        (lambda (z) (DeepSeq (watch:specialize api initial) 1)))
+        (Seq (bench:measure "setup" sample "merkle" 1
+          (lambda (z) (DeepSeq (merkle:specialize api initial) 1))) (build (Inc sample))))))
+  (DeepSeq [api states signs]
+    (Seq (build 0)
+      (Seq (foldl (lambda (acc pair) (Seq (one-case (_0 pair) (_1 pair)) 0))
+        0 [[1 0] [0 0] [1 1] [0 1] [1 2] [0 2]]) (print "WATCH-BENCH-DONE")))))
+(#export run)

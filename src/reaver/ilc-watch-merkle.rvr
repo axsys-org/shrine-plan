@@ -1,0 +1,154 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#bind pe (#module pe))
+(#bind ilc (#module ilc))
+(#bind watch (#module ilc-watch))
+
+;; Subtree specialization for the real axal watcher namespace.
+;; API extends ilc-watch's first nine fields with bee/get, bee/tap, axal/kid_put.
+;; A pinned plan is [watcher-subtree-pin maybe-partition-table child-index g].
+;; PE builds one dispatcher kernel per API. Each subtree closes that kernel
+;; over its source pin, precomputed care table, and child plans. Re-running PE
+;; on every node would duplicate the same code without removing more work.
+;; g uses relative paths and returns [news rest has-news]; subscriber addresses
+;; remain absolute data. Nodes own their local bucket; children own disjoint
+;; subtrees. This covers root values too and preserves intentional duplicates.
+;;
+;; The memo is EXPLICIT, scoped to compiler/dispatcher/PE code and API, kept in the
+;; returned cache. No global Memo hides setup work or carries hits across runs.
+;; A soft entry limit clears history on the next update; the active compiled
+;; tree remains reusable. A single batch can add more entries than the limit.
+;; This is a prototype of direct react, not lens/dependency translation.
+
+(define source-pin (lambda (plan) (_0 (Unpin plan))))
+(define node-table (lambda (plan) (_1 (Unpin plan))))
+(define node-kids (lambda (plan) (_2 (Unpin plan))))
+(define node-program (lambda (plan) (_3 (Unpin plan))))
+(define (child-links api node) ((Ix 10 api) (_1 node)))
+(define (child-pin api key node)
+  (define found ((Ix 9 api) key (_1 node)))
+  (If (IsApp found) (_0 (_0 found)) 0))
+(define (with-child api node key child)
+  ((Hd node) (_0 node) ((Ix 11 api) key child node)))
+(define (sign-mask sign)
+  (Add (Truth (_0 sign)) (Add (Mul 2 (Truth (_1 sign))) (Mul 4 (Truth (_2 sign))))))
+
+(define (run-node api source table kids signs)
+  (define old (Unpin source))
+  (define own-sign (_0 signs))
+  (define parts (If (And table (IsApp own-sign))
+    [ (Ix (sign-mask (_0 own-sign)) (_0 table)) ] 0))
+  (define hot (Ifz parts 0 (_0 (_0 parts))))
+  (define cool (Ifz parts 0 (_1 (_0 parts))))
+  (define news (Ifz hot (Ix 4 api) ((_2 api) [] hot (Ix 4 api))))
+  (define rest (Ifz parts old
+    (Ifz cool ((_3 api) [] old) ((_2 api) [] cool old))))
+  (foldl (lambda (out entry)
+    (define key (_0 entry))
+    (define plan (bst:bst-idx key kids))
+    (Ifz plan out
+      (let ((result ((node-program plan) (Unpin (_0 (_1 entry))))))
+        [(Ifz (_2 result) (_0 out) (with-child api (_0 out) key (_0 result)))
+         (with-child api (_1 out) key (_1 result))
+         (Or (_2 out) (_2 result))])))
+    [news rest (Truth hot)] (child-links api signs)))
+(define (run-root plan signs)
+  (define result ((node-program plan) signs))
+  [(_0 result) (_1 result)])
+
+;; Edit trie: [maybe-last-edit children]. A last edit is itself maybe-row,
+;; distinguishing no edit, deletion, and a present empty subscriber row.
+(define (insert-edit trie path value)
+  (Ifz path [[value] (_1 trie)]
+    [(_0 trie) (bst:bst-ups (_0 path) [0 0]
+      (lambda (child) (insert-edit child (drop 1 path) value)) (_1 trie))]))
+(define (edit-tree edits)
+  (foldl (lambda (trie edit) (insert-edit trie (_0 edit) (_1 edit))) [0 0] edits))
+
+;; Apply the whole batch to the source trie. A common ancestor is repinned
+;; once, after all its edited children. Missing-path deletions create nothing.
+(define (patch-tree api source delta)
+  (define old (Unpin source))
+  (define local (_0 delta))
+  (define start (Ifz local old
+    (Ifz (_0 local) ((_3 api) [] old) ((_2 api) [] (_0 (_0 local)) old))))
+  (define next
+    (foldl (lambda (node entry)
+      (define key (_0 entry))
+      (define prior (child-pin api key old))
+      (define base (Ifz prior (Pin (Ix 4 api)) prior))
+      (define fresh (patch-tree api base (_1 entry)))
+      (If (Equal base fresh) node
+        (with-child api node key (Unpin fresh)))) start (bst:bst-tap (_1 delta))))
+  (Pin next))
+
+;; Result: [plan memo [built reused history-hits tables-built]]. Statistics
+;; make reuse testable without timing assertions or side-effecting counters.
+(define (plus-stats a b) (gen 4 (lambda (i) (Add (Ix i a) (Ix i b)))))
+(define (compile-node api kernel source old delta memo)
+  (define hit (bst:bst-idx source memo))
+  (cond
+    ((And old (Equal source (source-pin old))) [old memo [0 1 0 0]])
+    (hit [hit memo [0 0 1 0]])
+    (else
+      (define tree (Unpin source))
+      (define same-local (And old (Equal (_0 tree) (_0 (Unpin (source-pin old))))))
+      (define table (If same-local (node-table old)
+        (If (IsApp (_0 tree)) [(watch:partition-table api (_0 (_0 tree)))] 0)))
+      ;; Sparse reconciliation uses only the edit trie; cold compilation
+      ;; enumerates the subtree once. Unedited child plans remain shared.
+      (define entries (If old (bst:bst-tap (_1 delta)) (child-links api tree)))
+      (define state (foldl (lambda (acc entry)
+        (define key (_0 entry))
+        (define child (child-pin api key tree))
+        (Ifz child acc
+          (let ((result (compile-node api kernel child
+                  (Ifz old 0 (bst:bst-idx key (node-kids old)))
+                  (Ifz old [0 0] (_1 entry)) (_1 acc))))
+            [(bst:bst-insert key (_0 result) (_0 acc)) (_1 result)
+             (plus-stats (_2 acc) (_2 result))])))
+        [(Ifz old 0 (node-kids old)) memo [0 0 0 0]] entries))
+      (define g (kernel source table (_0 state)))
+      (define plan (Pin [source table (_0 state) g]))
+      [plan (bst:bst-insert source plan (_1 state))
+       (plus-stats (_2 state) [1 0 0 (And (Nil same-local) (IsApp (_0 tree)))])])))
+
+;; Cache: [eyes plan history g scope limit stats kernel]. The compiler's own pin
+;; forms part of scope, so changing code or the static API cannot reuse stale
+;; compiled regions. The caller must retain this cache to retain its history.
+(define (scope api) (Pin [compile-node run-node run-root pe:partial-eval api]))
+(define (finish api kernel result limit)
+  (define plan (_0 result))
+  [(Unpin (source-pin plan)) plan (_1 result)
+   (pe:partial-eval (run-root plan)) (scope api) limit (_2 result) kernel])
+(define (specialize-with-limit api limit eyes)
+  (define kernel (pe:partial-eval (run-node api)))
+  (finish api kernel (compile-node api kernel (Pin eyes) 0 [0 0] 0) limit))
+(define (specialize api eyes) (specialize-with-limit api 4096 eyes))
+(define watching (Ix 0))
+(define program (Ix 3))
+(define stats (Ix 6))
+
+(define (patch-cache api old edits)
+  (define delta (edit-tree edits))
+  (define source (patch-tree api (source-pin (_1 old)) delta))
+  (define compatible (Equal (scope api) (_4 old)))
+  (define history (If (And compatible (Le (bst:bst-sz (_2 old)) (_5 old))) (_2 old) 0))
+  (define kernel (If compatible (_7 old) (pe:partial-eval (run-node api))))
+  (finish api kernel (compile-node api kernel source (If compatible (_1 old) 0) delta history) (_5 old)))
+(define (d-specialize api eyes dx)
+  (cond
+    ((Nil dx) 0)
+    ((And (Equal (Hd dx) "ILC_CUSTOM") (Equal (_0 dx) (watch:patch-eyes api)))
+      (ilc:custom-change (patch-cache api) (_1 dx)))
+    (else (ilc:replace-change (specialize api (ilc:apply-change eyes dx))))))
+(define (update api old dx)
+  (ilc:apply-change old
+    (ilc:differentiate-with [[(specialize api) (d-specialize api)]]
+      (specialize api) (watching old) dx)))
+
+(#export specialize specialize-with-limit program watching stats update
+ d-specialize edit-tree patch-tree source-pin node-kids)

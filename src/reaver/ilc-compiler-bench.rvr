@@ -1,0 +1,98 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind inc (#module ilc-compiler))
+(#bind fixture (#module ilc-compiler-fixture))
+(#bind driver (#module foil-new-env))
+(#bind rex (#module rex))
+(#bind rx (#module foil-rex))
+(#bind rb (#module rex-build))
+
+;; 32 leaves -> 8 groups of 4 -> one root. Every leaf contains real Foil
+;; functions as well as a value. Leaves, groups and root all use the ordinary
+;; compiler. Generated source and edit streams are forced before timing.
+(define (leaf i) (strWeld "leaf" (showNat i)))
+(define (group i) (strWeld "group" (showNat i)))
+(define (leaf-text i)
+  (strWeld "+ value 1
+" (strcat (gen 8 (lambda (j)
+    (strcat ["+ work" (showNat j) "
+  \ x=nat
+  ^ nat
+  (add x (add value " (showNat (Add i j)) "))
+"]))))))
+(define (join-source deps)
+  (strcat [(strcat (map (lambda (name) (strcat ["- " name " [at=" name "]
+"])) deps)) "+ value "
+    (foldl (lambda (out name) (strcat ["(add " out " " name "/value)"])) "0" deps) "
+"]))
+(define (texts ignored)
+  (Weld (gen 32 (lambda (i) [(leaf i) (leaf-text i)]))
+    (snoc ["main" (join-source (gen 8 group))]
+      (gen 8 (lambda (i) [(group i)
+        (join-source (gen 4 (lambda (j) (leaf (Add (Mul 4 i) j)))))])))))
+(define (batches kind distribution count cycles)
+  (gen cycles (lambda (cycle)
+    (define revision (Add 2 cycle))
+    (gen count (lambda (i)
+      (define name (leaf (If (Equal distribution "scattered")
+        (Add (Mul (Mod i 8) 4) (Div i 8)) i)))
+      (If (Equal kind "text")
+        (inc:text-diff name 8 (Bytes (showNat (Inc cycle))) (showNat revision))
+        ;; Multi-declaration normalized file -> first declaration -> value.
+        (inc:rex-diff name [0 1] (rb:nw (showNat revision)))))))))
+(define (measure name sample mode units work)
+  (define start (Now 0))
+  (define result (Seq start (work 0)))
+  (define end (DeepSeq result (Now 0)))
+  (Seq (print ("COMPILER-BENCH" name mode (showNat sample) (showNat units)
+    (showNat (Sub end start)) (showNat result))) result))
+(define (value state) (driver:get-perc ["value"] (inc:artifact state "main")))
+(define (loop cfg mode state forest batches)
+  (Ifz batches 0
+    (let ((edits (_0 batches)))
+      (define next-forest (inc:patch forest edits))
+      (define fresh (If (Equal mode "incremental")
+        (inc:update cfg state (inc:change edits))
+        (inc:specialize cfg next-forest)))
+      (define answer (If (Equal mode "production")
+        (_0 (fixture:values (inc:production cfg next-forest) ["main"]))
+        (DeepSeq fresh (value fresh))))
+      (Seq answer (Add answer (loop cfg mode
+        (If (Equal mode "production") state fresh)
+        (If (Equal mode "incremental") (inc:sources fresh) next-forest)
+        (drop 1 batches)))))))
+(define (validate cfg state edits total)
+  (Ifz edits total
+    (let ((fresh (inc:update cfg state (inc:change (_0 edits)))))
+      (define cold (inc:specialize cfg (inc:sources fresh)))
+      (define reference (_0 (fixture:values (inc:production cfg (inc:sources fresh)) ["main"])))
+      (If (And (Equal (_1 fresh) (_1 cold)) (Equal reference (value fresh)))
+        (validate cfg fresh (drop 1 edits)
+          (gen 3 (lambda (i) (Add (Ix i total) (Ix i (inc:stats fresh))))))
+        (error "incremental compiler benchmark mismatch")))))
+(define (run samples cycles)
+  (define input (texts 0))
+  (define cfg (fixture:config (map _0 input) ["main"]))
+  (define forest (inc:from-texts input))
+  (define state (inc:specialize cfg forest))
+  (define cases [["text" "clustered" 1] ["rex" "clustered" 1]
+    ["text" "clustered" 8] ["text" "scattered" 8] ["text" "clustered" 32]])
+  (define (one-case spec)
+    (define name (strcat [(_0 spec) "-" (_1 spec) "-" (showNat (_2 spec))]))
+    (define edits (batches (_0 spec) (_1 spec) (_2 spec) cycles))
+    (define counts (DeepSeq edits (validate cfg state edits [0 0 0])))
+    (define (repeat sample)
+      (If (Eq sample samples) 1
+        (Seq (foldl (lambda (acc mode)
+          (Seq (measure name sample mode cycles
+            (lambda (z) (loop cfg mode state forest edits))) 0)) 0
+          (If (Mod sample 2) ["incremental" "cold" "production"] ["production" "cold" "incremental"]))
+          (repeat (Inc sample)))))
+    (Seq (print ("COMPILER-STATS" name (showNat (_0 counts))
+      (showNat (_1 counts)) (showNat (_2 counts)))) (repeat 0)))
+  (DeepSeq [cfg forest state]
+    (Seq (foldl (lambda (acc spec) (Seq (one-case spec) 0)) 0 cases)
+      (print "COMPILER-BENCH-DONE"))))
+(#export run)

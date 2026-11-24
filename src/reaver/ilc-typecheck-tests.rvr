@@ -1,0 +1,79 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ilc (#module ilc))
+(#bind tc (#module ilc-typecheck))
+(#bind elab (#module foil-new-elab))
+(#bind builtins (#module foil-builtins))
+(#bind fixture (#module foil-test-elaboration))
+(#bind surface (#module foil-surface))
+(#bind structural (#module ilc-structural))
+(#bind rex (#module rex))
+(#bind sast (#module foil-sast))
+
+(define (expression text)
+  (_3 (_0 (sast:parse-module-sast 0 (rex:ParseRexNormFile (strWeld "+ test " text))))))
+
+(define (check staged?)
+  (define compiler (fixture:elab-mod (elab:compiler-for builtins:default-subject) []))
+  (define old [compiler (surface:surf-lit 1)])
+  (define next [compiler (surface:surf-lit 2)])
+  (define d (tc:derivative []))
+  (define actual (tc:update d old (tc:check old) (ilc:replace-change next)))
+  assert(Equal (tc:check next) actual)
+  (define ds (If staged?
+    (ilc:derive-staged-with (structural:rules-with ilc:derive-staged-with) tc:check)
+    (tc:derivative structural:rules)))
+  (define sparse (structural:at-path [1 1] (ilc:replace-change 2)))
+  assert(Equal next (ilc:apply-change old sparse))
+  assert(Equal (tc:check next) (tc:update ds old (tc:check old) sparse))
+  ;; Entire expression edits exercise the production checker, including
+  ;; application, annotation, lexical bindings, lambda inference and branches.
+  (define cases
+    [["(add 1 2)" "(add 1 3)"]
+     ["(add 1 2)" "(mul 4 5)"]
+     ["(\ x=nat (add x 1))" "(\ x=nat (add x 2))"]
+     ["
+  ^ nat
+  1" "
+  ^ nat
+  2"]
+     ["(? 1 2 3)" "(? 0 4 5)"]])
+  assert(all (lambda (pair)
+    (define before [compiler (expression (_0 pair))])
+    (define after [compiler (expression (_1 pair))])
+    (define original (tc:check before))
+    (define delta (structural:field 1 (ilc:replace-change (_1 after))))
+    (define expected (tc:check after))
+    (And (Equal expected (tc:update d before original delta))
+      (Equal expected (tc:update ds before original delta)))) cases)
+  ;; Type errors are checked by the generated code too, with the same located
+  ;; diagnostic as the original checker. The retained valid result survives.
+  (define valid [compiler (expression "(add 1 2)")])
+  (define checked (tc:check valid))
+  (define (attempt f) (Try (lambda (z) (DeepSeq (f 0) (f 0))) 0))
+  (define invalid (expression "(add 1 (\ x x))"))
+  (define bad (structural:field 1 (ilc:replace-change invalid)))
+  (define expected-error (attempt (lambda (z) (tc:check (ilc:apply-change valid bad)))))
+  assert(Equal 1 (Hd expected-error))
+  assert(Equal expected-error (attempt (lambda (z) (tc:update d valid checked bad))))
+  assert(Equal expected-error (attempt (lambda (z) (tc:update ds valid checked bad))))
+  ;; An unchanged expression under a changed binding environment must be
+  ;; checked again: the input delta is not assumed to affect syntax only.
+  (define (bound text)
+    (fixture:elab-mod (elab:compiler-for builtins:default-subject)
+      (sast:parse-module-sast 0 (rex:ParseRexNormFile text))))
+  (define ca (bound "+ x 1"))
+  (define cb (bound "+ x (\ a=nat a)"))
+  (define env-input [ca (expression "x")])
+  (define env-next [cb (_1 env-input)])
+  (define env-dx (structural:field 0 (ilc:replace-change cb)))
+  (define env-result (tc:check env-input))
+  assert(Nil (Equal (_1 env-result) (_1 (tc:check env-next))))
+  assert(Equal (tc:check env-next) (tc:update d env-input env-result env-dx))
+  assert(Equal (tc:check env-next) (tc:update ds env-input env-result env-dx))
+  (print "generated derivative agrees with production Foil expression checking")
+  1)
+assert(check 0)
+assert(check 1)

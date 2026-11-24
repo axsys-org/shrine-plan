@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Compare production react, flat ILC, and Merkle subtree ILC on 32-edit batches."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import statistics
+import tempfile
+
+import test_runner as runner
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'))
+    parser.add_argument('--samples', type=int, default=7)
+    parser.add_argument('--cycles', type=int, default=32)
+    parser.add_argument('--events', type=int, default=10)
+    parser.add_argument('--timeout', type=float, default=600)
+    args = parser.parse_args()
+    if min(args.samples, args.cycles, args.events, args.timeout) <= 0:
+        parser.error('samples/cycles/events/timeout must be positive')
+    if not args.wisp or not os.access(args.wisp, os.X_OK):
+        parser.error('set WISP=/path/to/wisp or use --wisp')
+    wisp = str(Path(args.wisp).resolve())
+    template = runner.stage(wisp, False, args.timeout)
+    root = Path(tempfile.mkdtemp(prefix='ilc-watch-merkle-', dir=runner.ROOT / '.check'))
+    runner.copy_template(template, root / 'snap')
+    shutil.copytree(runner.ROOT / 'src', root / 'src')
+    source = ('(#bind bench (#module ilc-watch-merkle-bench))\n'
+              f'(bench:run {args.samples} {args.cycles} {args.events})\n')
+    (root / 'input.rvr').write_text(source)
+    print('Benchmark artifacts: ' + str(root), flush=True)
+    code, completed, seconds = runner.run_process(
+        [wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
+        root, source, args.timeout)
+    log = (root / 'out.log').read_text(errors='replace')
+    if code or not completed or runner.ERROR.search(log) or '"WATCH-BENCH-DONE"' not in log:
+        raise RuntimeError(f'benchmark failed (exit={code}, complete={completed}): {root}/out.log')
+    records, keys = [], set()
+    for match in re.finditer(r'^\("WATCH-BENCH"\s+' + r'\s+'.join([runner.ATOM] * 6) + r'\)', log, re.M):
+        name, mode, sample, units, ns, checksum = [runner.decode_atom(x) for x in match.groups()]
+        row = dict(case=name, mode=mode, sample=int(sample), units=int(units), ns=int(ns), checksum=int(checksum))
+        key = name, mode, row['sample']
+        if key in keys or row['ns'] <= 0 or row['units'] <= 0:
+            raise RuntimeError(f'invalid/duplicate timing: {row}')
+        keys.add(key)
+        records.append(row)
+    cases = [f'{pattern}-{reuse}' for reuse in ['fresh', 'revisited', 'subtree-revisited']
+             for pattern in ['clustered', 'scattered']]
+    strategies = ['baseline', 'flat', 'merkle', 'merkle-no-history']
+    modes = strategies + ['update-' + m for m in strategies]
+    expected = {(c, m, i) for c in cases for m in modes for i in range(args.samples)}
+    expected |= {('setup', m, i) for m in ['flat', 'merkle'] for i in range(args.samples)}
+    if keys != expected:
+        raise RuntimeError(f'incomplete timings: {len(keys)}/{len(expected)} records')
+    by_key = {(r['case'], r['mode'], r['sample']): r for r in records}
+    for c in cases:
+        for i in range(args.samples):
+            for group in [strategies, ['update-' + m for m in strategies]]:
+                if len({by_key[c, m, i]['checksum'] for m in group}) != 1:
+                    raise RuntimeError(f'checksum mismatch: {c}, {i}, {group}')
+    summary = {}
+    for c in cases + ['setup']:
+        timings = {}
+        for m in (['flat', 'merkle'] if c == 'setup' else modes):
+            values = [r['ns'] / r['units'] for r in records if r['case'] == c and r['mode'] == m]
+            timings[m] = dict(median_ns=statistics.median(values), min_ns=min(values), max_ns=max(values))
+        item = dict(timings=timings)
+        if c != 'setup':
+            ratios = [by_key[c, 'flat', i]['ns'] / by_key[c, 'merkle', i]['ns'] for i in range(args.samples)]
+            item.update(merkle_vs_flat=timings['flat']['median_ns']/timings['merkle']['median_ns'],
+                        paired_speedups=ratios, merkle_wins=sum(r > 1 for r in ratios))
+        summary[c] = item
+    stats = {}
+    for match in re.finditer(r'^\("MERKLE-STATS"\s+' + r'\s+'.join([runner.ATOM] * 5) + r'\)', log, re.M):
+        name, *fields = [runner.decode_atom(x) for x in match.groups()]
+        stats[name] = dict(zip(['built_nodes', 'unchanged_node_reuses', 'history_hits', 'tables_built'],
+                              map(int, fields)))
+    if set(stats) != set(cases):
+        raise RuntimeError('missing subtree reuse statistics')
+    report = dict(timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        host=platform.platform(), machine=platform.machine(), runtime=wisp,
+        runtime_sha256=hashlib.sha256(Path(wisp).read_bytes()).hexdigest(),
+        samples=args.samples, cycles=args.cycles, events_per_cycle=args.events, wall_seconds=seconds,
+        artifact_directory=str(root), committed_comparison='cbc4cabf',
+        sources={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in sorted((root / 'src/reaver').glob('ilc*.rvr')) + [root / 'src/reaver/pe.rvr']},
+        workload='128 buckets in 16 regions of 8; 16 subscribers each; 32 real replacements then '
+                 f'{args.events} events touching 2 buckets each. Clustered: 4 complete regions; '
+                 'scattered: 2 buckets in every region. Unique subscriber IDs per bucket/revision. '
+                 'Fresh: increasing revisions. Revisited: alternate revisions 1 and 2. '
+                 'Subtree-revisited: 31 alternate, one is always fresh (whole roots never repeat). '
+                 'All strategies share initial state, edit streams and events. Each timed trial '
+                 'starts from the initial cache; history is explicit, limit 4096 entries.',
+        scope='In-VM nanoseconds. Lifecycle includes source patching, hashing, edit-trie construction, '
+              'cache maintenance and notifications; whole new caches deeply forced. Initial build '
+              'measured separately. Outputs including remaining subscriptions checked outside timers. '
+              'Production consumes news only; event results are not memoized. Excludes fixture '
+              'compilation, input generation, hive/lens processing. Update-only timings exclude events. '
+              'No-history ablation retains the active compiled tree but clears historical entries '
+              'before each batch. Statistics are from one validation traversal, not summed over samples.',
+        summary=summary, stats=stats, records=records)
+    (root / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+    print('case                    f ms/cycle   flat ms/cycle   Merkle ms/cycle   no-history   vs flat   wins')
+    for c in cases:
+        item = summary[c]
+        t = item['timings']
+        print(f'{c:29} ' + ' '.join(f'{t[m]["median_ns"]/1e6:14.3f}' for m in strategies)
+              + f' {item["merkle_vs_flat"]:8.2f}x {item["merkle_wins"]}/{args.samples}')
+    print('Report: ' + str(root / 'results.json'))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError) as error:
+        raise SystemExit(str(error))

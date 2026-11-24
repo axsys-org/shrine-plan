@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Measure text/Rex edits through the real Foil compiler and its ILC cache."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import statistics
+import tempfile
+
+import test_runner as runner
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'))
+    parser.add_argument('--samples', type=int, default=5)
+    parser.add_argument('--cycles', type=int, default=4)
+    parser.add_argument('--timeout', type=float, default=600)
+    args = parser.parse_args()
+    if min(args.samples, args.cycles, args.timeout) <= 0:
+        parser.error('samples/cycles/timeout must be positive')
+    if not args.wisp or not os.access(args.wisp, os.X_OK):
+        parser.error('set WISP=/path/to/wisp or use --wisp')
+    wisp = str(Path(args.wisp).resolve())
+    template = runner.stage(wisp, False, args.timeout)
+    root = Path(tempfile.mkdtemp(prefix='ilc-compiler-', dir=runner.ROOT / '.check'))
+    runner.copy_template(template, root / 'snap')
+    shutil.copytree(runner.ROOT / 'src', root / 'src')
+    source = ('(#bind bench (#module ilc-compiler-bench))\n'
+              f'(bench:run {args.samples} {args.cycles})\n')
+    (root / 'input.rvr').write_text(source)
+    print('Benchmark artifacts: ' + str(root), flush=True)
+    code, completed, seconds = runner.run_process(
+        [wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'], root, source, args.timeout)
+    log = (root / 'out.log').read_text(errors='replace')
+    if code or not completed or runner.ERROR.search(log) or '"COMPILER-BENCH-DONE"' not in log:
+        raise RuntimeError(f'benchmark failed (exit={code}, complete={completed}): {root}/out.log')
+    records, keys = [], set()
+    for match in re.finditer(r'^\("COMPILER-BENCH"\s+' + r'\s+'.join([runner.ATOM] * 6) + r'\)', log, re.M):
+        name, mode, sample, units, ns, checksum = [runner.decode_atom(x) for x in match.groups()]
+        row = dict(case=name, mode=mode, sample=int(sample), units=int(units), ns=int(ns), checksum=int(checksum))
+        key = name, mode, row['sample']
+        if key in keys or row['ns'] <= 0 or row['units'] != args.cycles:
+            raise RuntimeError(f'invalid timing: {row}')
+        records.append(row)
+        keys.add(key)
+    cases = ['text-clustered-1', 'rex-clustered-1', 'text-clustered-8', 'text-scattered-8', 'text-clustered-32']
+    modes = ['production', 'cold', 'incremental']
+    expected = {(c, m, i) for c in cases for m in modes for i in range(args.samples)}
+    if keys != expected:
+        raise RuntimeError(f'incomplete timings: {len(keys)}/{len(expected)} records')
+    by_key = {(r['case'], r['mode'], r['sample']): r for r in records}
+    summary = {}
+    for c in cases:
+        count = int(c.rsplit('-', 1)[1])
+        for i in range(args.samples):
+            if {by_key[c, m, i]['checksum'] for m in modes} != {32 * args.cycles + count * args.cycles * (args.cycles + 1) // 2}:
+                raise RuntimeError(f'checksum mismatch: {c}, {i}')
+        timings = {}
+        for m in modes:
+            values = [by_key[c, m, i]['ns'] / args.cycles for i in range(args.samples)]
+            timings[m] = dict(median_ns=statistics.median(values), min_ns=min(values), max_ns=max(values))
+        ratios = [by_key[c, 'production', i]['ns'] / by_key[c, 'incremental', i]['ns'] for i in range(args.samples)]
+        summary[c] = dict(timings=timings,
+            speedup=timings['production']['median_ns']/timings['incremental']['median_ns'],
+            paired_speedups=ratios, incremental_wins=sum(r > 1 for r in ratios))
+    stats = {}
+    for match in re.finditer(r'^\("COMPILER-STATS"\s+' + r'\s+'.join([runner.ATOM] * 4) + r'\)', log, re.M):
+        name, *fields = [runner.decode_atom(x) for x in match.groups()]
+        stats[name] = dict(zip(['compiled', 'hits', 'external_artifacts'], map(int, fields)))
+    if set(stats) != set(cases):
+        raise RuntimeError('missing compiler reuse statistics')
+    report = dict(timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        host=platform.platform(), machine=platform.machine(), runtime=wisp,
+        runtime_sha256=hashlib.sha256(Path(wisp).read_bytes()).hexdigest(),
+        samples=args.samples, cycles=args.cycles, wall_seconds=seconds, artifact_directory=str(root),
+        sources={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in (root / 'src/reaver').glob('*.rvr')},
+        workload='41 real Foil modules: 32 leaves (value plus eight typed functions each), '
+                 'eight groups of four leaves, one root importing the groups. Every edit sets a '
+                 'new value; no undo/repeated configurations. Clustered eight edits touch two groups; '
+                 'scattered eight edits touch all eight groups. Text splices parse the changed modules; '
+                 'Rex subtree edits bypass parsing. All strategies apply the same edits.',
+        scope='In-VM nanoseconds per edit batch and compilation. Includes applying edits, changed-file '
+              'parsing for text, dependency walk, hashes, elaboration, lowering, linking and cache '
+              'maintenance. Initial compilation, fixture/input generation and validation excluded. '
+              'production uses ordinary compile-with with empty cache; cold uses identical module-key '
+              'orchestration with empty history; incremental transfers the prior cache through ILC. '
+              'All new results forced. Each trial starts from the same initial cache. Validation checks '
+              'exact artifacts against cold orchestration and exported result against production. '
+              'Publication assignments are fixed and explicit; their selection is not timed. '
+              'Reuse is module-granular, not incremental parsing/typechecking within a module.',
+        summary=summary, stats=stats, records=records)
+    (root / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+    print('case                  production ms    cold ms    incremental ms   speedup   wins')
+    for c, item in summary.items():
+        t = item['timings']
+        print(f'{c:22} ' + ' '.join(f'{t[m]["median_ns"]/1e6:14.3f}' for m in modes)
+              + f' {item["speedup"]:8.2f}x {item["incremental_wins"]}/{args.samples}')
+    print('Report: ' + str(root / 'results.json'))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError) as error:
+        raise SystemExit(str(error))
