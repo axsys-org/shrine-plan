@@ -18,6 +18,7 @@
 (#bind render (#module foil-render))
 (#bind doctest (#module doctest))
 (#bind json (#module wire-json))
+(#bind rex (#module rex))
 
 (define (ok fields) (json:jobj (Weld [["ok" "true"]] fields)))
 (define compiler (Pin driver:compile-with))
@@ -112,11 +113,31 @@
         (ok [["passed" (showNat passed)] ["failed" (showNat (Sub (Sz results) passed))]])))
     (else (error ["unknown-wire-operation" op]))))
 
+;; Lint the saved surface even when the target cannot typecheck. The checker
+;; comes from the same published base layer and cache as editor compilation.
+(define (lint cache mod)
+  (define cached (find (lambda (perc) (Equal "stdlib/base" (driver:perc-name perc)))
+    (driver:cache-results cache)))
+  (define compiled (If cached [cache (_0 cached)] (compile cache "stdlib/base")))
+  (define check (driver:source-entry-val ["lint" "check"]
+    (driver:perc-subject (_1 compiled))))
+  (define text (source:read-source mod))
+  (define report (If (Eq 0 (Bytes text)) [[] []] (check (rex:ParseRexFile text))))
+  [(_0 compiled) (ok [["diags" (json:jarr (map (lambda (diag)
+    (json:jobj [["module" (json:jq mod)] ["source" (json:jq "foil-lint")]
+      ["line" (showNat (_0 (_0 diag)))] ["col" (showNat (_1 (_0 diag)))]
+      ["rule" (json:jq (_1 diag))] ["level" (json:jq (_2 diag))]
+      ["msg" (json:jq (_3 diag))]])) (Weld (_0 report) (_1 report))))]])])
+
+(define (handle-compiled cache op mod text name prefix)
+  (define cached (find (lambda (perc) (Equal mod (driver:perc-name perc))) (driver:cache-results cache)))
+  (define compiled (If (And cached (Nil (Equal op "compile"))) [cache (_0 cached)] (compile cache mod)))
+  [(_0 compiled) (dispatch (_0 compiled) (_1 compiled) op text name prefix)])
+
 ;; Failed compiles retain the caller's cache; no partial revision is installed.
 (define (handle cache op mod text name prefix)
   (define result (Try (lambda (ignored)
-    (define cached (find (lambda (perc) (Equal mod (driver:perc-name perc))) (driver:cache-results cache)))
-    (define compiled (If (And cached (Nil (Equal op "compile"))) [cache (_0 cached)] (compile cache mod)))
-    (force [(_0 compiled) (dispatch (_0 compiled) (_1 compiled) op text name prefix)])) 0))
+    (force (If (Equal op "lint") (lint cache mod)
+      (handle-compiled cache op mod text name prefix)))) 0))
   (If (Eq 1 (Hd result)) [cache (failure mod (_0 result))] (_0 result)))
 (#export handle)

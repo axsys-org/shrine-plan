@@ -12,6 +12,7 @@
 (#bind backend (#module foil-grove-backend))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind abi (#module foil-abi))
+(#bind reload (#module foil-reload))
 (#bind documentation (#module goo-documentation-bridge))
 (#bind value-editor (#module goo-value-bridge))
 
@@ -27,17 +28,41 @@
 (define (qualify self names)
   (Weld [self] (map (lambda (name) ("ts" name)) names)))
 
+;; Recompile the entire local production graph against the original /sys
+;; artifacts. The old policy publishes into a candidate, never the live state.
+(define (rebuild-core self system resolve slot state images)
+  (define old (module images "stdlib/runtime"))
+  (define version (driver:get-perc ["namespace" "case"] old))
+  (define x (abi:constructor old ["care" "x"]))
+  (define (previous path)
+    (define found (version x (map (lambda (part) ((_0 part) (_1 part))) path) state))
+    (If (Eq 1 (Sz found)) (_0 found) 0))
+  (define sys (bootstrap:system-images system))
+  (define (root name)
+    (define found (find (lambda (pair) (Equal name (_0 pair))) sys))
+    (If found (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
+      (resolve name)))
+  (define origin (context:module-context (subject:sut-context (driver:perc-subject old))))
+  (define plan (source:prepare-publication (context:publication-key origin)
+    (context:compiler-key origin) root sys previous ["stdlib/runtime"]))
+  (define code (reload:compile plan images driver:empty-foil-cache))
+  (define candidate (_0 (need-ok (publication:publish-local old slot code 0 0 state))))
+  (force [candidate code]))
+
+
 ;; Spec: name, folder, manifest, modules, Grove units, activation, HTTP,
 ;; post-start hook, hook arguments, inspection-provider flag, dependencies,
 ;; required assets, route claims, declarative-workspace flag, terminal hook.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token terminal)
-  (define local (bootstrap:build-local self system resolve slot
-    ["stdlib/runtime"]))
+(define (prepare self system resolve slot port specs scan-port scan-token terminal prior)
+  (define local
+    (Ifz prior (bootstrap:build-local self system resolve slot ["stdlib/runtime"])
+      (rebuild-core self system resolve slot (_0 (_0 prior)) (_1 (_0 prior)))))
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
-      (merge-images (_2 (bootstrap:publisher-code system)) (_2 core-code))))
+      (If prior (_2 core-code)
+        (merge-images (_2 core-code) (_2 (bootstrap:publisher-code system))))))
   (define core (module core-images "stdlib/runtime"))
   (define eden (module core-images "stdlib/runtime"))
   (define (tool path) (driver:get-perc path core))
@@ -87,10 +112,10 @@
     (define prepared (source:prepare-publication-with read
       (context:publication-key origin) (context:compiler-key origin)
       root imported (previous state) (map _0 own)))
-    (define code (publication:compile prepared (_1 core-code)))
+    (define code (reload:compile prepared (images-at path state) (_1 core-code)))
     (define candidate
       (If (Sz own)
-        (_0 (need-ok (publication:publish-local (bootstrap:policy system)
+        (_0 (need-ok (publication:publish-local core
           slot code 0 0 state))) state))
     (define all-images (merge-images (_2 code) imported))
     (define complete ((Hd code) (_0 code) (_1 code) all-images))
@@ -162,14 +187,20 @@
       ((abi:result draft-policy "ok") (_0 (_0 result)))))
   (define draft-ports ((abi:constructor draft-policy ["grove_draft" "ports"]) compile-draft build-candidate))
   (define homes (map (home self) specs))
-  (Seq (print "Core publication compiled") 0)
-  (define initial (need-ok ((driver:get-perc ["eden" "boot"] eden)
-    self (bootstrap:trusted system) (_1 (_0 local)) port)))
+  (Seq (force local) (print "Core publication compiled"))
+  (define initial
+    (If prior (need-ok ((tool ["eden" "refresh"]) (_0 local)))
+      (need-ok ((driver:get-perc ["eden" "boot"] eden)
+        self (bootstrap:trusted system) (_1 (_0 local)) port))))
   (define reader ((tool ["fs_read" "remote"]) scan-port scan-token))
   (define loaded
     (foldl (lambda (state spec)
-      (define scanned ((tool ["source_mount" "load"])
-        reader (_0 spec) (_1 spec) (_2 spec) state))
+      (define scanned
+        (If prior ((tool ["source_mount" "reload"]) reader ports (_0 spec) (_1 spec)
+          ((tool ["source_mount" "write"]) (home self spec)
+            ((tool ["myth" "sing"]) ((tool ["source_mount" "slot"]) ("ts" "snapshot"))
+              ((abi:constructor core ["pails" "t"]) "")) state))
+          ((tool ["source_mount" "load"]) reader (_0 spec) (_1 spec) (_2 spec) state)))
       (define published ((tool ["source_mount" "reconcile_one"])
         ports (home self spec) scanned))
       ((tool ["source_mount" "require_ready"]) [(home self spec)] published))
@@ -179,7 +210,7 @@
     (driver:get-perc (_1 binding) (module (images state) (_0 binding))))
   (define activated
     (foldl (lambda (state spec)
-      (If (Sz (_5 spec))
+      (If (And (Nil prior) (Sz (_5 spec)))
         (Seq (print ["Activating mount" (_0 spec)])
           (need-ok ((hook state spec 5) state))) state)) loaded specs))
   (define (workspace-tool state name)
@@ -220,26 +251,28 @@
                    0 (error ["undeclared-mount-routes" (_0 spec)]))
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
-  (define server ((driver:get-perc ["eden" "serve_read"] eden)
-    ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes))
-    reader ((draft-tool "reconcile") draft-ports editable)
-    ((driver:get-perc ["http_foot" "run_with"] http) config)))
-  (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
-  (Seq server (foldl (lambda (ignored spec)
-    (Ifz (Sz (_7 spec)) 0
-      (Seq ((hook installed spec 7) server (Ix 8 spec)) 0))) 0 specs))
-  [server (If terminal
-    (hook installed (need (find (lambda (spec) (Equal terminal (_0 spec))) specs)) 14)
-    0)])
+  (define access ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes)))
+  (define current ((draft-tool "reconcile") draft-ports editable))
+  (define hooks (map (lambda (spec) [(hook installed spec 7) (Ix 8 spec)])
+    (filter (lambda (spec) (Sz (_7 spec))) specs)))
+  (define terminal-hook (If terminal
+    (hook installed (need (find (lambda (spec) (Equal terminal (_0 spec))) specs)) 14) 0))
+  (force [current access config core-images hooks terminal-hook]))
 
+(define (mounted self system resolve slot port specs scan-port scan-token terminal)
+  (define built (prepare self system resolve slot port specs scan-port scan-token terminal 0))
+  (define core (module (_3 built) "stdlib/runtime"))
+  (define (tool path) (driver:get-perc path core))
+  (define reader ((tool ["fs_read" "remote"]) scan-port scan-token))
+  (define server ((tool ["eden" "serve_read"]) (_1 built) reader (_0 built)
+    ((tool ["http_foot" "run_with"]) (_2 built))))
+  (Seq server (DeepSeq (map (lambda (hook) ((_0 hook) server (_1 hook))) (_4 built)) 0))
+  [server (Ix 5 built) (_3 built)])
+
+(define (start-session self system resolve slot port specs scan-port scan-token)
+  (mounted self system resolve slot port specs scan-port scan-token ""))
 (define (start self system resolve slot port specs scan-port scan-token)
-  (If (Sz specs)
-    (_0 (mounted self system resolve slot port specs scan-port scan-token ""))
-    (let* ((local (bootstrap:build-local self system resolve slot ["stdlib/runtime"]))
-           (eden (publication:compiled-module (_1 local) "stdlib/runtime"))
-           (state (need-ok ((driver:get-perc ["eden" "boot"] eden)
-             self (bootstrap:trusted system) (_1 (_0 local)) port))))
-      ((driver:get-perc ["eden" "serve"] eden) state))))
+  (_0 (start-session self system resolve slot port specs scan-port scan-token)))
 (define (start-terminal self system resolve slot port specs scan-port scan-token name)
   (mounted self system resolve slot port specs scan-port scan-token name))
-(#export start start-terminal)
+(#export start start-session start-terminal prepare module)

@@ -1,0 +1,102 @@
+;;;; Compatible code replacement: types retain their defining moments.
+;;;; A changed or removed existing type needs an explicit migration and is
+;;;; rejected before any publication or actor handoff.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ca (#module cairn))
+(#bind context (#module foil-context))
+(#bind driver (#module foil-new-env))
+(#bind subject (#module foil-subject))
+(#bind entry (#module foil-entry))
+(#bind elab (#module foil-new-elab))
+(#bind pub (#module foil-publication))
+
+(define (types image)
+  (define sut (driver:perc-subject image))
+  (define unit (subject:sut-context sut))
+  (filter (lambda (pair)
+    (define local (need (context:local-definition unit pair)))
+    (Eq "TC_TYP" (Hd (subject:got-entry-tc (subject:root-path sut local) sut))))
+    (rowify (ca:tapax (_1 unit)))))
+
+(define (schema image path)
+  (define sut (driver:perc-subject image))
+  (define unit (subject:sut-context sut))
+  (define local (map (Ix 1) (drop (Sz (_0 unit)) path)))
+  (define tc (subject:got-entry-tc (subject:root-path sut local) sut))
+  (If (Eq "TC_TYP" (Hd tc))
+    (elab:compatibility-in-subject sut 0 (subject:tc-typ-inner tc))
+    (error ["reload-type-became-value" path])))
+
+(define (retained plan images)
+  (define ctx (pub:compilation-context plan))
+  (define names (pub:definition-names plan))
+  (define roots (map (lambda (pair) (_0 (context:module ctx (_0 pair)))) names))
+  ;; Relocation changes the source module, never the canonical definition.
+  ;; Include old modules sharing an affected root, even if their file retired.
+  (foldl (lambda (out binding)
+    (define image (Unpin (_1 binding)))
+    (define unit (subject:sut-context (driver:perc-subject image)))
+    (If (Or (context:artifact ctx (_0 binding))
+            (Nil (includes (Equal (_0 unit)) roots))) out
+      (Weld out (map (lambda (pair)
+        (define target (find (lambda (next)
+          (includes (Equal (_0 pair)) (_1 next))) names))
+        (Ifz target (error ["reload-removed-type" (_0 pair)])
+          [(_0 binding) (_0 pair) (_1 pair) (_0 (_0 target))]))
+        (types image))))) [] images))
+
+(define (prepare plan images)
+  (define ctx (pub:compilation-context plan))
+  (define kept (retained plan images))
+  (define assigned
+    (map (lambda (binding)
+      (define name (_0 (_0 binding)))
+      (define entries (rowify (ca:tapax (_1 binding))))
+      [name (map (lambda (pair)
+        (define prior (find (lambda (old)
+          (And (Equal name (_3 old)) (Equal (_0 pair) (_1 old)))) kept))
+        (If prior [(_0 pair) (_2 (_0 prior))] pair)) entries)])
+      (rowify (ca:tapax (_4 ctx)))))
+  (DeepSeq (map (lambda (old)
+    (If (Eq (_2 old) (_0 (ca:getax (_1 old) (pub:expected-cases plan)))) 0
+      (error ["reload-stale-type" (_1 old)]))) kept) 0)
+  (define roots (map (lambda (pair) [(_0 (_0 pair)) (_1 pair)])
+    (rowify (ca:tapax (_3 ctx)))))
+  (define imports (map (lambda (pair) [(_0 (_0 pair)) (_1 pair)])
+    (rowify (ca:tapax (_5 ctx)))))
+  (define fresh (context:create (_0 ctx) (_1 ctx) (_2 ctx) roots assigned imports))
+  (define owned (If (Sz (Ix 6 ctx)) (context:with-who (_0 (Ix 6 ctx)) fresh) fresh))
+  ;; Retained type records keep their old artifact and x case. New code
+  ;; references those moments, while functions and values get new cases.
+  (define names (map (lambda (pair)
+    [(_0 pair) (filter (lambda (path)
+      (Nil (find (lambda (old) (And (Equal (_0 pair) (_3 old))
+        (Equal path (_1 old)))) kept))) (_1 pair))]) (pub:definition-names plan)))
+  ((Hd plan) owned (_1 plan) names (_3 plan) (_4 plan)))
+
+(define (compile plan images cache)
+  (define kept (retained plan images))
+  (define code (pub:compile (prepare plan images) cache))
+  (DeepSeq (map (lambda (old)
+    (define before (Unpin (_1 (need (find (lambda (pair)
+      (Equal (_0 pair) (_0 old))) images)))))
+    (define after (pub:compiled-module code (_3 old)))
+    (If (Equal (schema before (_1 old)) (schema after (_1 old))) 0
+      (error ["reload-incompatible-type" (_1 old)]))) kept) code))
+
+;; The host invokes these entrypoints without Foil call-site checking.
+;; Reject an arity/type change before a continuation can strand an actor.
+(define (signature image path)
+  (define sut (driver:perc-subject image))
+  (define tc (subject:got-entry-tc (subject:resolve-source-path path sut) sut))
+  (elab:compatibility-in-subject sut 0 (subject:tc-ty tc)))
+
+(define (require-interface before after paths)
+  (DeepSeq (map (lambda (path)
+    (If (Equal (signature before path) (signature after path)) 0
+      (error ["reload-incompatible-entrypoint" path]))) paths) after))
+
+(#export prepare compile types schema signature require-interface)

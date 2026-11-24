@@ -1,71 +1,76 @@
--- Compile-on-save: the wire's compile op is the resync (report,
--- changeset, mirror remount); its diags land in vim.diagnostic, its
--- report in the echo area — save, and the verdict is under your eyes
--- before they move (the buddy promise, in-editor).
-
+-- Saved-source compiler and style diagnostics from the persistent wire service.
 local wire = require("foil.wire")
 local module = require("foil.module")
 local ui = require("foil.ui")
-
 local M = {}
-
 M.ns = vim.api.nvim_create_namespace("foil-wire")
+M.lint_ns = vim.api.nvim_create_namespace("foil-lint")
+local pending = {}
 
--- A lain-dev serve's sync diags carry a "module" field (a dependent
--- can break when its import changes); rows for other modules land as
--- one summary line rather than mis-anchored in this buffer.
-local function to_diagnostics(res, mod)
+local function to_diagnostics(rows, mod, source)
   local out, foreign = {}, {}
-  for _, d in ipairs(res.diags or {}) do
-    local dmod = d.module
-    if dmod ~= nil and dmod ~= vim.NIL and dmod ~= mod then
-      foreign[#foreign + 1] = ("%s:%s  %s"):format(dmod, d.line or "?", d.msg or "")
-    elseif type(d.line) == "number" and d.line > 0 then
+  for _, d in ipairs(rows) do
+    local severity = d.level == "warning" and vim.diagnostic.severity.WARN
+      or vim.diagnostic.severity.ERROR
+    if d.module ~= nil and d.module ~= vim.NIL and d.module ~= mod then
+      foreign[#foreign + 1] = ("%s:%s  %s"):format(d.module, d.line or "?", d.msg or "")
+    else
       out[#out + 1] = {
-        lnum = d.line - 1,
+        lnum = math.max(0, (tonumber(d.line) or 1) - 1),
         col = math.max(0, (tonumber(d.col) or 1) - 1),
-        message = d.msg or "error",
-        severity = vim.diagnostic.severity.ERROR,
-        source = "foil",
+        message = d.msg or "error", severity = severity, source = source,
+        code = wire.field(d, "rule"),
       }
     end
   end
   if #foreign > 0 then
     out[#out + 1] = {
-      lnum = 0, col = 0,
-      message = "dependents broke:\n" .. table.concat(foreign, "\n"),
-      severity = vim.diagnostic.severity.WARN,
-      source = "foil",
-    }
-  end
-  if #out == 0 then
-    out[1] = {
-      lnum = 0, col = 0,
-      message = wire.field(res, "error") or "compile failed",
-      severity = vim.diagnostic.severity.ERROR,
-      source = "foil",
+      lnum = 0, col = 0, message = "In other modules:\n" .. table.concat(foreign, "\n"),
+      severity = vim.diagnostic.severity.ERROR, source = source,
     }
   end
   return out
 end
 
-function M.compile(bufnr)
+local function diagnose(op, bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if bufnr == 0 then bufnr = vim.api.nvim_get_current_buf() end
   local mod = module.of(bufnr)
-  wire.request({ op = "compile", module = mod }, function(ok, res)
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  local token = {}
+  pending[bufnr] = token
+  wire.request({ op = op, module = mod }, function(ok, res)
+    if pending[bufnr] ~= token or not vim.api.nvim_buf_is_valid(bufnr)
+      or vim.api.nvim_buf_get_changedtick(bufnr) ~= tick
+      or vim.api.nvim_buf_get_name(bufnr) ~= name then return end
+    pending[bufnr] = nil
     if not ok then return ui.notify(res, vim.log.levels.WARN) end
-    if not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local compiler, lint = {}, {}
+    for _, d in ipairs(res.diags or {}) do
+      local rows = (op == "lint" or d.source == "foil-lint") and lint or compiler
+      rows[#rows + 1] = d
+    end
+    if not res.ok and #compiler == 0 and (op ~= "lint" or #lint == 0) then
+      local rows = op == "lint" and lint or compiler
+      rows[#rows + 1] = { msg = wire.field(res, "error") or (op .. " failed") }
+    end
+    if op == "compile" then
+      vim.diagnostic.set(M.ns, bufnr, to_diagnostics(compiler, mod, "foil"))
+    end
+    vim.diagnostic.set(M.lint_ns, bufnr, to_diagnostics(lint, mod, "foil-lint"))
     if res.ok then
-      vim.diagnostic.set(M.ns, bufnr, {})
-      ui.notify((wire.field(res, "report") or "compiled"):gsub("\n", " · "))
+      local report = wire.field(res, "report") or (op == "lint" and "Linted " .. mod or "compiled")
+      ui.notify((report:gsub("\n", " · ")) .. (" · %d lint findings"):format(#lint))
     else
-      vim.diagnostic.set(M.ns, bufnr, to_diagnostics(res, mod))
       local first = (res.diags or {})[1]
-      ui.notify(first and first.msg or wire.field(res, "error") or "compile failed",
-        vim.log.levels.ERROR)
+      ui.notify(first and first.msg or wire.field(res, "error") or (op .. " failed"), vim.log.levels.ERROR)
     end
   end)
 end
+
+function M.compile(bufnr) diagnose("compile", bufnr) end
+function M.lint(bufnr) diagnose("lint", bufnr) end
 
 function M.doctest(bufnr)
   local mod = module.of(bufnr or 0)
@@ -80,5 +85,4 @@ function M.doctest(bufnr)
     end
   end)
 end
-
 return M

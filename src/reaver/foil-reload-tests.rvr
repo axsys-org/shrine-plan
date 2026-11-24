@@ -1,0 +1,207 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind pub (#module foil-publication))
+(#bind reload (#module foil-reload))
+(#bind driver (#module foil-new-env))
+(#bind brand (#module shrine-brand))
+(#bind source (#module foil-source))
+(#bind elab (#module foil-new-elab))
+(#bind subject (#module foil-subject))
+(#bind nt (#module foil-new-types))
+(#bind contexts (#module foil-context))
+(#bind core (#module foil-type-core))
+(define native-selection
+  (Pin (map (lambda (name)
+    [(Weld [("ts" "sys") ("ts" "types")]
+       (map (lambda (part) ("ts" part)) name)) 1]) core:system-names)))
+(define root [["x" 7] ["ts" "library"]])
+(define app [["x" 7] ["ts" "app"]])
+(define sources
+  [["library" "+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t)
+  + empty (:)
++ value (tree/leaf[nat] 12)
+"]
+   ["app" "- library [at=renamed]
++ value renamed/value
+"]])
+(define (read name)
+  (rex:ParseRexNormFile (_1 (need (find (lambda (pair) (Equal name (_0 pair))) sources)))))
+(define (prepare version)
+  (pub:prepare native-selection (Pin "compiler") read
+    [["library" root] ["app" app]] [] (lambda (path) version)))
+(define plan (prepare 0))
+(define compiled (pub:compile plan driver:empty-foil-cache))
+(define artifacts (_2 compiled))
+(define library (Unpin (_1 (_0 artifacts))))
+(define application (Unpin (_1 (_1 artifacts))))
+(define value (driver:get-perc ["value"] library))
+assert(Equal [[(Weld root [["ts" "tree"] ["ts" "leaf"]]) 1]]
+  (brand:decode (Hd value)))
+assert(Equal value (driver:get-perc ["value"] application))
+assert(Equal compiled (pub:verify-predecessors compiled (lambda (path) 0)))
+assert(Eq 1 (Hd (Try (lambda (z)
+  (pub:verify-predecessors compiled (lambda (path) 1))) 0)))
+
+(define revised (reload:compile (prepare 1) artifacts (_1 compiled)))
+(define fresh (pub:compiled-module revised "library"))
+assert(Equal value (driver:get-perc ["value"] fresh))
+assert(Equal 2 (Sz (pub:definition-records revised)))
+(print "RELOAD-UNIT-DONE")
+
+;; Behavior can change while records and constructors retain their identity.
+(define (with-source text)
+  (pub:prepare native-selection (Pin "compiler")
+    (lambda (name) (If (Equal name "library") (rex:ParseRexNormFile text) (read name)))
+    [["library" root] ["app" app]] [] (lambda (path) 1)))
+(define changed (reload:compile (with-source "+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t)
+  + empty (:)
++ value (tree/leaf[nat] 99)
+") artifacts (_1 compiled)))
+(define changed-value (driver:get-perc ["value"] (pub:compiled-module changed "app")))
+assert(Equal (Hd value) (Hd changed-value))
+assert(Equal 99 (_0 changed-value))
+assert(Equal 12 (_0 value))
+(define (refused text)
+  (Eq 1 (Hd (Try (lambda (ignored)
+    (force (reload:compile (with-source text) artifacts (_1 compiled)))) 0))))
+assert(refused "+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t extra=nat)
+  + empty (:)
++ value (tree/leaf[nat] 99 0)
+")
+assert(refused "+ value 99
+")
+assert(refused "+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t)
+  + empty (:)
++ value missing_function(99)
+")
+;; Failed candidates never rewrite the old artifacts.
+assert(Equal value (driver:get-perc ["value"] library))
+
+;; Display reflection deliberately hides opaque constants; compatibility
+;; cannot, since a comparator is part of a container's type contract.
+(define first-constant (nt:tconst (lambda (x) (Inc x))))
+(define second-constant (nt:tconst (lambda (x) (Add x 2))))
+(define sut (driver:perc-subject library))
+assert(Equal (elab:reflect-in-subject sut 0 first-constant)
+  (elab:reflect-in-subject sut 0 second-constant))
+assert(Nil (Equal (elab:compatibility-in-subject sut 0 first-constant)
+  (elab:compatibility-in-subject sut 0 second-constant)))
+
+;; Host-side calls have no recompiled Foil caller to check their arity.
+(define (bridge text)
+  (define plan (pub:prepare native-selection (Pin "compiler")
+    (lambda (ignored) (rex:ParseRexNormFile text))
+    [["bridge" root]] [] (lambda (ignored) 0)))
+  (pub:compiled-module (pub:compile plan driver:empty-foil-cache) "bridge"))
+(define before-bridge (bridge "+ entry
+  \ value=nat
+  ^ nat
+  value
+"))
+(define after-bridge (bridge "+ entry
+  \ value=nat
+  ^ nat
+  (add value 1)
+"))
+(define broken-bridge (bridge "+ entry
+  \ value=nat extra=nat
+  ^ nat
+  (add value extra)
+"))
+assert(Equal after-bridge
+  (reload:require-interface before-bridge after-bridge [["entry"]]))
+assert(Eq 1 (Hd (Try (lambda (ignored)
+  (reload:require-interface before-bridge broken-bridge [["entry"]])) 0)))
+
+;; Files can share an explicit publication root with disjoint declarations.
+;; Move types out of a facade without changing stored brands or artifacts.
+(define (split-plan name extra)
+  (pub:prepare native-selection (Pin "compiler")
+    (lambda (module)
+      (cond
+        ((Equal module "library")
+          (rex:ParseRexNormFile (strcat ["- " name "
++ value (tree/leaf[nat] 99" (If extra " 0" "") ")
+"])))
+        ((Equal module name)
+          (rex:ParseRexNormFile (strcat ["+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t" (If extra " extra=nat" "") ")
+  + empty (:)
+"])))
+        (else (read module))))
+    [[name root] ["library" root] ["app" app]] [] (lambda (path) 1)))
+(define moved (reload:compile (split-plan "parts" 0) artifacts (_1 compiled)))
+assert(Equal (Hd value) (Hd (driver:get-perc ["value"]
+  (pub:compiled-module moved "app"))))
+assert(Equal 2 (Sz (pub:definition-records moved)))
+;; The previous source file may itself disappear on the next relocation.
+(define moved-again (reload:compile (split-plan "definitions" 0)
+  (_2 moved) (_1 moved)))
+assert(Equal (Hd value) (Hd (driver:get-perc ["value"]
+  (pub:compiled-module moved-again "app"))))
+assert(Eq 1 (Hd (Try (lambda (ignored)
+  (reload:compile (split-plan "parts" 1) artifacts (_1 compiled))) 0)))
+;; Two source files may not claim the same canonical definition.
+assert(Eq 1 (Hd (Try (lambda (ignored)
+  (pub:prepare native-selection (Pin "compiler")
+    (lambda (name) (rex:ParseRexNormFile "+ duplicate 1"))
+    [["one" root] ["two" root]] [] (lambda (path) 0))) 0)))
+
+;; A co-owned source can be reloaded while another stays a pinned import.
+(define parts (need (find (lambda (pair) (Equal "parts" (_0 pair))) (_2 moved))))
+(define partial-plan
+  (pub:prepare native-selection (Pin "compiler")
+    (lambda (name) (rex:ParseRexNormFile "- parts
++ value (tree/leaf[nat] 100)
+"))
+    [["parts" root] ["library" root]] [parts] (lambda (path) 1)))
+(define partial (reload:compile partial-plan (_2 moved) (_1 moved)))
+assert(Equal (Hd value) (Hd (driver:get-perc ["value"]
+  (pub:compiled-module partial "library"))))
+
+;; The disk loader resolves source ownership before freezing the context.
+(define inventory-plan
+  (source:prepare-publication-with
+    (lambda (name) (rex:ParseRexNormFile
+      (If (Equal name "stdlib/json") "+ moved (: value=nat)"
+        "- stdlib/json
++ kept (moved 42)")))
+    native-selection (Pin "compiler")
+    (lambda (name) (Weld [["x" 7]] (source:module-segments name)))
+    [] (lambda (path) 0) ["stdlib/base"]))
+(define inventory-code (pub:compile inventory-plan driver:empty-foil-cache))
+assert(Equal [[["x" 7] ["ts" "stdlib"] ["ts" "base"] ["ts" "moved"]] 1]
+  (_0 (brand:decode (Hd (driver:get-perc ["kept"]
+    (pub:compiled-module inventory-code "stdlib/base"))))))
+
+(#bind modules (#module foil-modules))
+(define sample "stdlib/json	base	stdlib/base
+stdlib/base	base	stdlib/base
+")
+assert(Equal "stdlib/base" (modules:owner (modules:parse-inventory sample) "stdlib/json"))
+(define (bad-inventory text)
+  (Eq 1 (Hd (Try (lambda (ignored) (force (modules:parse-inventory text))) 0))))
+assert(bad-inventory (strWeld sample sample))
+assert(bad-inventory "../json	base	../json
+")
+assert(bad-inventory "types	unknown	types
+")
+assert(bad-inventory "types	sys	types
+")
+assert(bad-inventory "stdlib/json	base	absent
+")
+assert(bad-inventory "types	types	sys/types
+sys/types	sys	sys/types
+")

@@ -62,6 +62,8 @@ subsequent queries rebuild against the current files. Eval does not publish
 its result into Eden. Grove publication still belongs to Eden's mount pipeline.
 
 Eden's wire endpoint also accepts `mount/status`, `mount/save`, and `mount/reload`.
+`x/reload-core` uses `core/reload` to replace the non-`sys` runtime and all
+selected mounts together, preserving live state and rejecting failed candidates.
 The CLI tools `x/save-mount` and `x/reload-mount` use these to update a selected
 mount and wait for live publication. See [mount authoring tools](../../MOUNTS.md#mount-authoring-tools)
 for scaffolding commands, the JSON protocol, and restart requirements.
@@ -80,12 +82,23 @@ require("foil").setup({
 ```
 
 This enables server-backed Foil hover, definition lookup and completion,
-compile-on-save diagnostics, plus these commands/mappings:
+compile-on-save diagnostics, plus these commands/mappings. Compilation also
+runs the native style checker from `stdlib/base` with its default rules and
+the CLI's tab/trailing-whitespace checks. Findings retain their rule IDs and
+error/warning levels in the separate `foil-lint` diagnostic namespace, even
+when compilation succeeds. Fixing and saving clears the old findings; replies
+for an older request or edited buffer are ignored.
+
+Diagnostics read saved files. `FoilLint` checks just the saved source without
+requiring its imports or declarations to typecheck. It leaves existing compiler
+diagnostics alone. The TODO-gated `lapidary` and `ufcs-lift` rules remain off,
+matching `x/foil-lint` defaults.
 
 | Command | Mapping | Action |
 | --- | --- | --- |
 | `FoilConnect` | | Ping the configured server |
 | `FoilCompile` | `<leader>fc` | Compile the saved module and dependencies |
+| `FoilLint` | | Lint the saved module without typechecking it |
 | `FoilDoctest` | `<leader>ft` | Run module doctests |
 | `FoilEval [expression]` | `<leader>fe` (normal/visual) | Evaluate |
 | `FoilInspect [name]` | `<leader>fi` | Inspect a mirror entry |
@@ -113,3 +126,9 @@ not require a running server. `WISP=/path/to/wisp python3 x/foil-wire-test.py`
 (or the `foil-wire` command suite in `x/check`) exercises the real compiler,
 TCP protocol, edits, mounted modules, and Neovim client. Samples for visual inspection are in
 `editor/foil-vim/samples/`.
+
+The JSON wire operation `{"op":"lint","module":"stdlib/runtime"}` returns
+`diags` with `module`, `line`, `col` (one-based), `source`, `rule`, `level`, and
+`msg`. Compile replies include these style findings alongside compiler errors;
+their `ok` continues to describe compilation success. `lint_ok` reports whether
+the checker completed, independently of whether it found style violations.

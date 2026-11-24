@@ -137,6 +137,55 @@ local function test()
   eq(requests[1].prefix, 'grove/tag-')
   vim.cmd('doautocmd BufWritePost')
   eq(requests[2].op, 'compile')
+
+  -- Successful compilation keeps lint findings, including their severity and
+  -- rule ids. Replies for an older request or edited buffer cannot overwrite it.
+  local callbacks = {}
+  wire.request = function(req, cb)
+    requests[#requests + 1] = req
+    callbacks[#callbacks + 1] = cb
+  end
+  local diag = require('foil.diag')
+  local mod = require('foil.module').of()
+  local finding = {module=mod, source='foil-lint', line=3, col=5,
+    level='warning', rule='gutter', msg='align the gutter'}
+  diag.compile()
+  callbacks[#callbacks](true, {ok=true, diags={finding}})
+  local got = vim.diagnostic.get(0, {namespace=diag.lint_ns})
+  eq(#got, 1, 'lint survives successful compilation')
+  eq({got[1].lnum, got[1].col, got[1].severity, got[1].code},
+    {2, 4, vim.diagnostic.severity.WARN, 'gutter'})
+  eq(#vim.diagnostic.get(0, {namespace=diag.ns}), 0)
+  diag.compile()
+  local stale = callbacks[#callbacks]
+  diag.compile()
+  callbacks[#callbacks](true, {ok=true, diags={}})
+  stale(true, {ok=false, error='old error'})
+  eq(#vim.diagnostic.get(0, {namespace=diag.lint_ns}), 0, 'fixed lint is cleared')
+  eq(#vim.diagnostic.get(0, {namespace=diag.ns}), 0, 'stale error ignored')
+  diag.compile()
+  local edited = callbacks[#callbacks]
+  vim.api.nvim_buf_set_lines(0, 2, 3, false, {'    42'})
+  edited(true, {ok=false, error='error in previous text'})
+  eq(#vim.diagnostic.get(0, {namespace=diag.ns}), 0, 'edited buffer ignores saved-source reply')
+  diag.compile()
+  callbacks[#callbacks](true, {ok=false, diags={
+    {module=mod, line=2, col=1, msg='unknown name'}, finding}})
+  eq(#vim.diagnostic.get(0, {namespace=diag.ns}), 1, 'compiler error retained alongside lint')
+  vim.cmd('FoilLint')
+  eq(requests[#requests].op, 'lint')
+  callbacks[#callbacks](true, {ok=true, diags={}})
+  eq(#vim.diagnostic.get(0, {namespace=diag.ns}), 1, 'lint-only preserves compiler errors')
+  eq(#vim.diagnostic.get(0, {namespace=diag.lint_ns}), 0)
+  diag.compile()
+  callbacks[#callbacks](true, {ok=false, diags={{module='dependency', line=7, msg='bad import'}}})
+  got = vim.diagnostic.get(0, {namespace=diag.ns})
+  eq(got[1].lnum, 0, 'dependency error is summarized, not misplaced')
+  eq(got[1].severity, vim.diagnostic.severity.ERROR)
+  diag.compile()
+  callbacks[#callbacks](true, {ok=true, diags={{module=mod, line=1, col=1,
+    source='foil-lint', rule='snake-case', level='error', msg='use snake_case'}}})
+  eq(vim.diagnostic.get(0, {namespace=diag.lint_ns})[1].severity, vim.diagnostic.severity.ERROR)
   require('foil').setup({wire_enabled = false})
 
   -- Filetype switches must clean up Lua mappings and buffer-local options.

@@ -154,7 +154,7 @@ reboot. 125 node tests: `node --test extras/mounts/explorer/tests/*.test.cjs`.
 ## 2. Kernel facts the plan depends on (checked against the source; verify again before building on them)
 
 - **Formulas are pure.** A stdlib formula gets the input tree its `/sys/tack` names at that care, its own slots, and
-  any other reference slot hydrated under `['views <slot>]`; it cannot read the store (`sys/view.foil:24-29`,
+  any other reference slot hydrated under `['views <slot>]`; it cannot read the store (`cell` in `sys/shrine.foil`,
   `lain_peek.foil:764-842`, `weft_std.foil:22`). Live secondary inputs are allowed; a live tack has no past case.
   Output may hold virtual children but they are not path-addressable: read the cell root at y or z. `follow` is one
   hop. No budget inside a formula; a tack chain over 64 edges counts as a cycle (`lain_peek.foil:869-885`).
@@ -367,7 +367,7 @@ src/foil/lain_poke.foil                writes, reactions, the crew index (hive/e
 src/foil/helm.foil                     the supervisor, feet, register, gifts
 src/foil/namespace.foil                ownership, permitted, the log
 src/foil/weft_std.foil                 the stdlib formulas (gather, count, where, follow, ...)
-src/foil/sys/view.foil                 the cell type
+src/foil/sys/shrine.foil                 the cell type
 src/foil/json.foil, fetch.foil         JSON; the (unused) fetch vocabulary; the real call is the Fetch builtin
 src/reaver/http-client.rvr             Fetch ABI
 x/eden, x/check, x/foil-check          boot a world; run Foil suites

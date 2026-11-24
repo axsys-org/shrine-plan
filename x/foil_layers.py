@@ -3,9 +3,9 @@
 from pathlib import Path
 import re
 import sys
+from foil_modules import inventory, LAYERS
 
 ROOT = Path(__file__).resolve().parent.parent
-LAYERS = ('sys', 'types', 'stdlib/base', 'namespace', 'vanes', 'stdlib/runtime')
 FIXTURES = ('tests/', 'test_fixtures/', 'fixtures/')
 
 
@@ -19,17 +19,23 @@ def imports(text):
                 yield name, number
 
 
-def check(root):
+def check(root, entries=None):
+    if entries is None:
+        try:
+            entries = inventory(root)
+        except (OSError, ValueError) as error:
+            return [str(error)]
     sources = {p.relative_to(root).with_suffix('').as_posix(): p
                for p in sorted(root.rglob('*.foil'))}
     errors = []
+    errors.extend(f'{name}: inventory source is missing'
+                  for name in entries if name not in sources)
     graph = {}
     ranks = {}
     for name, path in sources.items():
         if name.startswith(FIXTURES):
             continue
-        rank = (0 if name.startswith('sys/') else
-                LAYERS.index(name) if name in LAYERS[1:] else None)
+        rank = LAYERS.index(entries[name][0]) if name in entries else None
         if rank is None:
             errors.append(f'{name}: unclassified production module')
             continue

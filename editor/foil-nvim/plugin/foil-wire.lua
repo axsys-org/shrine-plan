@@ -26,6 +26,10 @@ vim.api.nvim_create_user_command("FoilCompile", connected(function()
   require("foil.diag").compile()
 end), { desc = "recompile the buffer's module (resync + diagnostics)" })
 
+vim.api.nvim_create_user_command("FoilLint", connected(function()
+  require("foil.diag").lint()
+end), { desc = "lint the saved buffer without typechecking it" })
+
 vim.api.nvim_create_user_command("FoilDoctest", connected(function()
   require("foil.diag").doctest()
 end), { desc = "run the buffer module's doctests" })

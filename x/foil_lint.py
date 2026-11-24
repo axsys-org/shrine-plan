@@ -83,7 +83,7 @@ SESSION = r'''
 (define (lint-one path)
   (define text (read-text-file path))
   (If (Eq 0 (Bytes text))
-    (say-fail path 0 0 "io" "empty or unreadable (outside --file-root?)")
+    (print ("LF" path "0" "0"))
     (let ((r (Try (lambda (z)
                 (let ((report (lint-check (force (rex:ParseRexFile text)))))
                   (DeepSeq report report))) 0)))
@@ -151,16 +151,14 @@ def select_files(args):
             names += git_lines('ls-files', '--others', '--exclude-standard')
         return sorted({p for p in names if (ROOT / p).is_file()})
     return [p for p in tracked_foil()
-            if not p.startswith('src/foil-bad/') and p not in GENERATED]
+            if not p.startswith('src/foil-bad/') and p not in GENERATED and (ROOT / p).is_file()]
 
 
 def session_path(repo_path):
     # ReadFile is jailed to --file-root: paths must be root-relative
     if repo_path.startswith('src/'):
         return repo_path[len('src/'):]
-    if repo_path.startswith('extras/'):
-        return repo_path
-    fail(2, f'{repo_path}: outside src/ and extras/, unreachable from the file root')
+    return repo_path
 
 
 def run_session(files, timeout):
@@ -169,7 +167,7 @@ def run_session(files, timeout):
         fail(2, f'no wisp on PATH and no {ROOT}/wisp (enter the dev shell or set WISP)')
     template = (Path(os.environ['TEST_TEMPLATE']) if os.environ.get('TEST_TEMPLATE')
                 else ROOT / '.check' / ('template-' + tr.compiler_key(wisp)))
-    if not (template / 'data.mdb').exists():
+    if not (template / 'arena.dat').is_file():
         fail(2, 'no matching compiler/runtime template - run x/check --fast first')
     source = Path(os.environ.get('TEST_SOURCE_ROOT') or ROOT / 'src')
     if os.environ.get('TEST_RUN_DIR'):
@@ -179,16 +177,25 @@ def run_session(files, timeout):
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True)
     tr.copy_template(template, work / 'snap')
-    if any(p.startswith('extras/') for p in files):
-        # Merged root: extras live outside src and the file-root jail
-        # follows symlinks.  copytree keeps mtimes (copy2), which the
+    external = [p for p in files if not p.startswith('src/')]
+    if external:
+        # Merged root: tracked samples and mounts live outside src.
+        # Copy selected files into the file-root jail; parsing does not
+        # need their sibling assets. The core compiler still needs src.
+        # copytree keeps mtimes (copy2), which the
         # .rvr module cache's Stamp check needs to stay warm.
         root = work / 'root'
         shutil.copytree(source, root, ignore=shutil.ignore_patterns('__pycache__'))
-        shutil.copytree(ROOT / 'extras', root / 'extras')
+        for repo_path in external:
+            target = root / repo_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / repo_path, target)
     else:
         root = source
     paths = [session_path(p) for p in files]
+    missing = [p for p in paths if not (root / p).is_file()]
+    if missing:
+        fail(2, 'missing source in file root: ' + ', '.join(missing))
     script = SESSION.replace('@FILES@', ' '.join(tr.rvr_string(p) for p in paths))
     code, complete, _ = tr.run_process([wisp, '--file-root', str(root), 'snap', 'root', '_'],
                                        work, script, timeout)
@@ -196,7 +203,7 @@ def run_session(files, timeout):
     if not (complete and READY.search(log) and DONE.search(log)):
         error = tr.ERROR.search(log)
         detail = log[error.start():error.start() + 2000] if error else ('timeout' if not complete else '')
-        why = 'compile of lint.foil failed' if not READY.search(log) else 'session unfinished'
+        why = 'compile of stdlib/base.foil failed' if not READY.search(log) else 'session unfinished'
         fail(2, f'{why} (exit={code}) - see {work}/out.log\n{detail}')
     return log, dict(zip(paths, files)), work
 
@@ -219,21 +226,26 @@ def parse_log(log):
     return diags, linted, default_rules, all_rules, timing
 
 
-def text_checks(repo_path):
+def text_diagnostics(text):
     # Text-level rules: the guide forbids tabs; trailing whitespace is a
     # freebie a Rex tree cannot see.
     out = []
-    for n, line in enumerate((ROOT / repo_path).read_text(errors='replace').split('\n'), 1):
+    for n, line in enumerate(text.split('\n'), 1):
         if '\t' in line:
-            out.append(dict(file=repo_path, line=n, col=line.index('\t') + 1,
+            out.append(dict(line=n, col=len(line[:line.index('\t')].encode('utf-8')) + 1,
                             level=TEXT_LEVEL['tabs'], rule='tabs',
                             msg='tab character (text-level check)'))
         stripped = line.rstrip(' \t')
         if stripped != line:
-            out.append(dict(file=repo_path, line=n, col=len(stripped) + 1,
+            out.append(dict(line=n, col=len(stripped.encode('utf-8')) + 1,
                             level=TEXT_LEVEL['trailing-space'], rule='trailing-space',
                             msg='trailing whitespace (text-level check)'))
     return out
+
+
+def text_checks(repo_path):
+    return [dict(d, file=repo_path) for d in
+            text_diagnostics((ROOT / repo_path).read_text(errors='replace'))]
 
 
 def counts_by_file_rule(diags):

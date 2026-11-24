@@ -15,10 +15,11 @@ import threading
 
 from eden_mounts import runtime_literal, select
 from test_runner import ROOT, copy_template, stage
+from foil_lint import text_diagnostics
 
 MAX_REQUEST = 1024 * 1024
 MODULE = re.compile(r'[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\Z')
-OPS = {'compile', 'eval', 'describe', 'complete', 'doctest'}
+OPS = {'compile', 'lint', 'eval', 'describe', 'complete', 'doctest'}
 
 
 def validate(request):
@@ -105,6 +106,7 @@ class Compiler:
     def sources(self):
         files = {p.relative_to(self.source_root / 'foil').as_posix(): p
                  for p in (self.source_root / 'foil').rglob('*.foil')}
+        files['modules.tsv'] = self.source_root / 'foil/modules.tsv'
         for mount in self.mounts:
             for key in ('modules', 'tests'):
                 for mod, rel in mount.manifest.get(key, {}).items():
@@ -146,20 +148,40 @@ class Compiler:
             if self.process is None or self.process.poll() is not None:
                 raise RuntimeError('compiler stopped; restart the service')
             changed = self.refresh()
-            args = ' '.join(runtime_literal(request.get(key, ''))
-                            for key in ('op', 'module', 'text', 'name', 'prefix'))
-            state = '0' if changed else 'wire-state'
-            self.send(f'(Seq (define wire-result (wire:handle {state} {args})) 0)\n'
-                      '(Seq (define wire-state (_0 wire-result)) 0)\n'
-                      '(Seq (write-text-file ".wire-response.json" (_1 wire-result)) '
-                      '(Seq (print "FOIL-WIRE-DONE") 0))\n')
-            self.wait('"FOIL-WIRE-DONE"')
-            result = json.loads((self.temp_sources / '.wire-response.json').read_text())
+            if changed:
+                self.send('(define wire-state 0)\n')
+            if request['module'] + '.foil' not in self.origins:
+                return {'ok': False, 'error': 'module source not found: ' + request['module']}
+            result = self.execute(request)
+            if request['op'] in ('compile', 'lint'):
+                lint = (result if request['op'] == 'lint' else
+                        self.execute(dict(op='lint', module=request['module'])))
+                findings = [dict(d, source='foil-lint') for d in lint.get('diags', [])]
+                text = (self.temp_sources / 'foil' / (request['module'] + '.foil')).read_text()
+                findings += [dict(d, module=request['module'], source='foil-lint')
+                             for d in text_diagnostics(text)]
+                if not lint.get('ok') and not lint.get('diags'):
+                    findings.append(dict(module=request['module'], source='foil-lint',
+                                         line=1, col=1, level='error',
+                                         msg=lint.get('error', 'lint failed')))
+                result['diags'] = ((result.get('diags', []) if request['op'] == 'compile' else [])
+                                   + findings)
+                result['lint_ok'] = bool(lint.get('ok'))
             if result.get('ok') and request['op'] == 'describe':
                 path = self.origins.get(result.get('module', '') + '.foil')
                 if path:
                     result['file'] = str(path)
             return result
+
+    def execute(self, request, state='wire-state'):
+        args = ' '.join(runtime_literal(request.get(key, ''))
+                        for key in ('op', 'module', 'text', 'name', 'prefix'))
+        self.send(f'(Seq (define wire-result (wire:handle {state} {args})) 0)\n'
+                  '(Seq (define wire-state (_0 wire-result)) 0)\n'
+                  '(Seq (write-text-file ".wire-response.json" (_1 wire-result)) '
+                  '(Seq (print "FOIL-WIRE-DONE") 0))\n')
+        self.wait('"FOIL-WIRE-DONE"')
+        return json.loads((self.temp_sources / '.wire-response.json').read_text())
 
     def close(self):
         if self.process:

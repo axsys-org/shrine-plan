@@ -1,0 +1,50 @@
+;;;; Loader inventory and canonical publication ownership are independent.
+;;;; Read once per preparation; the resulting roots enter the frozen context.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind parse (#module parse))
+
+(define layers ["sys" "types" "base" "namespace" "vanes" "runtime"])
+(define (valid-name name)
+  (define (letter byte) (Or (Eq byte 95) (And (Ge byte 97) (Le byte 122))))
+  (define (segment part)
+    (define (tail i)
+      (If (Eq i (Bytes part)) 1
+        (let ((byte (Load8 i part)))
+          (And (Or (letter byte) (And (Ge byte 48) (Le byte 57)))
+            (tail (Inc i))))))
+    (And (Bytes part) (And (letter (Load8 0 part)) (tail 1))))
+  (And (Bytes name) (all segment (parse:split-byte 47 name))))
+
+(define (parse-inventory text)
+  (define lines (filter (lambda (line)
+    (And (Bytes line) (Nil (Eq 35 (Load8 0 line)))))
+    (parse:split-byte 10 text)))
+  (define entries (map (parse:split-byte 9) lines))
+  (DeepSeq (foldl (lambda (seen row)
+    (If (And (Eq 3 (Sz row))
+      (And (valid-name (_0 row)) (And (valid-name (_2 row)) (includes (Equal (_1 row)) layers)))) 0
+      (error ["invalid-module-inventory-entry" row]))
+    (If (includes (Equal (_0 row)) seen)
+      (error ["duplicate-module-inventory-entry" (_0 row)]) 0)
+    (define parts (parse:split-byte 47 (_0 row)))
+    (If (Equal (And (Gt (Sz parts) 1) (Equal "sys" (_0 parts)))
+               (Equal "sys" (_1 row))) 0
+      (error ["invalid-system-layer" row]))
+    (snoc (_0 row) seen)) [] entries) 0)
+  (DeepSeq (map (lambda (row)
+    (define owner (find (lambda (other) (Equal (_0 other) (_2 row))) entries))
+    (If (And owner (Equal (_0 (_0 owner)) (_2 (_0 owner)))) 0
+      (error ["invalid-publication-owner" row]))
+    (If (Equal (Equal "sys" (_1 row)) (Equal "sys" (_1 (_0 owner)))) 0
+      (error ["ownership-crosses-system-boundary" row]))) entries) entries))
+
+(define (read ignored) (parse-inventory (read-text-file "foil/modules.tsv")))
+
+(define (owner entries name)
+  (define found (find (lambda (row) (Equal name (_0 row))) entries))
+  (If found (_2 (_0 found)) name))
+
+(#export read owner parse-inventory)

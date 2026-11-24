@@ -330,7 +330,7 @@ The criterion for a successful refactor is that a new domain can declare its dat
 These references describe the inspected checkout, including uncommitted work. This note does not claim a new runtime verification run. Earlier architecture documents contain historical limits and proposals; executable validators take precedence when those differ.
 
 1. [Shrine records, care scopes, and lifetimes](../../src/foil/sys/shrine.foil); [namespace publications and history](../../src/foil/namespace.foil).
-2. [Derived record and tree constructors](../../src/foil/sys/view.foil); [slot vocabulary](../../slots/README.md).
+2. [Derived record and tree constructors](../../src/foil/sys/shrine.foil); [slot vocabulary](../../slots/README.md).
 3. [Grove role and action contracts](../../src/foil/grove_role_runtime.foil); [action compilation](../../src/foil/grove_actions.foil).
 4. [Goo authoring reference](../../src/grove/GOO.md); [constructor validation, view selection, and pane composition](../../src/foil/grove_views.foil).
 5. [Pane contracts and lifecycle](../mounts/explorer/PANES.md); [pane description production](../mounts/explorer/goo_panes.foil); [route host](../mounts/explorer/goo_workspace_mount.foil).

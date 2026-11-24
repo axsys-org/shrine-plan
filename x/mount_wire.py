@@ -11,7 +11,8 @@ from mount_tools import atomic_write, leaf_name
 
 
 class MountWire:
-    def __init__(self, compiler, mounts, live=None, timeout=600):
+    def __init__(self, compiler, mounts, live=None, timeout=600, refresh_core=None):
+        self.refresh_core = refresh_core
         self.compiler = compiler
         self.mounts = {m.name: m for m in mounts}
         self.live = live
@@ -68,6 +69,19 @@ class MountWire:
         return {'ok': True, 'mount': name, 'reloaded': results}
 
     def request(self, request):
+        if isinstance(request, dict) and request.get('op') == 'core/reload':
+            with self.lock:
+                if self.live is None or self.refresh_core is None:
+                    return {'ok': False, 'error': 'Core reload requires a live Eden wire.'}
+                for name in self.mounts:
+                    _, error = self.checked(name)
+                    if error:
+                        return error
+                self.refresh_core()
+                try:
+                    return self.live('@core', True)
+                except RuntimeError as error:
+                    return {'ok': False, 'error': str(error)}
         if not isinstance(request, dict) or request.get('op') not in ('mount/status', 'mount/save', 'mount/reload'):
             return self.compiler.request(request)
         with self.lock:

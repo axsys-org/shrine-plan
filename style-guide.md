@@ -12,22 +12,22 @@ style requirements until resolved.
 ## Example
 
 ```foil
-+  is_txt
++ is_txt
   '  Whether v is a nonempty cord of printable ASCII bytes.
   '  ?=  ((tyshow/is_txt "abc") 1)
   '  ?=  ((tyshow/is_txt 3) 0)
   \ v=nat
   ^ bool
-  ? | eq v 0
-   .false
+  ? (eq v 0)
+    .false
   % rest=nat v
-  ? | eq rest 0
-   .true
+  ? (eq rest 0)
+    .true
   = byte | mod rest 256
-  ? | lt byte 32
-   .false
-  ? | lt 126 byte
-   .false
+  ? (lt byte 32)
+    .false
+  ? (lt 126 byte)
+    .false
   | _ | div rest 256
 ```
 
@@ -213,38 +213,39 @@ produced — no `PChoice`, no chance of incorrect flat output.
 ## Whitespace Layout
 
 At the module level the `+` rune induces a two space margin for its children.
-Inside a declaration the gutter should have a one space margin as in the example
-above.
+Inside a declaration, bodies sit two columns past their parent rune.
+Operand lists may instead align under the first operand. Use one space after
+`+`, just as for other runes; declaration bodies retain their two-space margin.
 
 Here are the columns in the opening example. Each `·` represents one space;
 the column numbers and notes are not part of the code.
 
 ```text
 0123456789                  column (zero-based)
-+··is_txt                   module rune: column 0
++·is_txt                   module rune: column 0
 ··\·v=nat                   declaration rune: column 2, value column 4
 ··^·bool
-··?·|·eq·v·0                parent rune: column 2
-···.false                   branch: column 3 (+1 from parent)
+··?·(eq·v·0)                parent rune: column 2
+····.false                  branch: column 4 (+2 from parent)
 ··%·rest=nat·v              back to declaration gutter
 
 0 → 2   two-space margin from the module rune to its children
-2 → 3   one-space margin from the parent rune to its branch
+2 → 4   two-space margin from the parent rune to its branch
 2 → n   n-space margin for dealing with backstepping
 ```
 
 
 ```foil
 0123456789                  column (zero-based)
-+··is_txt                   module rune: column 0
-··+··help                   module rune inside module rune: column 2
++·is_txt                   module rune: column 0
+··+·help                   module rune inside module rune: column 2
 ····|·add·2·3               nested declaration rune: column 4, value colum 6
 ··\·v=nat                   declaration rune: column 2, value column 4
 
 ```
 
-Line width has a hard cap at 72. Line width above 54 is suspect, but may be
-called for. Tabs are forbidden
+Line width has a hard cap at 80. Line width above 72 is suspect (a lint
+warning), but may be called for. Width above 80 is a lint error. Tabs are forbidden.
 
 ## Rune layout
 
@@ -289,31 +290,44 @@ separate let binding (single-use lets are eliminated by the compiler).
 UFCS vs free fns is a judgement call, you should use whichever maximises the
 aesthetic of the code
 
+### Path literals
+
+Always write literal paths with slash syntax: `'/foo/bar`, not
+`['foo 'bar]`. This includes single-segment paths (`'/foo`), numeric
+segments (`'/foo/3`), and the empty/root path (`'/`). Parenthesize the
+empty path as `('/)` in argument positions so Rex does not absorb the
+following text into the literal. A bare `'foo` is one symbol, not a path.
+
+Use row construction only when path segments are computed, such as
+`[authority 'app name]`, or append computed segments to a literal prefix
+with `.snoc`. Ordinary rows that are not paths retain row syntax.
+
 ### Rune layout `=`
 
 `=` layout can be either kingside e.g.
 ```foil
-+  foo
++ foo
   = bar 3
     baz 4
   | add bar baz
 ```
-or queenside e.g.
+or queenside for a multiline value:
 ```foil
-  =   bar
-    | some outrageously
-     | long way
-    | to make three
-    '
-      baz
-    4
-  | add bar baz
+  =   result
+    | transform source
+      | choose mode
+        fallback
+  | finish result
 ```
-Queenside style indents variable names/patterns by 3 spaces and the
-corresponding bodies by 1 from the gutter  Use `'` SLUG doccomments to document variables and give
-the layout breathing room.
-If the bodies of variables take up more than one line, always use queenside for
-the entire declaration group.
+Queenside patterns sit four columns past `=`, and their values sit two
+columns past it. A multiline value must remain one expression. Keep
+parentheses when they group multiple statements into that expression.
+
+Group adjacent short bindings in an aligned kingside stanza. Give complex
+values separate queenside bindings. Use `'` comments for explanations, not
+empty separators between bindings. An inner `^` can supply type information
+that does not flow through a parenthesized body; avoid repeating that same
+type on the binding name.
 
 Kingside values should be aligned on the first rune of the value
 ```foil

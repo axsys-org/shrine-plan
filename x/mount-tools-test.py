@@ -21,6 +21,22 @@ class Tests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.folder = create(self.root, 'clockwork')
 
+    def test_core_reload_requires_live_server_and_checks_descriptors(self):
+        mounts = select(self.root, ['clockwork'])
+        self.assertFalse(MountWire(CompilerStub(), mounts).request({'op': 'core/reload'})['ok'])
+        events = []
+        def live(name, rescan):
+            events.append((name, rescan))
+            return {'ok': True}
+        service = MountWire(CompilerStub(), mounts, live,
+                            refresh_core=lambda: events.append('capture'))
+        self.assertTrue(service.request({'op': 'core/reload'})['ok'])
+        self.assertEqual(events, ['capture', ('@core', True)])
+        add_file(self.root, 'clockwork', 'extra.foil')
+        events.clear()
+        self.assertTrue(service.request({'op': 'core/reload'})['restart_required'])
+        self.assertEqual(events, [])
+
     def test_scaffold_and_registration(self):
         mount = select(self.root, ['clockwork'])[0]
         self.assertEqual(mount.manifest['grove'][0]['root'], ['gov', 'clockwork'])
