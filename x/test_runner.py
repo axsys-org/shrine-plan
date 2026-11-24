@@ -127,8 +127,10 @@ def inventory():
         suites.append(dict(name=mod, kind='reaver', target=mod, group=mod,
                            fast=False, timeout=900, category='manual', enabled=False, reason=reason))
     known = registered | data['excluded'].keys()
+    # Explicit suites may be executable demos without a test-style filename.
+    # Still discover unregistered tests, and require every known file to exist.
     found = {p.stem for p in (ROOT / 'src/reaver').glob('*.rvr')
-             if p.stem.endswith('-tests') or p.stem.startswith('test-')}
+             if p.stem in known or p.stem.endswith('-tests') or p.stem.startswith('test-')}
     if found != known:
         raise ValueError(f'inventory drift: unclassified={sorted(found-known)}, missing={sorted(known-found)}')
     helpers = data.get('native_helpers', {})

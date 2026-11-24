@@ -1,0 +1,158 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ilc (#module ilc))
+(#import ilc)
+
+;; Change structure, including replacement by zero and code-shaped values.
+assert(Equal 7 (apply-change 7 (nil-change 7)))
+assert(Equal 0 (apply-change 7 (diff-change 7 0)))
+assert(Equal 0 (diff-change [1 2] [1 2]))
+assert(Equal [1 9]
+  (apply-change [1 2] (app-change 0 (replace-change 9))))
+assert(Equal (0 1 2) (apply-change 8 (replace-change (0 1 2))))
+assert(Equal 11
+  (apply-change 3 (compose-change 3 (replace-change 7) (replace-change 11))))
+assert(Equal 7
+  (apply-change 3 (compose-change 3 (replace-change 7) 0)))
+assert(Equal 7
+  (apply-change 3 (compose-change 3 0 (replace-change 7))))
+assert(Equal "DIFF" (Hd plan-changes))
+assert(Equal 9 ((_0 plan-changes) 1 ((_1 plan-changes) 1 9)))
+assert(Equal 0 ((_2 plan-changes) 9))
+
+(define (check f x y)
+  (Equal (f y) (apply-change (f x) (differentiate f x (diff-change x y)))))
+(define (identity x) x)
+(define (constant x) 42)
+(define (square x) (Mul x x))
+assert(check identity 2 8)
+assert(check constant 2 8)
+assert(check square 3 5)
+assert(check square 5 0)
+assert(Equal 0 (differentiate square 5 0))
+assert(Equal 0 ((derive constant) 8 (replace-change 10)))
+assert(Equal (replace-change 8) ((derive identity) 3 (replace-change 8)))
+assert(Equal 2 (Arity (derive square)))
+assert(Equal 25 (apply-change 9 ((derive square) 3 (replace-change 5))))
+
+;; Multi-argument laws, PAPs, and changes to captured arguments.
+assert(Equal 4 (Arity (derive Add)))
+assert(Equal 12 (apply-change 5 ((derive Add) 2 3 (replace-change 7) (replace-change 5))))
+assert(check (Add 2) 3 9)
+assert(Equal 11 (apply-change 5 ((derive (Add 2)) 3 (replace-change 9))))
+(define (curried x) (Add x))
+assert(Equal 9
+  ((apply-change (curried 2) (differentiate curried 2 (replace-change 5))) 4))
+(define (call f x) (f x))
+assert(Equal 15
+  (apply-change (call (Add 2) 3)
+    ((derive call) (Add 2) 3 (replace-change (Mul 3)) (replace-change 5))))
+(define (captured x)
+  (define f (Add x))
+  (f x))
+assert(check captured 2 7)
+;; A function replacement can change arity, even across the saturation point.
+assert(Equal 4
+  (apply-change (call Add 3)
+    ((derive call) Add 3 (replace-change Inc) 0)))
+assert(Equal 7
+  ((apply-change (call Inc 3)
+    ((derive call) Inc 3 (replace-change Add) 0)) 4))
+
+;; Constants in derivative bodies are always requoted under the larger scope.
+(define literal-law (Law 0 "literal" 2))
+assert(check literal-law 2 9)
+(define quoted-law (Law 0 "quoted" (0 (0 1 2))))
+assert(check quoted-law 2 9)
+(define pap-law (Law 0 "pap" (Mul 2)))
+assert(Equal 12
+  ((apply-change (pap-law 3) (differentiate pap-law 3 (replace-change 7))) 6))
+;; A pin-headed PAP with two arguments must not be mistaken for (0 f x).
+(define literal-pap (If 1 23))
+(define literal-pap-law (Law 0 "literal-pap" literal-pap))
+assert(Equal literal-pap
+  (apply-change (literal-pap-law 2)
+    (differentiate literal-pap-law 2 (replace-change 8))))
+
+;; Forward refs and shared lets. These raw laws bypass front-end elimination.
+(define forward-law (Law 0 "forward" (1 3 (1 (0 Inc 1) 2))))
+assert(check forward-law 3 7)
+(define shared-law
+  (Law 0 "shared" (1 (0 (0 Mul 1) 1) (0 (0 Add 2) 2))))
+assert(check shared-law 3 5)
+;; Recursive let values remain lazy, and primal/delta slots share their scope.
+(define cyclic-law
+  (Law 0 "cyclic" (1 (0 (0 (0 0) 1) 2) 2)))
+(define (changed-cycle ignored)
+  (apply-change (cyclic-law 3) (differentiate cyclic-law 3 (replace-change 8))))
+assert(Equal 8 (_0 (changed-cycle 0)))
+assert(Equal 8 (_0 (_1 (changed-cycle 0))))
+assert(Equal 8 (_0 (_1 (_1 (changed-cycle 0)))))
+;; Original self must escape with its original arity and pin identity.
+(define self-law (Pin (Law 0 "self" 0)))
+assert(Equal self-law
+  (apply-change (self-law 2) (differentiate self-law 2 (replace-change 5))))
+(define (sum-to n) (Ifz n 0 (Add n (sum-to (Dec n)))))
+assert(check sum-to 3 5)
+assert(check sum-to 5 0)
+
+;; Lazy branches must not force old results or unused argument deltas.
+(define (fail x) (error "ilc forced an unused branch"))
+assert(Equal 0 (differentiate fail 1 0))
+(define (branch x) (Ifz x 19 (fail x)))
+assert(Equal 19 (apply-change (branch 1) (differentiate branch 1 (replace-change 0))))
+assert(Equal 19
+  (apply-change (branch 0) (differentiate branch 0 (replace-change 0))))
+(define (ignore x) (If 1 42 (fail x)))
+assert(check ignore 2 3)
+;; Replacing the result of a primitive does not demand the old result.
+assert(Equal 2
+  (apply-change (Div 10 0) (differentiate (Div 10) 0 (replace-change 5))))
+
+;; Primitive rules compose through transformed code, including PAP captures.
+;; A canonical zero distinguishes the custom rule from primitive fallback.
+(define (inc-rule x dx)
+  (Ifz dx 0 (replace-change (Inc (apply-change x dx)))))
+(define rules [[Inc inc-rule]])
+(define (capturing-rule offset x dx)
+  (Ifz dx 0 (replace-change (Add offset (apply-change x dx)))))
+assert(Equal (replace-change 9)
+  ((derive-with [[Inc (capturing-rule 1)]] Inc) 3 (replace-change 8)))
+assert(Equal 0 ((derive-with rules Inc) 2 0))
+(define (twice-inc x) (Inc (Inc x)))
+assert(Equal 0 ((derive-with rules twice-inc) 2 0))
+assert(Equal 9
+  (apply-change (twice-inc 2)
+    ((derive-with rules twice-inc) 2 (replace-change 7))))
+;; A valid rule can be independent of an unavailable old input.
+(define (keep-first x y) x)
+(define (keep-first-rule x y dx dy) dx)
+(define keep-rules [[keep-first keep-first-rule]])
+assert(Equal (replace-change 9)
+  ((derive-with keep-rules keep-first) 3 (fail 0) (replace-change 9) (fail 0)))
+(define (use-keep x) (keep-first x (fail x)))
+assert(Equal 9
+  (apply-change (use-keep 3)
+    ((derive-with keep-rules use-keep) 3 (replace-change 9))))
+(define (pap-rule x dx) (Ifz dx 0 (replace-change (Add 2 (apply-change x dx)))))
+(define pap-rules [[(Add 2) pap-rule]])
+assert(Equal 0 ((derive-with pap-rules (Add 2)) 3 0))
+assert(Equal 9
+  (apply-change 5 ((derive-with pap-rules (Add 2)) 3 (replace-change 7))))
+
+;; Data constructors and arbitrary primitive results use the same contract.
+(define (pair x) [x (Inc x)])
+assert(check pair 3 7)
+assert(check (Ix 1) [3 4] [8 9])
+;; Direct primitive pins also have a compiled derivative adapter.
+assert(Equal 10
+  (apply-change 4 ((derive (Pin "B")) ("Inc" 3) (replace-change ("Inc" 9)))))
+;; Several functions and input pairs check the defining equation together.
+assert(all (lambda (f)
+  (all (lambda (x)
+    (all (lambda (y) (check f x y)) [0 1 2 5])) [0 1 2 5]))
+  [identity constant square captured pair sum-to])
+assert(Equal 1 (Hd (Try derive 0)))
+(print "incremental lambda calculus tests passed")

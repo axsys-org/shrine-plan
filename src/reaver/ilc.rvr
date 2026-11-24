@@ -1,0 +1,194 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind pe (#module pe))
+
+;; An untyped incremental lambda calculus for pure PLAN computations.
+;; See Cai et al., A Theory of Changes for Higher-Order Languages (2014).
+;; https://arxiv.org/abs/1312.0658
+;;
+;; Changes are relative to an OLD value:
+;;   0                  keep that value (including a function)
+;;   ("ILC_SET" value)  replace it, without inspecting the old value
+;;   ("ILC_APP" df dx)  change the two sides of an application/PAP
+;;   ("ILC_CUSTOM" apply payload)  a domain-specific change; apply old payload
+;; Custom appliers are pure and must obey the same relative-change contract.
+;; The last form is valid only when the old value is an application.
+;; This keeps changes to captured arguments until a law is saturated.
+;; Opaque primitives use replacement changes; rules can supply cheaper
+;; derivatives. Effects are outside the calculus. No speedup is promised
+;; for primitives without rules, and this is not a cache-transfer transform.
+;;
+;; Contract: apply-change (f x) (differentiate f x dx)
+;;                         == f (apply-change x dx)
+;; Equality here is observational; changes need not be canonical.
+;;
+;; Example: (apply-change (Inc 3)
+;;            (differentiate Inc 3 (replace-change 8)))  => 9
+;;          ((derive Add) 2 3 (replace-change 7) 0) is a change from 5 to 10.
+
+(define (differentiable apply diff nil)
+  ("DIFF" apply diff nil))
+
+(define (replace-change value) ("ILC_SET" value))
+(define (app-change df dx) ("ILC_APP" df dx))
+(define (custom-change apply payload) ("ILC_CUSTOM" apply payload))
+
+(define (apply-change value delta)
+  (cond
+    ((Nil delta) value)
+    ((Equal (Hd delta) "ILC_SET") (_0 delta))
+    ((Equal (Hd delta) "ILC_CUSTOM") ((_0 delta) value (_1 delta)))
+    ((Equal (Hd delta) "ILC_APP")
+      ((apply-change (Init value) (_0 delta))
+       (apply-change (Last value) (_1 delta))))
+    (else (error ["ilc: invalid change" delta]))))
+
+;; Explicit diff may inspect both values; the generated derivative never
+;; uses it, so replacing a value does not force an unused old computation.
+(define (diff-change old new)
+  (If (Equal old new) 0 (replace-change new)))
+(define (nil-change value) 0)
+(define plan-changes (differentiable apply-change diff-change nil-change))
+
+;; Compose changes relative to successive bases, not two changes at one base.
+(define (compose-change value first second)
+  (Ifz second first
+    (Ifz first second
+      (replace-change (apply-change (apply-change value first) second)))))
+
+;; Do not scan all argument deltas for zero: doing so forces changes to
+;; unused branches. APP nodes and replacement payloads stay lazy instead.
+;; recur handles a saturated application after collecting its PAP spine.
+(define (derive-apply rules recur f df x dx)
+  (If (Eq 1 (pe:plan-arity f))
+    (recur rules f df [x] [dx])
+    (app-change df dx)))
+
+;; pe's predicates describe the core law language. Guard heads with Equal:
+;; numeric Eq coerces a pin/law to 0, which must not make a literal into code.
+(define (body-call? depth body)
+  (And (Equal 0 (Hd body)) (pe:law-call? depth body)))
+(define (body-const body)
+  (If (Equal 0 (Hd body)) (pe:pull-const body) body))
+(define (body-let? body)
+  (And (Equal 1 (Hd body)) (Eq 2 (Sz body))))
+
+;; All let slots are in scope throughout the prelude, including forward
+;; and recursive references. Collect them before renumbering any expression.
+(define (split-body body)
+  (If (body-let? body)
+    (let ((rest (split-body (_1 body))))
+      [(cons (_0 body) (_0 rest)) (_1 rest)])
+    [[] body]))
+
+;; The derivative takes x1 .. xn dx1 .. dxn. Each old let slot becomes
+;; two slots (primal, delta). Self remains the ORIGINAL law, not its derivative.
+(define (primal-ref arity ref)
+  (If (Le ref arity) ref
+    (Dec (Mul 2 ref))))
+(define (delta-ref arity ref)
+  (If (Le ref arity) (Add arity ref)
+    (Mul 2 ref)))
+
+(define (primal-body law arity depth body)
+  (cond
+    ((pe:law-var? depth body)
+      (Ifz body (pe:law-quote law) (primal-ref arity body)))
+    ((body-call? depth body)
+      (0 (primal-body law arity depth (_0 body))
+         (primal-body law arity depth (_1 body))))
+    ;; Requote after lifting: a literal nat may now be a reference.
+    (else (pe:law-quote (body-const body)))))
+
+(define (body-apply f args)
+  (foldl (lambda (f x) (0 f x)) f args))
+
+(define (delta-body rules recur law arity depth body)
+  (cond
+    ((pe:law-var? depth body)
+      (Ifz body (pe:law-quote 0) (delta-ref arity body)))
+    ((body-call? depth body)
+      (let ((f (_0 body)) (x (_1 body)))
+        (body-apply (pe:law-quote derive-apply)
+          [(pe:law-quote rules) (pe:law-quote recur)
+           (primal-body law arity depth f)
+           (delta-body rules recur law arity depth f)
+           (primal-body law arity depth x)
+           (delta-body rules recur law arity depth x)])))
+    (else (pe:law-quote 0))))
+
+(define (make-derivative rules recur f)
+  (define law (If (IsPin f) (Unpin f) f))
+  (define arity (Arity law))
+  (define parts (split-body (Body law)))
+  (define binds (_0 parts))
+  (define depth (Add arity (Sz binds)))
+  (define (primal body) (primal-body f arity depth body))
+  (define (delta body) (delta-body rules recur f arity depth body))
+  (Law (Dec (Mul 2 arity)) (strWeld "delta-" (Name law))
+    (foldr (lambda (body rest) (1 (primal body) (1 (delta body) rest)))
+      (delta (_1 parts)) binds)))
+
+;; Rules are rows of [original-function derivative]. The derivative takes
+;; all old arguments, then all changes, and returns an output change.
+;; Matching preserves pin identity. Rules are trusted to satisfy the contract.
+(define (find-rule rules f)
+  (Ifz rules 0
+    (If (Equal f (_0 (_0 rules))) [(_1 (_0 rules))]
+      (find-rule (drop 1 rules) f))))
+
+(define (changed-args args deltas)
+  (gen (Sz args) (lambda (i) (apply-change (Ix i args) (Ix i deltas)))))
+
+;; Ordinary application preserves a PAP's flat spine. Coup's bulk allocation
+;; path can nest an already-partial head when the call remains unsaturated.
+;; Rules may themselves capture an environment, so apply their args one by one.
+(define (apply-args f args)
+  (foldl (lambda (fn arg) (fn arg)) f args))
+
+(define (change-call rules f df args deltas)
+  (define rule (find-rule rules f))
+  (define law (If (IsPin f) (Unpin f) f))
+  (cond
+    ((And (Nil df) rule)
+      (apply-args (apply-args (_0 rule) args) deltas))
+    ;; Peeling APP deltas transports changes to already captured arguments.
+    ((And (IsApp f) (Or (Nil df) (Equal (Hd df) "ILC_APP")))
+      (change-call rules (Init f) (Ifz df 0 (_0 df))
+        (cons (Last f) args) (cons (Ifz df 0 (_1 df)) deltas)))
+    ((And (Nil df) (IsLaw law))
+      (apply-args (apply-args (Memo (make-derivative rules change-call) f) args) deltas))
+    ;; Includes changed function values and primitive pins. Recompute only
+    ;; the updated call, not the old result; that is essential for laziness.
+    (else
+      (replace-change (apply-args (apply-change f df) (changed-args args deltas))))))
+
+;; Unary application, including one step of a curried/multi-argument function.
+;; (differentiate f x) itself is a function from dx to the output change.
+(define (differentiate-with rules f x dx)
+  (Ifz dx 0 (derive-apply rules change-call f 0 x dx)))
+(define (differentiate f x) (differentiate-with [] f x))
+
+;; Compile a whole callable: (derive f) x1 .. xn dx1 .. dxn -> delta-result.
+;; For a PAP/primitive/rule, generate an adapter to the same application rule.
+;; A bare law is transformed immediately; derived laws are memoized.
+(define (derive-with rules f)
+  (define arity (pe:plan-arity f))
+  (define law (If (IsPin f) (Unpin f) f))
+  (Ifz arity (error ["ilc: derive expects a callable" f])
+    (If (And (IsLaw law) (Nil (find-rule rules f)))
+      (Memo (make-derivative rules change-call) f)
+      (Law (Dec (Mul 2 arity)) "delta-call"
+        (body-apply (pe:law-quote change-call)
+          [(pe:law-quote rules) (pe:law-quote f) (pe:law-quote 0)
+           (body-apply (pe:law-quote 0) (gen arity Inc))
+           (body-apply (pe:law-quote 0)
+             (gen arity (lambda (i) (Add arity (Inc i)))))])))))
+(define (derive f) (derive-with [] f))
+
+(#export
+ differentiable plan-changes
+ replace-change app-change custom-change apply-change diff-change nil-change compose-change
+ differentiate differentiate-with derive derive-with)

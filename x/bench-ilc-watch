@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Benchmark watcher specialization against production lain_poke/react.
+
+Uses the shared staged compiler, freezes the input sources and times work
+inside Wisp. The full log, source snapshot and JSON report are retained.
+"""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import statistics
+import tempfile
+
+import test_runner as runner
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'))
+    parser.add_argument('--samples', type=int, default=5)
+    parser.add_argument('--events', type=int, default=32)
+    parser.add_argument('--updates', type=int, default=8)
+    parser.add_argument('--timeout', type=float, default=300)
+    parser.add_argument('--churn-sweep', action='store_true',
+                        help='measure genuine bucket replacements against events between updates')
+    parser.add_argument('--paths', type=int, default=128)
+    parser.add_argument('--subscribers', type=int, default=16)
+    parser.add_argument('--changed', type=int, default=2)
+    parser.add_argument('--edits', default='1,8,16,32,64,128')
+    parser.add_argument('--reuse', default='1,2,3,4,6,8,12,16')
+    parser.add_argument('--points', help='selected edit:reuse pairs instead of the full sweep grid')
+    args = parser.parse_args()
+    if args.samples < 1 or args.events < 8 or args.updates < 1 or args.timeout <= 0:
+        parser.error('samples/updates/timeout must be positive; events must be >= 8')
+    try:
+        edits = sorted(set(map(int, args.edits.split(','))))
+        reuses = sorted(set(map(int, args.reuse.split(','))))
+        points = sorted(set(tuple(map(int, p.split(':'))) for p in args.points.split(','))) if args.points else None
+    except ValueError:
+        parser.error('edits/reuse must be comma-separated integers')
+    if args.churn_sweep and (args.paths < 1 or args.subscribers < 1 or args.changed < 1
+            or args.changed > args.paths or not edits or min(edits) < 1
+            or (not points and max(edits) > args.paths) or not reuses or min(reuses) < 1):
+        parser.error('sweep sizes must be positive; changed/edits must not exceed paths')
+    if points and (not args.churn_sweep or any(len(p) != 2 or p[0] < 1
+                  or p[0] > args.paths or p[1] < 1 for p in points)):
+        parser.error('points require --churn-sweep and positive edit:reuse pairs with edits <= paths')
+    if not args.wisp or not os.access(args.wisp, os.X_OK):
+        parser.error('set WISP=/path/to/wisp or use --wisp')
+    wisp = str(Path(args.wisp).resolve())
+    template = runner.stage(wisp, False, args.timeout)
+    root = Path(tempfile.mkdtemp(prefix='ilc-watch-bench-', dir=runner.ROOT / '.check'))
+    runner.copy_template(template, root / 'snap')
+    shutil.copytree(runner.ROOT / 'src', root / 'src')
+    if args.churn_sweep:
+        edit_row = '[' + ' '.join(map(str, edits)) + ']'
+        reuse_row = '[' + ' '.join(map(str, reuses)) + ']'
+        call = (f'(bench:churn-sweep {args.samples} {args.updates} {args.paths} '
+                f'{args.subscribers} {args.changed} {edit_row} {reuse_row})')
+        if points:
+            point_row = '[' + ' '.join(f'[{e} {r}]' for e, r in points) + ']'
+            call = (f'(bench:churn-points {args.samples} {args.updates} {args.paths} '
+                    f'{args.subscribers} {args.changed} {point_row})')
+    else:
+        call = f'(bench:run {args.samples} {args.events} {args.updates})'
+    source = '(#bind bench (#module ilc-watch-bench))\n' + call + '\n'
+    print('Benchmark artifacts: ' + str(root), flush=True)
+    code, completed, seconds = runner.run_process(
+        [wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
+        root, source, args.timeout)
+    log = (root / 'out.log').read_text(errors='replace')
+    if code or not completed or runner.ERROR.search(log) or '"WATCH-BENCH-DONE"' not in log:
+        raise RuntimeError(f'benchmark failed (exit={code}, complete={completed}): {root}/out.log')
+    cases = {}
+    for match in re.finditer(r'^\("WATCH-CASE"\s+' + r'\s+'.join([runner.ATOM] * 6) + r'\)', log, re.M):
+        name, *fields = [runner.decode_atom(x) for x in match.groups()]
+        cases[name] = dict(zip(['paths', 'subscribers_per_path', 'changed_paths',
+                               'edited_paths', 'events_per_update'], map(int, fields)))
+    records = []
+    keys = set()
+    for match in re.finditer(r'^\("WATCH-BENCH"\s+' + r'\s+'.join([runner.ATOM] * 6) + r'\)', log, re.M):
+        name, mode, sample, units, ns, checksum = [runner.decode_atom(x) for x in match.groups()]
+        row = dict(case=name, mode=mode, sample=int(sample), units=int(units),
+                   ns=int(ns), checksum=int(checksum))
+        key = name, mode, row['sample']
+        if key in keys or row['ns'] <= 0 or row['units'] <= 0:
+            raise RuntimeError(f'invalid/duplicate timing: {row}')
+        keys.add(key)
+        records.append(row)
+    modes = ['baseline', 'captured', 'indexed', 'g', 'direct-pe', 'build', 'patch-only',
+             'rebuild', 'incremental', 'life-baseline', 'life-incremental']
+    if args.churn_sweep:
+        modes = ['life-baseline', 'life-incremental']
+    expected = {(name, mode, sample) for name in cases for mode in modes for sample in range(args.samples)}
+    case_count = (len(points) if points else len(edits) * len(reuses)) if args.churn_sweep else 6
+    if len(cases) != case_count or keys != expected:
+        raise RuntimeError(f'incomplete timings: {len(cases)} cases, {len(keys)}/{len(expected)} records')
+    by_key = {(r['case'], r['mode'], r['sample']): r for r in records}
+    for name in cases:
+        for sample in range(args.samples):
+            for equivalent in [('baseline', 'captured', 'indexed', 'g', 'direct-pe'),
+                               ('life-baseline', 'life-incremental')]:
+                if equivalent[0] not in modes:
+                    continue
+                checksums = {by_key[name, mode, sample]['checksum'] for mode in equivalent}
+                if len(checksums) != 1:
+                    raise RuntimeError(f'checksum mismatch: {name}, {sample}, {equivalent}')
+    summary = {}
+    for name, config in cases.items():
+        timing = {}
+        for mode in modes:
+            values = [r['ns'] / r['units'] for r in records if r['case'] == name and r['mode'] == mode]
+            timing[mode] = dict(median_ns=statistics.median(values), min_ns=min(values), max_ns=max(values))
+        def median(mode):
+            return timing[mode]['median_ns']
+        if args.churn_sweep:
+            ratios = [by_key[name, 'life-baseline', i]['ns'] /
+                      by_key[name, 'life-incremental', i]['ns'] for i in range(args.samples)]
+            summary[name] = dict(config=config, timings=timing,
+                lifecycle_speedup=median('life-baseline') / median('life-incremental'),
+                paired_speedups=ratios, specialized_wins=sum(ratio > 1 for ratio in ratios))
+            continue
+        savings = median('baseline') - median('g')
+        summary[name] = dict(config=config, timings=timing,
+            dispatch_speedup=median('baseline') / median('g'),
+            pe_over_indexed_speedup=median('indexed') / median('g'),
+            update_vs_rebuild_speedup=median('rebuild') / median('incremental'),
+            lifecycle_speedup=median('life-baseline') / median('life-incremental'),
+            setup_break_even_events=math.ceil(median('build') / savings) if savings > 0 else None)
+    files = ['pe', 'ilc', 'ilc-watch', 'ilc-watch-fixture', 'ilc-watch-bench']
+    report = dict(timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        host=platform.platform(), machine=platform.machine(), runtime=wisp,
+        runtime_sha256=hashlib.sha256(Path(wisp).read_bytes()).hexdigest(),
+        samples=args.samples, events=args.events, updates=args.updates, wall_seconds=seconds,
+        experiment='genuine-churn-sweep' if args.churn_sweep else 'original-workloads',
+        sweep_workload=('Fixed edited buckets; every replacement rotates all care assignments; '
+                        'identities/lengths unchanged; all event sign grades are 1; '
+                        'changed paths vary between events; existing cache, initial build excluded.'
+                        if args.churn_sweep else None),
+        artifact_directory=str(root),
+        sources={name: hashlib.sha256((root / 'src/reaver' / (name + '.rvr')).read_bytes()).hexdigest()
+                 for name in files},
+        scope='Actual react notifications; rest checked for correctness but not forced in timings. '
+              'Excludes hive_bump, eyes_from, react_lens, fixture compilation and input generation. '
+              'Build/update timers deeply force the whole specialization; lifecycle includes watcher '
+              'patches and specialization maintenance but excludes initial cache construction.',
+        summary=summary, records=records)
+    (root / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+    if args.churn_sweep:
+        print('edits  events/update   baseline ms/cycle   specialized ms/cycle   speedup   wins')
+        for item in summary.values():
+            c, t = item['config'], item['timings']
+            print(f'{c["edited_paths"]:5} {c["events_per_update"]:14} '
+                  f'{t["life-baseline"]["median_ns"]/1e6:19.3f} '
+                  f'{t["life-incremental"]["median_ns"]/1e6:22.3f} '
+                  f'{item["lifecycle_speedup"]:8.2f}x {item["specialized_wins"]}/{args.samples}')
+        print('Report: ' + str(root / 'results.json'))
+        return
+    print('case                 f us/event   g us/event   dispatch   rebuild/update   lifecycle')
+    for name, item in summary.items():
+        t = item['timings']
+        print(f'{name:20} {t["baseline"]["median_ns"]/1000:10.2f} '
+              f'{t["g"]["median_ns"]/1000:12.2f} {item["dispatch_speedup"]:9.2f}x '
+              f'{item["update_vs_rebuild_speedup"]:15.2f}x {item["lifecycle_speedup"]:10.2f}x')
+    print('Report: ' + str(root / 'results.json'))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError) as error:
+        raise SystemExit(str(error))

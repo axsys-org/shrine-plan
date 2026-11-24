@@ -1,0 +1,164 @@
+;; Incremental lambda calculus for PLAN: an executable walkthrough.
+;;
+;; Run: x/check ilc-demo       (with wisp on PATH, or WISP set)
+;; REPL: (#bind demo (#module ilc-demo))
+;; Also runs in the ilc-tests group and the default/fast test gates.
+;; Read from top to bottom: each section prints its results and checks them.
+
+(#bind std (#module std))
+(#import std)
+(#bind ilc (#module ilc))
+(#import ilc)
+
+(print "1. A change describes how to update an OLD value")
+
+;; A change is not an arithmetic difference. Here it means 'replace by 8'.
+;; Zero means 'keep'; replacing by zero needs an explicit replacement.
+(define dx (replace-change 8))
+assert(Equal 8 (apply-change 3 dx))
+assert(Equal 3 (apply-change 3 0))
+assert(Equal 0 (apply-change 3 (replace-change 0)))
+(print ["old" 3 "change" dx "updated" (apply-change 3 dx)])
+
+;; diff-change discovers a change by comparing values. nil-change constructs
+;; the identity change. plan-changes packages apply, diff, and nil as a DIFF
+;; descriptor; the rest of the walkthrough uses the named functions directly.
+assert(Equal dx (diff-change 3 8))
+assert(Equal 0 (diff-change 3 3))
+assert(Equal 3 (apply-change 3 (nil-change 3)))
+assert(Equal 8 ((_0 plan-changes) 3 ((_1 plan-changes) 3 8)))
+
+(print "2. Differentiate an application, then update its old result")
+
+(define (square x) (Mul x x))
+(define old-square (square 3))
+(define square-change (differentiate square 3 dx))
+(define new-square (apply-change old-square square-change))
+assert(Equal 9 old-square)
+assert(Equal 64 new-square)
+(print ["square: old" old-square "change" square-change "updated" new-square])
+
+;; This equation is the contract, for any valid input change:
+;;   apply-change (f x) (differentiate f x dx) == f (apply-change x dx)
+;; 'Differentiate' computes an OUTPUT CHANGE, not the updated output itself.
+assert(Equal (square (apply-change 3 dx)) new-square)
+assert(Equal 0 (differentiate square 3 0))
+
+(print "3. Compile a reusable derivative law")
+
+;; derive produces an ordinary PLAN law. Arguments are all old inputs first,
+;; then all their changes: df x1 .. xn dx1 .. dxn.
+(define d-square (derive square))
+assert(Equal 2 (Arity d-square))
+assert(Equal 25 (apply-change (square 3) (d-square 3 (replace-change 5))))
+(print ["derivative name" (Name d-square) "arity" (Arity d-square)])
+
+(define d-add (derive Add))
+(define sum-change (d-add 2 3 (replace-change 7) (replace-change 5)))
+assert(Equal 4 (Arity d-add))
+assert(Equal 12 (apply-change (Add 2 3) sum-change))
+;; Only the first argument changes this time: 2+3 becomes 7+3.
+assert(Equal 10 (apply-change 5 (d-add 2 3 (replace-change 7) 0)))
+(print ["sum: old" 5 "updated" (apply-change 5 sum-change)])
+
+(print "4. Change part of a data application")
+
+;; PLAN rows are application spines: [3 4] is ((0 3) 4).
+;; app-change df dx changes Init and Last, respectively. Keeping the prefix
+;; and replacing the last element gives [3 9], without replacing the whole row.
+(define old-pair [3 4])
+(define pair-change (app-change 0 (replace-change 9)))
+(define new-pair (apply-change old-pair pair-change))
+assert(Equal [3 9] new-pair)
+;; Nest an application change to reach the first element instead.
+assert(Equal [8 4]
+  (apply-change old-pair (app-change (app-change 0 dx) 0)))
+(define (pair-total pair) (Add (_0 pair) (_1 pair)))
+(define total-change (differentiate pair-total old-pair pair-change))
+assert(Equal 12 (apply-change (pair-total old-pair) total-change))
+assert(Equal (pair-total new-pair) (apply-change 7 total-change))
+(print ["row: old" old-pair "change" pair-change "updated" new-pair])
+
+(print "5. Partial applications carry changes to captured arguments")
+
+;; A function can be a result. add-offset returns an Add partial application.
+;; The output change preserves the change to its captured offset until use.
+(define (add-offset offset) (Add offset))
+(define offset-change (differentiate add-offset 2 (replace-change 7)))
+(define updated-adder (apply-change (add-offset 2) offset-change))
+assert(Equal 10 (updated-adder 3))
+(print ["captured offset change" offset-change "applied to 3" (updated-adder 3)])
+
+;; We can also differentiate a function that already has a captured argument.
+(define d-add-two (derive (Add 2)))
+assert(Equal 11 (apply-change 5 (d-add-two 3 (replace-change 9))))
+
+(print "6. Functions can change just like other inputs")
+
+(define (call f x) (f x))
+(define callback-change
+  ((derive call) (Add 2) 3 (replace-change (Mul 3)) (replace-change 5)))
+;; Old: (Add 2) 3 = 5. New: (Mul 3) 5 = 15.
+assert(Equal 15 (apply-change (call (Add 2) 3) callback-change))
+(print ["callback: old" 5 "updated" (apply-change 5 callback-change)])
+
+(print "7. Local bindings and recursive calls work too")
+
+(define (sum-to n) (Ifz n 0 (Add n (sum-to (Dec n)))))
+(define (score n)
+  (define subtotal (sum-to n))
+  (Add subtotal subtotal))
+(define score-change (differentiate score 3 (replace-change 5)))
+assert(Equal 12 (score 3))
+assert(Equal 30 (apply-change (score 3) score-change))
+assert(Equal (score 5) (apply-change (score 3) score-change))
+(print ["recursive score: old" (score 3) "updated" (apply-change (score 3) score-change)])
+
+(print "8. Updating a lazy branch need not evaluate its old result")
+
+(define (fail x) (error "ilc-demo forced an unused computation"))
+(define (choose x) (Ifz x 19 (fail x)))
+;; Do not print (choose 1): it throws. Its thunk can still be the old result
+;; when a replacement change lets apply-change return the updated branch.
+assert(Equal 19
+  (apply-change (choose 1) (differentiate choose 1 (replace-change 0))))
+;; A no-change input does not require evaluating even the original function.
+assert(Equal 0 (differentiate fail 1 0))
+(print "Updated branch returns 19; the unused failing computation stays lazy")
+
+(print "9. Supply custom derivative rules")
+
+;; Opaque primitives otherwise recompute their updated result and return a
+;; replacement. A rule can exploit the meaning of a particular operation.
+;; Here Inc propagates zero immediately, preserving no-change information
+;; through a larger function. Rules must satisfy the same update equation.
+(define (inc-change x dx)
+  (Ifz dx 0 (replace-change (Inc (apply-change x dx)))))
+(define rules [[Inc inc-change]])
+(define (twice-inc x) (Inc (Inc x)))
+(define d-twice-inc (derive-with rules twice-inc))
+assert(Equal 0 (d-twice-inc 3 0))
+assert(Equal 10 (apply-change (twice-inc 3) (d-twice-inc 3 dx)))
+assert(Equal 9
+  (apply-change (Inc 3) (differentiate-with rules Inc 3 dx)))
+(print ["custom rules: no-change" (d-twice-inc 3 0)
+        "changed result" (apply-change (twice-inc 3) (d-twice-inc 3 dx))])
+;; The generated derivative calls the registered rules at matching callees.
+;; This does not guarantee a speedup for every program: there is no stored
+;; execution trace, and operations without rules may recompute their result.
+
+(print "10. Compose successive updates")
+
+;; The second change is relative to the result of the first, not the initial
+;; base. Here 3 -> 8 -> 11 can be applied as one change to the original 3.
+(define next-change (diff-change 8 11))
+(define combined (compose-change 3 dx next-change))
+assert(Equal 11 (apply-change 3 combined))
+assert(Equal (apply-change (apply-change 3 dx) next-change)
+  (apply-change 3 combined))
+assert(Equal 121
+  (apply-change (square 3) (differentiate square 3 combined)))
+(print ["composed input" (apply-change 3 combined)
+        "updated square" (apply-change (square 3) (differentiate square 3 combined))])
+
+(print "ILC walkthrough passed: updating the old result agrees with fresh evaluation")

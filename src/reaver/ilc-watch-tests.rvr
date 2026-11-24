@@ -1,0 +1,93 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind pe (#module pe))
+(#bind ilc (#module ilc))
+(#bind watch (#module ilc-watch))
+(#bind fixture (#module ilc-watch-fixture))
+
+(define (check ignored)
+  (define api (fixture:create 0))
+  (define original (fixture:eyes api 8 9))
+  (define cache (watch:specialize api original))
+  (define g (watch:program cache))
+  (define direct (watch:direct-specialize api original))
+  (define captured (pe:partial-eval (watch:baseline api original)))
+  (define (same eyes g signs)
+    (Equal (watch:observations api (watch:baseline api eyes signs))
+      (watch:observations api (g signs))))
+  assert(Equal 1 (Arity g))
+  assert(Equal 1 (Arity direct))
+  ;; Every care-grade combination, including grade 2 and explicit all-zero.
+  assert(all (lambda (n)
+    (define signs ((_2 api) (fixture:path 3)
+      ((Ix 6 api) (Mod n 3) (Mod (Div n 3) 3) (Div n 9)) (Ix 4 api)))
+    (And (same original g signs)
+      (And (same original direct signs) (same original captured signs))))
+    (gen 27 (lambda (i) i)))
+  assert(same original g (Ix 4 api))
+  assert(same original g (fixture:signs api 20 4 15 2))
+  ;; Empty rows, the root, overlapping ancestor/descendant paths, duplicates.
+  (define special
+    ((_2 api) [] (fixture:subscribers api 5 1)
+      ((_2 api) (fixture:path 0) []
+        ((_2 api) (Weld (fixture:path 1) [("ts" "child")])
+          (Rep 0 ((Ix 7 api) (_0 (Ix 8 api)) []) 3) original))))
+  (define special-signs
+    ((_2 api) [] ((Ix 6 api) 2 1 0)
+      ((_2 api) (Weld (fixture:path 1) [("ts" "child")]) ((Ix 6 api) 2 0 0)
+        (fixture:signs api 8 8 0 2))))
+  assert(same special (watch:program (watch:specialize api special)) special-signs)
+  ;; Sparse edits: replace, delete, insert, clear a row, and overwrite an edit.
+  (define edits [[(fixture:path 2) [(fixture:subscribers api 7 2)]]
+                [(fixture:path 3) 0]
+                [(fixture:path 10) [(fixture:subscribers api 4 1)]]
+                [(fixture:path 4) [[]]]
+                [(fixture:path 2) [(fixture:subscribers api 5 0)]]])
+  (define dx (watch:watch-change api edits))
+  (define updated (watch:update api cache dx))
+  (define eyes2 (ilc:apply-change original dx))
+  (define rebuilt (watch:specialize api eyes2))
+  assert(Equal ((_1 api) eyes2) ((_1 api) (watch:watching updated)))
+  assert(all (lambda (i)
+    (define signs (fixture:signs api 12 12 i (Mod i 3)))
+    (And (same eyes2 (watch:program updated) signs)
+      (Equal (watch:observations api ((watch:program rebuilt) signs))
+        (watch:observations api ((watch:program updated) signs))))) [0 1 2])
+  ;; Derivative can be applied through the generic ILC API, including fallback.
+  assert(Equal 0 (watch:d-specialize api original 0))
+  assert(Equal 0 (watch:watch-change api []))
+  assert(Equal cache (watch:update api cache 0))
+  ;; A custom derivative transfers the retained cache: it need not evaluate
+  ;; the old input to produce its output change.
+  (define delta (watch:d-specialize api (error "recomputed old watcher state") dx))
+  assert(same eyes2 (watch:program (ilc:apply-change cache delta)) special-signs)
+  ;; Poison partitioning for old y/z subscribers. Changing an x-only bucket
+  ;; must reuse the other buckets, rather than repartitioning all watchers.
+  (define (only-x care sign)
+    (If (Equal care (_0 (Ix 8 api))) ((Ix 5 api) care sign)
+      (error "repartitioned an unchanged bucket")))
+  (define guarded (Up 5 only-x api))
+  (define one-edit [[(fixture:path 2) [[((Ix 7 api) (_0 (Ix 8 api)) [])]]]])
+  (define local-update (watch:update guarded cache (watch:watch-change guarded one-edit)))
+  assert(same (watch:patch-eyes api original one-edit)
+    (watch:program local-update) special-signs)
+  assert(same eyes2 (watch:program (watch:update api cache (ilc:replace-change eyes2))) special-signs)
+  ;; Consume subscriptions, update the specialization to its returned rest,
+  ;; and ensure a repeated event does not emit the same notifications again.
+  (define event (fixture:signs api 8 2 0 2))
+  (define result (g event))
+  (define fired ((_1 api) (_0 result)))
+  (define consume (map (lambda (entry)
+    (define path (_0 entry))
+    (define hit (find (lambda (item) (Equal path (_0 item))) ((_1 api) (_1 result))))
+    [path (Ifz hit 0 [(_1 (_0 hit))])]) fired))
+  (define after (watch:update api cache (watch:watch-change api consume)))
+  assert(Equal [] ((_1 api) (_0 ((watch:program after) event))))
+  assert(same (_1 result) (watch:program after) event)
+  ;; Empty watcher indexes have no news; new watches can be installed later.
+  assert(same (Ix 4 api) (watch:program (watch:specialize api (Ix 4 api))) event)
+  (print "watch specialization agrees with production react")
+  1)
+assert(check 0)

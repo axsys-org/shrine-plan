@@ -1,0 +1,204 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind pe (#module pe))
+(#bind watch (#module ilc-watch))
+(#bind fixture (#module ilc-watch-fixture))
+
+;; Timers are inside the VM (Now is ns in Wisp). Setup, fixture compilation,
+;; input generation, semantic checks and warming are outside timing windows.
+;; Every result used by the workload is forced before the end timestamp.
+;; No Memo of event results. A fresh application is made for every iteration.
+(define (measure case sample mode units work)
+  (define start (Now 0))
+  (define result (Seq start (work 0)))
+  (define end (Seq (DeepSeq result 0) (Now 0)))
+  (Seq (print ("WATCH-BENCH" case mode (showNat sample) (showNat units)
+    (showNat (Sub end start)) (showNat result))) result))
+
+;; Production sovereign_cycle_with consumes news and ignores react's rest.
+;; Time that demand pattern, not a forced reconstruction of unused rest.
+(define (news-count api result)
+  (foldl (lambda (count entry) (Add count (Sz (_1 entry))))
+    0 ((_1 api) (_0 result))))
+(define (events-work api fn events)
+  (foldl (lambda (count signs) (Add count (news-count api (fn signs)))) 0 events))
+
+;; Check every state transition and whole output, outside the timing window.
+(define (validate-updates api eyes cache batches events)
+  (Ifz batches 1
+    (let ((next-eyes (watch:patch-eyes api eyes (_0 batches)))
+          (next-cache (watch:update api cache (watch:watch-change api (_0 batches)))))
+      (And (all (lambda (signs)
+        (Equal (watch:observations api (watch:baseline api next-eyes signs))
+          (watch:observations api ((watch:program next-cache) signs)))) events)
+        (validate-updates api next-eyes next-cache (drop 1 batches) events)))))
+
+;; For updates, carry the previous result forward; do not rebuild independent
+;; snapshots. These edit streams use replacements (bounded cache size).
+(define (state-work api mode eyes cache batches)
+  (define (loop eyes cache batches count)
+    (Ifz batches count
+      (let ((edits (_0 batches)))
+        (define next-eyes (watch:patch-eyes api eyes edits))
+        (define next-cache
+          (If (Equal mode "rebuild") (watch:specialize api next-eyes)
+            (watch:update api cache (watch:watch-change api edits))))
+        (define forced (If (Equal mode "patch-only") (DeepSeq next-eyes 0)
+          (DeepSeq next-cache 0)))
+        (Seq forced
+          (loop next-eyes (If (Equal mode "patch-only") cache next-cache)
+            (drop 1 batches) (Inc count))))))
+  (loop eyes cache batches 0))
+
+;; End-to-end watcher edits plus events. The whole specialization update is
+;; charged. Initial cache construction is measured separately as 'build'.
+;; As in sovereign_cycle_with's eyes_from(hive), each round's watcher state is
+;; supplied independently of react's discarded rest. This is not a benchmark
+;; of hive_bump, eyes_from, lens translation or the rest of the sovereign cycle.
+(define (lifecycle api mode eyes cache batches events)
+  (define (loop eyes cache batches count)
+    (Ifz batches count
+      (let ((edits (_0 batches)))
+        (define next-eyes (watch:patch-eyes api eyes edits))
+        (define next-cache (watch:update api cache (watch:watch-change api edits)))
+        (define fn (If (Equal mode "baseline") (watch:baseline api next-eyes)
+          (watch:program next-cache)))
+        (define ready (If (Equal mode "baseline") (DeepSeq next-eyes 0)
+          (DeepSeq next-cache 0)))
+        (define total (Seq ready (events-work api fn events)))
+        (Seq total
+          (loop next-eyes (If (Equal mode "baseline") cache next-cache)
+            (drop 1 batches) (Add count total))))))
+  (loop eyes cache batches 0))
+
+;; case = [name paths subscribers-per-path changed-paths edited-paths events/update]
+(define (run-case api samples case event-count update-count)
+  (define name (_0 case))
+  (define paths (_1 case))
+  (define subs (_2 case))
+  (define changed (_3 case))
+  (define edited (_4 case))
+  (define per-update (Ix 5 case))
+  (define eyes (fixture:eyes api paths subs))
+  (define cache (watch:specialize api eyes))
+  (define g (watch:program cache))
+  (define captured (pe:partial-eval (watch:baseline api eyes)))
+  (define direct (watch:direct-specialize api eyes))
+  (define indexed (watch:run-prepared api (_0 cache)))
+  (define events (gen event-count (lambda (i) (fixture:signs api paths changed i (Mod i 3)))))
+  (define batches (gen update-count (lambda (i)
+    (gen edited (lambda (j)
+      [(fixture:path (Mod (Add i j) paths))
+       [(fixture:subscribers api subs (Add i (Inc j)))]])))))
+  (define life-events (take per-update events))
+  ;; Check the ACTUAL outputs, including remaining subscriptions, before
+  ;; using small checksums in the timing loop. Warm every execution variant.
+  (define checked
+    (all (lambda (signs)
+      (define expected (watch:observations api (watch:baseline api eyes signs)))
+      (And (Equal expected (watch:observations api (g signs)))
+        (And (Equal expected (watch:observations api (captured signs)))
+          (And (Equal expected (watch:observations api (direct signs)))
+               (Equal expected (watch:observations api (indexed signs))))))) events))
+  (define warm (DeepSeq [eyes cache captured direct events batches life-events]
+    (Seq (state-work api "incremental" eyes cache (take 1 batches))
+      (Seq (state-work api "rebuild" eyes cache (take 1 batches))
+        (If (And checked (validate-updates api eyes cache batches life-events))
+          1 (error ["watch benchmark mismatch" name]))))))
+  (define modes ["baseline" "captured" "indexed" "g" "direct-pe" "build" "patch-only"
+                "rebuild" "incremental" "life-baseline" "life-incremental"])
+  (define (one sample mode)
+    (cond
+      ((Equal mode "baseline")
+        (measure name sample mode event-count
+          (lambda (z) (events-work api (watch:baseline api eyes) events))))
+      ((Equal mode "captured")
+        (measure name sample mode event-count (lambda (z) (events-work api captured events))))
+      ((Equal mode "indexed")
+        (measure name sample mode event-count (lambda (z) (events-work api indexed events))))
+      ((Equal mode "g")
+        (measure name sample mode event-count (lambda (z) (events-work api g events))))
+      ((Equal mode "direct-pe")
+        (measure name sample mode event-count (lambda (z) (events-work api direct events))))
+      ((Equal mode "build")
+        (measure name sample mode 1
+          (lambda (z) (DeepSeq (watch:specialize api eyes) 1))))
+      ((Equal mode "life-baseline")
+        (measure name sample mode update-count
+          (lambda (z) (lifecycle api "baseline" eyes cache batches life-events))))
+      ((Equal mode "life-incremental")
+        (measure name sample mode update-count
+          (lambda (z) (lifecycle api "incremental" eyes cache batches life-events))))
+      (else (measure name sample mode update-count
+        (lambda (z) (state-work api mode eyes cache batches))))))
+  ;; Reverse mode order on alternating samples to reduce order/warmth bias.
+  (define (repeat sample)
+    (If (Eq sample samples) 1
+      (Seq (foldl (lambda (acc mode) (Seq (one sample mode) 0)) 0
+        (If (Mod sample 2) (rev modes) modes)) (repeat (Inc sample)))))
+  (Seq warm
+    (Seq (print ("WATCH-CASE" name (showNat paths) (showNat subs)
+      (showNat changed) (showNat edited) (showNat per-update)))
+      (repeat 0))))
+
+(define cases
+  [["small-sparse" 32 8 1 1 8]
+   ["medium-sparse" 128 16 1 1 8]
+   ["large-sparse" 512 16 2 1 8]
+   ["medium-dense" 128 16 128 1 8]
+   ["high-churn" 128 16 2 32 1]
+   ["quiet" 128 16 0 1 8]])
+(define (run samples event-count update-count)
+  (define api (fixture:create 0))
+  (Seq (DeepSeq api 0)
+    (Seq (foldl (lambda (acc case)
+      (Seq (run-case api samples case event-count update-count) 0)) 0 cases)
+      (print "WATCH-BENCH-DONE"))))
+;; A controlled crossover experiment. Every submitted bucket really changes:
+;; the edited set is fixed, and its subscribers' care assignments alternate
+;; between offsets +1 and +2 from the initial rows. Subscriber identities and
+;; row lengths stay fixed. Unlike the original overlapping-batch workload,
+;; there are no redundant rewrites. Events always grade x/y/z as 1, so each
+;; changed path emits the same number of notifications regardless of reuse.
+(define (churn-points samples update-count paths subs changed points)
+  (define api (fixture:create 0))
+  (define eyes (fixture:eyes api paths subs))
+  (define cache (watch:specialize api eyes))
+  (define (one-case edited reuse)
+    (define name (strWeld "edit-" (strWeld (showNat edited)
+      (strWeld "-reuse-" (showNat reuse)))))
+    (define batches (gen update-count (lambda (i)
+      (gen edited (lambda (j)
+        [(fixture:path j)
+         [(fixture:subscribers api subs (Add j (Inc (Mod i 2))))]])))))
+    (define events (gen reuse (lambda (i)
+      (foldl (lambda (out j)
+        ((_2 api) (fixture:path (Mod (Add i j) paths))
+          ((Ix 6 api) 1 1 1) out)) (Ix 4 api) (gen changed (lambda (j) j))))))
+    (define ready (DeepSeq [batches events]
+      (If (validate-updates api eyes cache batches events) 1
+        (error ["churn sweep mismatch" name]))))
+    (define (timed sample mode)
+      (measure name sample (strWeld "life-" mode) update-count
+        (lambda (z) (lifecycle api mode eyes cache batches events))))
+    (define (repeat sample)
+      (If (Eq sample samples) 1
+        (Seq (If (Mod sample 2)
+          (Seq (timed sample "incremental") (timed sample "baseline"))
+          (Seq (timed sample "baseline") (timed sample "incremental")))
+          (repeat (Inc sample)))))
+    (Seq ready
+      (Seq (print ("WATCH-CASE" name (showNat paths) (showNat subs)
+        (showNat changed) (showNat edited) (showNat reuse)))
+        (repeat 0))))
+  (Seq (DeepSeq [api eyes cache] 0)
+    (Seq (foldl (lambda (acc point)
+      (Seq (one-case (_0 point) (_1 point)) 0)) 0 points)
+      (print "WATCH-BENCH-DONE"))))
+(define (churn-sweep samples update-count paths subs changed edits-counts reuses)
+  (churn-points samples update-count paths subs changed
+    (foldl (lambda (out edited)
+      (Weld out (map (lambda (reuse) [edited reuse]) reuses))) [] edits-counts)))
+(#export run run-case churn-sweep churn-points)

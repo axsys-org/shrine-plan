@@ -1,5 +1,6 @@
 """Failure-path tests for the gate; run with python3 x/test_runner_tests.py."""
 import os
+import json
 import shutil
 import tempfile
 import unittest
@@ -185,6 +186,31 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('foil:tests/supervisor', names)
         self.assertIn('foil:tests/http_foot', names)
         self.assertFalse(any(name.startswith('helm-') for name in names))
+
+    def test_explicit_demo_preserves_inventory_drift_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sources = root / 'src/reaver'
+            sources.mkdir(parents=True)
+            (root / 'test-inventory.json').write_text(json.dumps({
+                'groups': [dict(name='demo', modules=['walkthrough-demo'],
+                                fast=True, timeout=30, category='reaver')],
+                'excluded': {}, 'commands': [],
+            }))
+            demo = sources / 'walkthrough-demo.rvr'
+            demo.touch()
+            with patch.object(runner, 'ROOT', root):
+                suite, = runner.inventory()
+                self.assertEqual(suite['name'], 'walkthrough-demo')
+                self.assertTrue(suite['enabled'] and suite['fast'])
+                stray = sources / 'forgotten-tests.rvr'
+                stray.touch()
+                with self.assertRaisesRegex(ValueError, "unclassified=\\['forgotten-tests'\\]"):
+                    runner.inventory()
+                stray.unlink()
+                demo.unlink()
+                with self.assertRaisesRegex(ValueError, "missing=\\['walkthrough-demo'\\]"):
+                    runner.inventory()
 
     def test_generated_helpers_are_covered_without_running_as_suites(self):
         suites = {s['name']: s for s in runner.inventory()}

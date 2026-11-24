@@ -1,0 +1,99 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#bind pe (#module pe))
+(#bind ilc (#module ilc))
+
+;; A staged form of lain_poke/react, not a replacement for the driver.
+;; api = [react tap put del empty fires sign dep [care-x care-y care-z]].
+;; All tree operations and care semantics come from the real Foil module.
+;; Its output is [news remaining-eyes]; fired subscriptions are consumed.
+;; Equality is by axal/tap, since persistent tree shapes need not be identical.
+
+(define (baseline api eyes signs) ((_0 api) signs eyes))
+(define (observations api result)
+  [((_1 api) (_0 result)) ((_1 api) (_1 result))])
+
+;; There are only eight firing patterns for x/y/z (grade 1 and grade 2
+;; both fire). Preserve original subscriber order and duplicates in each row.
+(define (partition-table api subscribers)
+  (gen 8 (lambda (mask)
+    (define sign ((Ix 6 api) (Test 0 mask) (Test 1 mask) (Test 2 mask)))
+    [(filter (lambda (dep) ((Ix 5 api) (_0 dep) sign)) subscribers)
+     (filter (lambda (dep) (Nil ((Ix 5 api) (_0 dep) sign))) subscribers)])))
+(define (prepare api eyes)
+  [eyes (foldl (lambda (index entry)
+    (bst:bst-insert (_0 entry) (partition-table api (_1 entry)) index))
+    0 ((_1 api) eyes))])
+(define (sign-mask sign)
+  (Add (Truth (_0 sign)) (Add (Mul 2 (Truth (_1 sign))) (Mul 4 (Truth (_2 sign))))))
+
+;; Visit changed paths, not every watcher. Each matched bucket needs one
+;; table lookup instead of a loop testing each subscriber's care.
+;; Starting rest at eyes also preserves paths not mentioned in signs.
+(define (run-prepared api prepared signs)
+  (foldl (lambda (result entry)
+    (define path (_0 entry))
+    (define found (bst:bst-search path (_1 prepared)))
+    (Ifz (And found (_0 found)) result
+      (let ((parts (Ix (sign-mask (_1 entry)) (_0 found))))
+        [(Ifz (_0 parts) (_0 result) ((_2 api) path (_0 parts) (_0 result)))
+         (Ifz (_1 parts) ((_3 api) path (_1 result))
+           ((_2 api) path (_1 parts) (_1 result)))])))
+    [(Ix 4 api) (_0 prepared)] ((_1 api) signs)))
+
+;; Binding-time factoring exposes the static watcher work explicitly.
+;; Blind PE of baseline merely captures eyes; it does not invent this index.
+(define (staged api eyes signs) (run-prepared api (prepare api eyes) signs))
+(define (direct-specialize api eyes)
+  (pe:partial-eval-with [prepare] (staged api eyes)))
+(define (finish api prepared)
+  [prepared (pe:partial-eval (run-prepared api prepared))])
+(define (specialize api eyes) (finish api (prepare api eyes)))
+(define (program cache) (_1 cache))
+(define (watching cache) (_0 (_0 cache)))
+
+;; Sparse watcher edits are [path maybe-subscribers]: 0 deletes a bucket,
+;; [row] puts it. [[]] is a present, empty subscription row, not deletion.
+;; Edits are applied in order, so repeated paths have last-write semantics.
+(define (patch-eyes api eyes edits)
+  (foldl (lambda (state edit)
+    (Ifz (_1 edit) ((_3 api) (_0 edit) state)
+      ((_2 api) (_0 edit) (_0 (_1 edit)) state))) eyes edits))
+(define (watch-change api edits)
+  (Ifz edits 0 (ilc:custom-change (patch-eyes api) edits)))
+
+;; Only edited buckets are repartitioned. Deletion keeps a tombstone in the
+;; private BST so existing persistent spines remain reusable; run-prepared
+;; ignores it. A full specialize compacts these tombstones. This cache can
+;; grow with distinct deleted paths, so long-lived callers should rebuild.
+(define (patch-prepared api prepared edits)
+  [(patch-eyes api (_0 prepared) edits)
+   (foldl (lambda (index edit)
+     (bst:bst-insert (_0 edit)
+       (Ifz (_1 edit) 0 (partition-table api (_0 (_1 edit)))) index))
+     (_1 prepared) edits)])
+(define (patch-specialization api old edits)
+  (finish api (patch-prepared api (_0 old) edits)))
+
+;; G(eyes) = [prepared-cache, g], where g(signs) returns [news rest].
+;; dG/dEyes returns an ILC change to G, applied to the PREVIOUS specialization.
+;; This domain rule provides cache transfer; the generic ILC alone cannot
+;; recover a previous preparation from eyes without recomputing it.
+;; Unknown changes remain correct via full rebuilding, without claiming speed.
+(define (d-specialize api eyes dx)
+  (cond
+    ((Nil dx) 0)
+    ((And (Equal (Hd dx) "ILC_CUSTOM") (Equal (_0 dx) (patch-eyes api)))
+      (ilc:custom-change (patch-specialization api) (_1 dx)))
+    (else (ilc:replace-change (specialize api (ilc:apply-change eyes dx))))))
+(define (update api old dx)
+  (ilc:apply-change old
+    (ilc:differentiate-with [[(specialize api) (d-specialize api)]]
+      (specialize api) (watching old) dx)))
+
+(#export baseline observations partition-table prepare run-prepared staged
+ direct-specialize specialize program watching patch-eyes watch-change
+ patch-prepared d-specialize update)
