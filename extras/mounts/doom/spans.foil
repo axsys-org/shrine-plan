@@ -1,0 +1,355 @@
+- apps/doom/render
+
++ ds
+  ' Frame-wide BSP projection, clipped wall columns, shared plane scanlines.
+  + span
+    : seg=dw/seg left=nat right=nat side=dw/side front=nat back=nat solid=bool flags=nat den=nat den_step=nat numerator=nat along=nat along_step=nat
+  + scene
+    : rays=row[[nat nat]] spans=row[ds/span] sprites=row[dr/projected] eye=nat
+  + clamp
+    \ limit=nat value=nat
+    ^ nat
+    ? (dz/sign value) 0
+    (dg/minimum limit (dz/abs value))
+  + floor_div
+    \ value=nat divisor=nat
+    ^ nat
+    = n (div (dz/abs value) divisor)
+    ? (dz/sign value) (dz/neg (dz/pos (add n (? (mod (dz/abs value) divisor) 1 0))))
+    (dz/pos n)
+  + project_seg
+    \ w=dg/world width=nat sine=nat cosine=nat seg=dw/seg
+    ^ maybe[ds/span]
+    = ax (dz/sub seg.a.x w.x) ay (dz/sub seg.a.y w.y)
+      bx (dz/sub seg.b.x w.x) by (dz/sub seg.b.y w.y)
+      lx (dz/sub bx ax) ly (dz/sub by ay)
+      numerator (dz/cross ax ay lx ly)
+    ? !(dz/sign numerator) .none
+    = za (dz/dot ax ay cosine sine)
+      zb (dz/dot bx by cosine sine)
+    ? (and (dz/lt za 2048) (dz/lt zb 2048)) .none
+    = la (dz/cross cosine sine ax ay)
+      lb (dz/cross cosine sine bx by)
+      ca (? (dz/lt za 2048) (dz/add la (dz/div (dz/mul (dz/sub lb la) (dz/sub 2048 za)) (dz/sub zb za))) la)
+      cb (? (dz/lt zb 2048) (dz/add lb (dz/div (dz/mul (dz/sub la lb) (dz/sub 2048 zb)) (dz/sub za zb))) lb)
+      half (dz/pos (div width 2))
+      xa (dz/sub half (dz/div (dz/mul ca half) (dz/max 2048 za)))
+      xb (dz/sub half (dz/div (dz/mul cb half) (dz/max 2048 zb)))
+      left (ds/clamp width (dz/sub (dz/min xa xb) 4))
+      right (ds/clamp width (dz/add (dz/max xa xb) 6))
+    ? (ge left right) .none
+    = line w.level.lines.at(seg.line)
+      sid (? seg.side line.left line.right)
+      other (? seg.side line.right line.left)
+      side w.level.sides.at(sid)
+      rx (dz/mul (dz/sub cosine sine) half)
+      ry (dz/mul (dz/add sine cosine) half)
+      den (dz/cross rx ry lx ly)
+      den_step (dz/cross sine (dz/neg cosine) lx ly)
+      num (dz/mul numerator (dz/mul 2048 half))
+      along (dz/mul (dz/cross ax ay rx ry) 2048)
+      along_step (dz/mul (dz/cross ax ay sine (dz/neg cosine)) 2048)
+    (./some (ds/span seg left right side side.sector (? (eq other 65535) side.sector w.level.sides.at(other).sector) (eq other 65535) line.flags den den_step num along along_step))
+  + intersection
+    ' Perspective distance and texture u from affine ray/segment coefficients.
+    \ s=ds/span x=nat
+    ^ maybe[dg/hit]
+    = den (dz/add s.den (dz/mul s.den_step (dz/pos x)))
+    ? (eq den 0) .none
+    = t (dz/div s.numerator den)
+      u (dz/div (dz/add s.along (dz/mul s.along_step (dz/pos x))) den)
+    ? ((dz/sign t) || ((dz/sign u) || ((eq t 0) || (gt (dz/abs u) 1024)))) .none
+    (./some (dg/hit (dz/abs t) (dz/abs u)))
+  + box_visible
+    ' Conservative support-point test against the three camera half planes.
+    \ w=dg/world normals=row[[nat nat]] box=dw/box
+    ^ bool
+    | normals.all
+      \ [nx ny]
+      = x (? (dz/sign nx) box.left box.right)
+        y (? (dz/sign ny) box.bottom box.top)
+      !(dz/sign (dz/dot nx ny (dz/sub x w.x) (dz/sub y w.y)))
+  + visibility
+    : spans=list[ds/span] covered=nat lo=nat hi=nat normals=row[[nat nat]]
+  + covers
+    ' Exact affine intersection bounds, without divisions. Used only at span edges.
+    \ s=ds/span x=nat
+    ^ bool
+    = den (dz/add s.den (dz/mul s.den_step (dz/pos x)))
+      u (dz/add s.along (dz/mul s.along_step (dz/pos x)))
+      d (dz/abs den)
+      t (dz/abs s.numerator)
+    (and (gt d 0) (and (eq (dz/sign den) (dz/sign s.numerator))
+      (and (ge t d) (and (le t (mul d 8192))
+        (and ((eq u 0) || (eq (dz/sign u) (dz/sign den))) (le (dz/abs u) (mul d 1024)))))))
+  + first_covered
+    \ s=ds/span lo=nat hi=nat
+    ^ nat
+    ? (ge lo hi) hi
+    ? (ds/covers s lo) lo
+    (_ s lo.inc hi)
+  + end_covered
+    \ s=ds/span lo=nat hi=nat
+    ^ nat
+    ? (ge lo hi) lo
+    ? (ds/covers s hi.dec) hi
+    (_ s lo hi.dec)
+  + first_open
+    \ covered=nat lo=nat hi=nat
+    ^ nat
+    ? (ge lo hi) hi
+    ? !(get_bit lo covered) lo
+    (_ covered lo.inc hi)
+  + end_open
+    \ covered=nat lo=nat hi=nat
+    ^ nat
+    ? (ge lo hi) lo
+    ? !(get_bit hi.dec covered) hi
+    (_ covered lo hi.dec)
+  + normals
+    \ width=nat sine=nat cosine=nat lo=nat hi=nat
+    ^ row[[nat nat]]
+    = half (dz/pos (div width 2))
+      lc (dz/sub half (dz/pos lo))
+      rc (dz/sub half (dz/pos hi))
+      lx (dz/sub (dz/mul cosine half) (dz/mul sine lc))
+      ly (dz/add (dz/mul sine half) (dz/mul cosine lc))
+      rx (dz/sub (dz/mul cosine half) (dz/mul sine rc))
+      ry (dz/add (dz/mul sine half) (dz/mul cosine rc))
+    [[cosine sine] [ly (dz/neg lx)] [(dz/neg ry) rx]]
+  + accept
+    \ width=nat sine=nat cosine=nat v=ds/visibility s=ds/span
+    ^ ds/visibility
+    = lo (dg/maximum v.lo s.left)
+      hi (dg/minimum v.hi s.right)
+    ? (ge lo hi) v
+    ? (eq (mod (rsh v.covered lo) (bex (sub hi lo))) (dec (bex (sub hi lo)))) v
+    = spans (cons s v.spans)
+    ? !(s.solid) (ds/visibility spans v.covered v.lo v.hi v.normals)
+    = start (ds/first_covered s lo hi)
+      end (ds/end_covered s start hi)
+      covered (add (mod v.covered (bex start)) (add (sub (bex end) (bex start)) (lsh (rsh v.covered end) end)))
+      low (ds/first_open covered v.lo v.hi)
+      high (ds/end_open covered low v.hi)
+      normals (? (and (eq low v.lo) (eq high v.hi)) v.normals (ds/normals width sine cosine low high))
+    (ds/visibility spans covered low high normals)
+  + visit
+    ' One front-to-back walk. Opaque spans narrow the remaining view frustum.
+    \ w=dg/world width=nat sine=nat cosine=nat child=nat fuel=nat state=ds/visibility
+    ^ ds/visibility
+    ? ((eq fuel 0) || (ge state.lo state.hi)) state
+    ? (ge child 32768)
+      = sub w.level.subs.at((sub child 32768))
+      | (row/range sub.first (add sub.first sub.count)).fold state
+        \ out i
+        ? (ge out.lo out.hi) out
+        ? (ds/project_seg w width sine cosine w.level.segs.at(i))
+         > (./some span) (ds/accept width sine cosine out span)
+         > .none out
+    = n w.level.nodes.at(child)
+      right (dz/sign (dz/cross n.dx n.dy (dz/sub w.x n.x) (dz/sub w.y n.y)))
+      near (? right n.right n.left)
+      far (? right n.left n.right)
+      near_box (? right n.right_box n.left_box)
+      far_box (? right n.left_box n.right_box)
+      next (? (ds/box_visible w state.normals near_box) (ds/visit w width sine cosine near fuel.dec state) state)
+    ? (ge next.lo next.hi) next
+    ? (ds/box_visible w next.normals far_box) (ds/visit w width sine cosine far fuel.dec next)
+    next
+  + prepare
+    \ w=dg/world art=dr/art width=nat height=nat
+    ^ ds/scene
+    = eye (dz/add (dg/floor w w.x w.y) 82)
+      rays (dr/camera w width)
+      sine (dz/sin w.angle) cosine (dz/cos w.angle)
+      normals (ds/normals width sine cosine 0 width)
+      visible (ds/visit w width sine cosine w.level.nodes.len.dec w.level.nodes.len.inc (ds/visibility nil[ds/span] 0 0 width normals))
+      spans (list/row (list/reverse[ds/span] visible.spans))
+      sprites (dr/sprites (dr/view w art width height eye 0 0 0))
+    ; (DeepSeq[nat] [eye rays spans] 0)
+    ; (dr/force_sprites sprites)
+    (ds/scene rays spans sprites eye)
+  + band
+    ' kind 0 = wall column, 1 = plane index, 2 = sky column.
+    : lo=nat hi=nat kind=nat depth=nat col=row[nat] base=nat step=nat shade=nat plane=nat
+  + layer
+    ' Transparent columns: masked walls, sprites and weapon. Q16 vertical sampling.
+    : lo=nat hi=nat depth=nat col=row[nat] base=nat step=nat shade=nat
+  + column
+    : bands=list[ds/band] layers=list[ds/layer]
+  + shade
+    \ light=nat distance=nat
+    ^ nat
+    (mul 256 (dg/minimum 31 (add (div (sub 255 light) 8) (div distance 128))))
+  + screen_y
+    ' First row strictly below a world height; shared by adjacent bands.
+    \ v=dr/view z=nat distance=nat
+    ^ nat
+    = numerator (dz/sub (dz/pos (mul (div v.height 2) distance)) (dz/mul (dz/sub z v.eye) (dz/pos (div v.width 2))))
+    (ds/clamp v.height (dz/add 2 (ds/floor_div numerator distance)))
+  + add_plane
+    \ lo=nat hi=nat plane=nat bands=list[ds/band]
+    ^ list[ds/band]
+    ? (ge lo hi) bands
+    (cons (ds/band lo hi 1 0 [] 0 0 0 plane) bands)
+  + wall_band
+    \ v=dr/view span=ds/span hit=dg/hit lo=nat hi=nat texture=nat top=nat
+    ^ ds/band
+    = picture v.world.level.textures.at(texture.dec).image
+      tx (dz/add span.side.x (dz/pos (add span.seg.offset (div (mul span.seg.length hit.along) 1024))))
+      col picture.cols.at((dz/mod tx picture.width))
+      distance (dg/maximum 1 hit.distance)
+      step (div (mul distance 65536) (div v.width 2))
+      origin (dz/sub (dz/mul (dz/add span.side.y (dz/sub top v.eye)) 131072) (dz/pos (mul (div v.height 2) step)))
+      base (dz/mod origin (mul picture.height 65536))
+    (ds/band lo hi 0 distance col base step (ds/shade v.world.sectors.at(span.front).light distance) 0)
+  + add_wall
+    \ v=dr/view span=ds/span hit=dg/hit lo=nat hi=nat texture=nat top=nat bands=list[ds/band]
+    ^ list[ds/band]
+    ? ((ge lo hi) || (eq texture 0)) bands
+    (cons (ds/wall_band v span hit lo hi texture top) bands)
+  + clip_column
+    \ v=dr/view spans=row[ds/span]
+    ^ ds/column
+    % i=nat 0 lo=nat 0 hi=nat v.height bands=list[ds/band] nil[ds/band] layers=list[ds/layer] nil[ds/layer]
+    ? (ge lo hi) (ds/column bands layers)
+    ? (eq i spans.len)
+      = sector (dw/sector_at v.world.level v.world.x v.world.y)
+        half (div v.height 2)
+        out (ds/add_plane lo (dg/minimum hi half) (inc (mul sector 2)) bands)
+      (ds/column (ds/add_plane (dg/maximum lo half) hi (mul sector 2) out) layers)
+    = s spans.at(i)
+    ? ((lt v.x s.left) || (ge v.x s.right)) (_ i.inc lo hi bands layers)
+    ?> (./some hit) (ds/intersection s v.x) (_ i.inc lo hi bands layers)
+    ? (gt hit.distance 8192) (_ i.inc lo hi bands layers)
+    = front v.world.sectors.at(s.front)
+      back v.world.sectors.at(s.back)
+      ceiling (ds/screen_y v front.ceiling hit.distance)
+      floor (ds/screen_y v front.floor hit.distance)
+      out (ds/add_plane lo (dg/minimum hi ceiling) (inc (mul s.front 2)) bands)
+      out (ds/add_plane (dg/maximum lo floor) hi (mul s.front 2) out)
+      low (dg/maximum lo ceiling)
+      high (dg/minimum hi floor)
+    ? s.solid
+      = top
+          ? (eq (mod (div s.flags 16) 2) 1)
+            (dz/add front.floor (dz/pos (? s.side.middle v.world.level.textures.at(s.side.middle.dec).image.height 128)))
+          front.ceiling
+      (ds/column (ds/add_wall v s hit low high s.side.middle top out) layers)
+    = upper (? (and front.sky back.sky) ceiling (ds/screen_y v back.ceiling hit.distance))
+      lower (ds/screen_y v back.floor hit.distance)
+      out (ds/add_wall v s hit low (dg/minimum high upper) s.side.upper front.ceiling out)
+      out (ds/add_wall v s hit (dg/maximum low lower) high s.side.lower back.floor out)
+      low (dg/maximum low upper)
+      high (dg/minimum high lower)
+      layers
+        ? (and (lt low high) s.side.middle)
+          = b (ds/wall_band v s hit low high s.side.middle front.ceiling)
+          (cons (ds/layer b.lo b.hi b.depth b.col b.base b.step b.shade) layers)
+        layers
+    (_ i.inc low high out layers)
+  + plane_line
+    : distance=nat colors=row[nat]
+  + plane
+    ' A shared horizontal scanline: one division for distance, then wrapped Q16 coordinates.
+    \ w=dg/world width=nat height=nat eye=nat rays=row[[nat nat]] index=nat y=nat
+    ^ ds/plane_line
+    = sector w.sectors.at((div index 2))
+      roof (mod index 2)
+      half (div height 2)
+    ? (and roof sector.sky)
+      = colors (row/range 0 width).map((\ x 0))
+      (ds/plane_line 8192 colors)
+    = z (? roof (dz/sub sector.ceiling eye) (dz/sub eye sector.floor))
+      screen (? roof (sub half y) (sub y half))
+      distance (div (mul (dz/abs z) (div width 2)) (dg/maximum 1 screen))
+      texture (? roof sector.roof sector.flat)
+      shade (ds/shade sector.light distance)
+      [dx dy] rays.at(0)
+      period 4194304
+      ox (dz/mod (dz/add (dz/mul w.x 131072) (dz/div (dz/mul dx (dz/pos (mul distance 65536))) 2048)) period)
+      oy (dz/mod (dz/add (dz/mul w.y 131072) (dz/div (dz/mul dy (dz/pos (mul distance 65536))) 2048)) period)
+      sx (dz/mod (dz/div (dz/mul (dz/sin w.angle) (dz/pos (mul distance 65536))) (dz/pos (mul 1024 (div width 2)))) period)
+      sy (dz/mod (dz/neg (dz/div (dz/mul (dz/cos w.angle) (dz/pos (mul distance 65536))) (dz/pos (mul 1024 (div width 2))))) period)
+      colors
+        | (row/range 0 width).map
+          \ x
+          = tx (rsh (mod (add ox (mul sx x)) period) 16)
+            ty (rsh (mod (add oy (mul sy x)) period) 16)
+          (load8 (add shade (load8 (add (mul ty 64) tx) texture)) w.level.cmap)
+    (ds/plane_line distance colors)
+  + sprite_layer
+    \ v=dr/view s=dr/projected
+    ^ ds/layer
+    = column (dz/abs (dz/sub (dz/pos v.x) s.left))
+      col s.picture.cols.at((dg/minimum s.picture.width.dec (div (mul column s.picture.width) s.width)))
+      step (div (mul s.picture.height 65536) s.height)
+      base (dz/mod (dz/neg (dz/mul s.top (dz/pos step))) (mul s.picture.height 65536))
+    (ds/layer (ds/clamp v.height s.top) (ds/clamp v.height (dz/add s.top (dz/pos s.height))) s.distance col base step (ds/shade s.light s.distance))
+  + weapon_image
+    ' Resolution-dependent overlay is sampled once at startup, including transparent edges.
+    \ picture=dw/picture width=nat height=nat
+    ^ row[row[nat]]
+    = left (dz/sub 2 picture.left)
+      top (dz/neg picture.top)
+    | (row/range 0 width).map
+      \ x
+      = px (dz/sub (dz/pos (div (mul x 320) width)) left)
+      | (row/range 0 height).map
+        \ y
+        = py (dz/sub (dz/pos (div (mul y 200) height)) top)
+        ? ((dz/sign px) || ((dz/sign py) || ((ge (dz/abs px) picture.width) || (ge (dz/abs py) picture.height)))) 0
+        picture.cols.at((dz/abs px)).at((dz/abs py))
+  + weapons
+    \ art=dr/art width=nat height=nat
+    ^ row[row[row[nat]]]
+    [(ds/weapon_image art.pistol width height) (ds/weapon_image art.firing width height)
+     ((row/range 0 width).map((\ x (row/range 0 height).map((\ y 0)))))]
+  + overlay
+    \ cmap=nat layers=list[ds/layer] y=nat depth=nat color=nat
+    ^ nat
+    ? layers.is_nil color
+    = s layers.head
+    ? ((ge s.depth depth) || ((lt y s.lo) || (ge y s.hi))) (_ cmap layers.tail y depth color)
+    = index (mod (rsh (add s.base (mul y s.step)) 16) s.col.len)
+      sample s.col.at(index)
+    ? (eq sample 0) (_ cmap layers.tail y depth color)
+    (_ cmap layers.tail y s.depth (load8 (add s.shade sample.dec) cmap))
+  + draw_band
+    \ v=dr/view planes=row[row[ds/plane_line]] layers=list[ds/layer] weapon=row[nat] b=ds/band bytes=nat
+    ^ nat
+    = sky v.art.sky
+      skycol sky.cols.at((mod (div (mul (mod (add (mul v.world.angle 4) (sub (mul v.width 4) v.x)) 1440) sky.width) 1440) sky.width))
+      skyplane (and (eq b.kind 1) (and (mod b.plane 2) v.world.sectors.at((div b.plane 2)).sky))
+    % y=nat b.lo out=nat bytes ty=nat (add b.base (mul b.lo b.step))
+    ? (ge y b.hi) out
+    = plane (? (eq b.kind 1) planes.at(b.plane).at(y) (ds/plane_line b.depth []))
+      depth (? skyplane 8192 plane.distance)
+      color
+        ? skyplane skycol.at((dg/minimum sky.height.dec (div (mul y sky.height) (dg/maximum 1 (div v.height 2))))).dec
+        ? (eq b.kind 1) plane.colors.at(v.x)
+        (load8 (add b.shade b.col.at((mod (rsh ty 16) b.col.len)).dec) v.world.level.cmap)
+      color (? weapon.at(y) weapon.at(y).dec (ds/overlay v.world.level.cmap layers y depth color))
+    (_ y.inc (add out (lsh color (mul y 8))) (add ty b.step))
+  + columns
+    \ w=dg/world art=dr/art width=nat height=nat scene=ds/scene weapons=row[row[row[nat]]]
+    ^ row[nat]
+    = weapon weapons.at((? (eq w.health 0) 2 (? (gt w.cooldown 6) 1 0)))
+      planes
+        | (row/range 0 (mul w.sectors.len 2)).map
+          \ index
+          (row/range 0 height).map((\ y (ds/plane w width height scene.eye scene.rays index y)))
+    | (row/range 0 width).map
+      \ x
+      = [dx dy] scene.rays.at(x)
+        v (dr/view w art width height scene.eye dx dy x)
+        column (ds/clip_column v scene.spans)
+        sprites scene.sprites.filter((\ s (and !(dz/lt (dz/pos x) s.left) (dz/lt (dz/pos x) (dz/add s.left (dz/pos s.width))))))
+        layers (row/fold[dr/projected list[ds/layer]] column.layers (\ out s (cons (ds/sprite_layer v s) out)) sprites)
+      % bands=list[ds/band] column.bands bytes=nat 0
+      ? bands.is_nil bytes
+      (_ bands.tail (ds/draw_band v planes layers weapon.at(x) bands.head bytes))
+  + render
+    \ w=dg/world art=dr/art width=nat height=nat
+    ^ nat
+    (dr/pack height (ds/columns w art width height (ds/prepare w art width height) (ds/weapons art width height)))

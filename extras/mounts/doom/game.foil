@@ -1,0 +1,396 @@
+- apps/doom/wad
+
++ dg
+  + actor
+    : x=nat y=nat kind=nat hp=nat active=bool removed=bool
+  + mover
+    : sector=nat home=nat target=nat wait=nat closing=bool floor_mode=bool stay=bool
+  + world
+    : level=dw/level sectors=row[dw/sector] actors=row[dg/actor] movers=row[dg/mover]
+      x=nat y=nat angle=nat health=nat armor=nat ammo=nat tic=nat rnd=nat
+      cooldown=nat flash=nat kills=nat items=nat won=bool use_down=bool
+  + hit
+    : distance=nat along=nat
+  + maximum
+    \ a=nat b=nat
+    ^ nat
+    ? (gt a b) a
+    b
+  + minimum
+    \ a=nat b=nat
+    ^ nat
+    ? (lt a b) a
+    b
+  + monster
+    \ kind=nat
+    ^ bool
+    ((eq kind 3004) || ((eq kind 9) || ((eq kind 3001) || ((eq kind 3002) || (eq kind 58)))))
+  + hp
+    \ kind=nat
+    ^ nat
+    ? ((eq kind 3002) || (eq kind 58)) 150
+    ? (eq kind 3001) 60
+    ? (eq kind 9) 30
+    ? ((eq kind 3004) || (eq kind 2035)) 20
+    0
+  + new
+    \ lv=dw/level
+    ^ dg/world
+    = actors=row[dg/actor]
+        | lv.things.filter((\ t (and (eq (mod (div t.flags 16) 2) 0) (eq (mod (div t.flags 2) 2) 1)))).map
+          \ t
+          (dg/actor t.x t.y t.kind (dg/hp t.kind) .false .false)
+    (dg/world lv lv.sectors actors [] lv.start.x lv.start.y lv.start.angle 100 0 50 0 0 0 0 0 0 .false .false)
+  + key
+    \ key=nat keys=str
+    ^ bool
+    (row/range 0 keys.len).any((\ i (eq keys.at(i) key)))
+  + intersection
+    ' Ray direction in 1024ths; positive distance in map units, along in 1024ths.
+    \ x=nat y=nat dx=nat dy=nat a=dw/vertex b=dw/vertex
+    ^ maybe[dg/hit]
+    = lx (dz/sub b.x a.x)
+      ly (dz/sub b.y a.y)
+      ax (dz/sub a.x x) ay (dz/sub a.y y)
+      den (dz/cross dx dy lx ly)
+    ? (eq den 0) .none
+    = t (dz/div (dz/mul (dz/cross ax ay lx ly) 2048) den)
+      u (dz/div (dz/mul (dz/cross ax ay dx dy) 2048) den)
+    ? ((dz/sign t) || ((dz/sign u) || ((eq t 0) || (gt (dz/abs u) 1024)))) .none
+    (./some (dg/hit (dz/abs t) (dz/abs u)))
+  + floor
+    \ w=dg/world x=nat y=nat
+    ^ nat
+    w.sectors.at((dw/sector_at w.level x y)).floor
+  + open
+    \ w=dg/world line=dw/line floor=nat
+    ^ bool
+    ? ((eq line.left 65535) || (eq (mod line.flags 2) 1)) .false
+    = f w.sectors.at(w.level.sides.at(line.right).sector)
+      b w.sectors.at(w.level.sides.at(line.left).sector)
+      bottom (dz/max f.floor b.floor)
+      top (dz/min f.ceiling b.ceiling)
+    (and !(dz/lt top (dz/add bottom 112)) !(dz/lt (dz/add floor 48) bottom))
+  + near_line
+    \ x=nat y=nat radius=nat line=dw/line
+    ^ bool
+    = ax (dz/sub x line.a.x)
+      ay (dz/sub y line.a.y)
+      dx (dz/sub line.b.x line.a.x) dy (dz/sub line.b.y line.a.y)
+      dot (dz/dot ax ay dx dy)
+      len2 (add (mul (dz/abs dx) (dz/abs dx)) (mul (dz/abs dy) (dz/abs dy)))
+    ? (dz/sign dot) (lt (dz/distance x y line.a.x line.a.y) radius)
+    ? (gt (dz/abs dot) len2) (lt (dz/distance x y line.b.x line.b.y) radius)
+    (lt (dz/abs (dz/cross ax ay dx dy)) (mul radius line.length))
+  + cell
+    \ coordinate=nat origin=nat limit=nat
+    ^ nat
+    = n (dz/sub coordinate origin)
+    ? (dz/sign n) 0
+    (dg/minimum limit.dec (div (dz/abs n) 128))
+  + can_move
+    \ w=dg/world x=nat y=nat floor=nat radius=nat
+    ^ bool
+    = grid w.level.grid
+      cx (dg/cell x grid.x grid.width)
+      cy (dg/cell y grid.y grid.height)
+      blocked
+        | (row/range (sub cy 1) (dg/minimum grid.height (add cy 2))).any
+          \ gy
+          | (row/range (sub cx 1) (dg/minimum grid.width (add cx 2))).any
+            \ gx
+            | grid.cells.at((add (mul gy grid.width) gx)).any
+              \ i
+              = line w.level.lines.at(i)
+              (and (dg/near_line x y radius line) !(dg/open w line floor))
+    !blocked
+  + actor_clear
+    \ w=dg/world x=nat y=nat
+    ^ bool
+    = blocked
+        | w.actors.any
+          \ a
+          ? a.removed .false
+          = obstacle ((eq a.kind 2028) || ((eq a.kind 48) || ((eq a.kind 54) || ((eq a.kind 43) || (eq a.kind 47)))))
+          ? !(obstacle || (gt a.hp 0)) .false
+          = radius (? (eq a.kind 2035) 26 (? ((eq a.kind 3002) || (eq a.kind 58)) 46 36))
+            dx (dz/abs (dz/sub x a.x))
+            dy (dz/abs (dz/sub y a.y))
+          (lt (add (mul dx dx) (mul dy dy)) (mul radius radius))
+    !blocked
+  + move
+    \ w=dg/world dx=nat dy=nat
+    ^ dg/world
+    ? (and (eq dx 0) (eq dy 0)) w
+    = floor (dg/floor w w.x w.y)
+      x (dz/add w.x dx)
+      w (? (and (dg/can_move w x w.y floor 16) (dg/actor_clear w x w.y)) w.set_x(x) w)
+      y (dz/add w.y dy)
+    ? (and (dg/can_move w w.x y floor 16) (dg/actor_clear w w.x y)) w.set_y(y)
+    w
+  + blocked
+    \ w=dg/world ax=nat ay=nat dx=nat dy=nat distance=nat floor=nat child=nat low=nat high=nat fuel=nat
+    ^ bool
+    ? (eq fuel 0) .false
+    ? (ge child 32768)
+      = sub w.level.subs.at((sub child 32768))
+      | (row/range sub.first (add sub.first sub.count)).any
+        \ i
+        = seg w.level.segs.at(i)
+          line w.level.lines.at(seg.line)
+        ?> (./some hit) (dg/intersection ax ay dx dy seg.a seg.b) .false
+        (and (lt hit.distance distance) !(dg/open w line floor))
+    = n w.level.nodes.at(child)
+      origin (dz/cross n.dx n.dy (dz/sub ax n.x) (dz/sub ay n.y))
+      direction (dz/cross n.dx n.dy dx dy)
+      at_low (dz/add origin (dz/div (dz/mul direction (dz/pos low)) 2048))
+      at_high (dz/add origin (dz/div (dz/mul direction (dz/pos high)) 2048))
+      near (? (dz/sign at_low) n.right n.left)
+      far (? (dz/sign at_low) n.left n.right)
+    ? (eq (dz/sign at_low) (dz/sign at_high)) (_ w ax ay dx dy distance floor near low high fuel.dec)
+    = split (dz/abs (dz/div (dz/mul (dz/neg origin) 2048) direction))
+    ((_ w ax ay dx dy distance floor near low split fuel.dec) || (_ w ax ay dx dy distance floor far split high fuel.dec))
+  + visible
+    \ w=dg/world ax=nat ay=nat bx=nat by=nat
+    ^ bool
+    = distance (dg/maximum 1 (dz/distance ax ay bx by))
+      dx (dz/div (dz/mul (dz/sub bx ax) 2048) (dz/pos distance))
+      dy (dz/div (dz/mul (dz/sub by ay) 2048) (dz/pos distance))
+      floor (dg/floor w ax ay)
+    !(dg/blocked w ax ay dx dy distance floor w.level.nodes.len.dec 0 distance w.level.nodes.len.inc)
+  + damage
+    \ amount=nat w=dg/world
+    ^ dg/world
+    = saved (dg/minimum w.armor (div amount 3))
+    w.set_armor((sub w.armor saved)).set_health((sub w.health (sub amount saved))).set_flash(3)
+  + use
+    \ w=dg/world
+    ^ dg/world
+    = dx (dz/cos w.angle)
+      dy (dz/sin w.angle)
+      seed=[index=nat dist=nat] [65535 81]
+      choice
+        | (row/range 0 w.level.lines.len).fold seed
+          \ best=[index=nat dist=nat] i
+          = line w.level.lines.at(i)
+          ?> (./some hit) (dg/intersection w.x w.y dx dy line.a line.b) best
+          ? (and (gt line.special 0) (lt hit.distance dist)) [i hit.distance]
+          best
+      [index distance] choice
+    ? (eq index 65535) w
+    = line w.level.lines.at(index)
+    (dg/activate line w)
+  + activate
+    \ line=dw/line w=dg/world
+    ^ dg/world
+    ? ((eq line.special 11) || (eq line.special 51)) w.set_won(.true)
+    ? ((eq line.special 62) || ((eq line.special 88) || (eq line.special 23)))
+      | (row/range 0 w.sectors.len).fold w
+        \ state i
+        = s state.sectors.at(i)
+        ? !(and (gt line.tag 0) (eq s.tag line.tag)) state
+        = target
+            | state.level.lines.fold s.floor
+              \ floor neighbor
+              ? (eq neighbor.left 65535) floor
+              = a state.level.sides.at(neighbor.right).sector
+                b state.level.sides.at(neighbor.left).sector
+              ? (eq a i) (dz/min floor state.sectors.at(b).floor)
+              ? (eq b i) (dz/min floor state.sectors.at(a).floor)
+              floor
+        ? (state.movers.any((\ m (eq m.sector i)))) state
+        state.set_movers(state.movers.snoc((dg/mover i s.floor target 105 .false .true (eq line.special 23))))
+    ? (and (eq line.special 2) (gt line.tag 0))
+      | (row/range 0 w.sectors.len).fold w
+        \ state i
+        ? (eq state.sectors.at(i).tag line.tag) (dg/open_door i .true state)
+        state
+    ? (eq line.left 65535) w
+    (dg/open_door w.level.sides.at(line.left).sector (eq line.special 2) w)
+  + open_door
+    \ sector=nat stay=bool w=dg/world
+    ^ dg/world
+    = s w.sectors.at(sector)
+      target
+        | w.level.lines.fold (dz/pos 65536)
+          \ top neighbor
+          ? (eq neighbor.left 65535) top
+          = a w.level.sides.at(neighbor.right).sector
+            b w.level.sides.at(neighbor.left).sector
+          ? (eq a sector) (dz/min top (dz/sub w.sectors.at(b).ceiling 8))
+          ? (eq b sector) (dz/min top (dz/sub w.sectors.at(a).ceiling 8))
+          top
+    ? (w.movers.any((\ m (eq m.sector sector)))) w
+    w.set_movers(w.movers.snoc((dg/mover sector s.ceiling target 140 .false .false stay)))
+  + movers
+    \ w=dg/world
+    ^ dg/world
+    = empty=row[dg/mover] []
+      result
+        | w.movers.fold [w.sectors empty]
+          \ pair=[sectors=row[dw/sector] out=row[dg/mover]] mover
+          = s sectors.at(mover.sector)
+            occupied (and !(mover.floor_mode) (eq (dw/sector_at w.level w.x w.y) mover.sector))
+            current (? mover.floor_mode s.floor s.ceiling)
+            destination (? mover.closing mover.home mover.target)
+            height
+              ? (and mover.closing occupied) current
+              ? (dz/lt current destination) (dz/min destination (dz/add current 8))
+              (dz/max destination (dz/sub current 8))
+            next mover.set_wait((? (eq height mover.target) (dec mover.wait) mover.wait))
+            next next.set_closing((? (eq next.wait 0) .true mover.closing))
+            keep !((and mover.closing (eq height mover.home)) || (and mover.stay (eq height mover.target)))
+            moved (? mover.floor_mode s.set_floor(height) s.set_ceiling(height))
+            updated (row/range 0 sectors.len).map((\ i (? (eq i mover.sector) moved sectors.at(i))))
+          [updated (? keep out.snoc(next) out)]
+      [sectors movers] result
+    w.set_sectors(sectors).set_movers(movers)
+  + blast
+    ' Each destroyed barrel is queued once; walls block splash damage.
+    \ barrel=nat w=dg/world
+    ^ dg/world
+    % state=dg/world w pending=row[nat] [barrel] next=nat 0
+    ? (eq next pending.len) state
+    = origin state.actors.at(pending.at(next))
+      actors (row/range 0 state.actors.len).map((\ i (? (eq i pending.at(next)) origin.set_removed(.true) state.actors.at(i))))
+      state state.set_actors(actors)
+      pdist (dz/distance origin.x origin.y state.x state.y)
+      state (? (and (lt pdist 128) (dg/visible state origin.x origin.y state.x state.y)) (dg/damage (sub 128 pdist) state) state)
+      seed=[world=dg/world queue=row[nat]] [state pending]
+      result
+        | (row/range 0 state.actors.len).fold seed
+          \ acc=[world=dg/world queue=row[nat]] i
+          = a world.actors.at(i)
+            distance (dz/distance origin.x origin.y a.x a.y)
+          ? ((eq a.hp 0) || ((ge distance 128) || a.removed)) acc
+          ? !(dg/visible world origin.x origin.y a.x a.y) acc
+          = hp (sub a.hp (sub 128 distance))
+            killed (eq hp 0)
+            actors (row/range 0 world.actors.len).map((\ j (? (eq i j) a.set_hp(hp).set_active(.true) world.actors.at(j))))
+            changed world.set_actors(actors).set_kills((add world.kills (and killed (dg/monster a.kind))))
+            queue (? (and killed (eq a.kind 2035)) queue.snoc(i) queue)
+          [changed queue]
+      [world queue] result
+    (_ world queue next.inc)
+  + fire
+    \ w=dg/world
+    ^ dg/world
+    ? ((gt w.cooldown 0) || (eq w.ammo 0)) w
+    = dx (dz/cos w.angle)
+      dy (dz/sin w.angle)
+      seed=[index=nat distance=nat] [65535 2048]
+      target
+        | (row/range 0 w.actors.len).fold seed
+          \ best=[index=nat distance=nat] i
+          = a w.actors.at(i)
+          ? ((eq a.hp 0) || a.removed) best
+          = ax (dz/sub a.x w.x)
+            ay (dz/sub a.y w.y)
+            ahead (dz/div (dz/dot ax ay dx dy) 2048)
+            side (dz/abs (dz/div (dz/cross ax ay dx dy) 2048))
+          ? ((dz/sign ahead) || ((gt side 24) || (ge (dz/abs ahead) distance))) best
+          ? !(dg/visible w w.x w.y a.x a.y) best
+          [i (dz/abs ahead)]
+      [index distance] target
+      damage (mul 5 (inc (mod (add w.rnd 7) 3)))
+      actors=row[dg/actor]
+        | (row/range 0 w.actors.len).map
+          \ i
+          = a w.actors.at(i)
+          ? (eq i index) a.set_hp((sub a.hp damage)).set_active(.true)
+          ? (and (dg/monster a.kind) (lt (dz/distance w.x w.y a.x a.y) 1000)) a.set_active(.true)
+          a
+      killed (and (lt index actors.len) (eq actors.at(index).hp 0))
+      next w.set_actors(actors).set_ammo(w.ammo.dec).set_cooldown(10).set_rnd((mod (add w.rnd 73) 256)).set_kills((add w.kills (and killed (dg/monster actors.at(index).kind))))
+    ? (and killed (eq actors.at(index).kind 2035)) (dg/blast index next)
+    next
+  + pickups
+    \ w=dg/world
+    ^ dg/world
+    | (row/range 0 w.actors.len).fold w
+      \ state i
+      = a state.actors.at(i)
+      ? a.removed state
+      ? !((eq a.kind 8) || (and (ge a.kind 2007) (le a.kind 2048))) state
+      = dx (dz/abs (dz/sub state.x a.x))
+        dy (dz/abs (dz/sub state.y a.y))
+      ? (ge (add (mul dx dx) (mul dy dy)) 784) state
+      = kind a.kind
+        health
+          ? (eq kind 2014) (dg/minimum 200 state.health.inc)
+          ? (and (eq kind 2011) (lt state.health 100)) (dg/minimum 100 (add state.health 10))
+          ? (and (eq kind 2012) (lt state.health 100)) (dg/minimum 100 (add state.health 25))
+          ? (eq kind 2013) (dg/minimum 200 (add state.health 100))
+          state.health
+        ammo
+          ? ((eq kind 2007) || (eq kind 2002)) (dg/minimum 200 (add state.ammo 10))
+          ? ((eq kind 2048) || (eq kind 8)) (dg/minimum 200 (add state.ammo 50))
+          state.ammo
+        armor
+          ? (eq kind 2015) (dg/minimum 200 state.armor.inc)
+          ? (eq kind 2018) (dg/maximum state.armor 100)
+          ? (eq kind 2019) 200
+          state.armor
+        took !(and (eq health state.health) (and (eq ammo state.ammo) (eq armor state.armor)))
+      ? !took state
+      = actors=row[dg/actor] (row/range 0 state.actors.len).map((\ j (? (eq i j) a.set_removed(.true) state.actors.at(j))))
+      state.set_health(health).set_ammo(ammo).set_armor(armor).set_actors(actors).set_items(state.items.inc)
+  + think
+    \ w=dg/world
+    ^ dg/world
+    ? !(eq (mod w.tic 4) 0) w
+    | (row/range 0 w.actors.len).fold w
+      \ state i
+      = a state.actors.at(i)
+      ? ((eq a.hp 0) || !(dg/monster a.kind)) state
+      = dist (dz/distance a.x a.y state.x state.y)
+        sees (and (lt dist 1100) (dg/visible state a.x a.y state.x state.y))
+      ? !(a.active || sees) state
+      = a a.set_active(.true)
+        bite ((eq a.kind 3002) || (eq a.kind 58))
+        attack (and sees (and (eq (mod (add state.tic (mul i 4)) 36) 0) (? bite (lt dist 60) .true)))
+        state (? attack (dg/damage (add 3 (mod (add i state.tic) 12)) state) state)
+        speed (? bite 12 6)
+        dx (dz/div (dz/mul (dz/sub state.x a.x) (dz/pos speed)) (dz/pos (dg/maximum 1 dist)))
+        dy (dz/div (dz/mul (dz/sub state.y a.y) (dz/pos speed)) (dz/pos (dg/maximum 1 dist)))
+        x (dz/add a.x dx) y (dz/add a.y dy)
+        floor (dg/floor state a.x a.y)
+        a (? (and (gt dist 48) (dg/can_move state x a.y floor 18)) a.set_x(x) a)
+        a (? (and (gt dist 48) (dg/can_move state a.x y floor 18)) a.set_y(y) a)
+        actors=row[dg/actor] (row/range 0 state.actors.len).map((\ j (? (eq i j) a state.actors.at(j))))
+      state.set_actors(actors)
+  + crossings
+    \ before=dg/world after=dg/world
+    ^ dg/world
+    ? (and (eq before.x after.x) (eq before.y after.y)) after
+    | before.level.lines.fold after
+      \ state line
+      ? !((eq line.special 2) || (eq line.special 88)) state
+      = dx (dz/sub line.b.x line.a.x)
+        dy (dz/sub line.b.y line.a.y)
+        old (dz/cross dx dy (dz/sub before.x line.a.x) (dz/sub before.y line.a.y))
+        new (dz/cross dx dy (dz/sub after.x line.a.x) (dz/sub after.y line.a.y))
+      ? (eq (dz/sign old) (dz/sign new)) state
+      ? !(dg/near_line after.x after.y 32 line) state
+      (dg/activate line state)
+  + step
+    \ w=dg/world keys=str
+    ^ dg/world
+    ? (eq w.health 0)
+      ? (dg/key 117 keys) (dg/new w.level)
+      w
+    ? w.won w
+    = turn (? (dg/key 114 keys) 8 4)
+      angle (mod (sub (add (add w.angle 360) (? (dg/key 97 keys) turn 0)) (? (dg/key 100 keys) turn 0)) 360)
+      w w.set_angle(angle).set_tic(w.tic.inc).set_cooldown(w.cooldown.dec).set_flash(w.flash.dec)
+      speed (? (dg/key 114 keys) 16 8)
+      forward (dz/sub (dz/pos (? (dg/key 119 keys) speed 0)) (dz/pos (? (dg/key 115 keys) speed 0)))
+      strafe (dz/sub (dz/pos (? (dg/key 113 keys) speed 0)) (dz/pos (? (dg/key 101 keys) speed 0)))
+      dx (dz/div (dz/sub (dz/mul forward (dz/cos angle)) (dz/mul strafe (dz/sin angle))) 2048)
+      dy (dz/div (dz/add (dz/mul forward (dz/sin angle)) (dz/mul strafe (dz/cos angle))) 2048)
+      w (dg/crossings w (dg/move w dx dy))
+      using (dg/key 117 keys)
+      next (? (and using !(w.use_down)) (dg/use w) w)
+      next (dg/movers next.set_use_down(using))
+      next (? (dg/key 102 keys) (dg/fire next) next)
+    (dg/think (dg/pickups next))
