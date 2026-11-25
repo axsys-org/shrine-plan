@@ -15,8 +15,13 @@
 (#bind documentation (#module goo-documentation-bridge))
 (#bind value-editor (#module goo-value-bridge))
 
+;; A module's artifact pin from an image row; module unpins it.  A closure
+;; that outlives the launch holds the pin and unpins when called, so a
+;; snapshot references the artifact instead of rewriting it.
+(define (module-pin images name)
+  (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images))))
 (define (module images name)
-  (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
+  (Unpin (module-pin images name)))
 (define (merge-images left right)
   (foldl (lambda (out pair)
     (If (find (lambda (other) (Equal (_0 pair) (_0 other))) out) out
@@ -31,25 +36,37 @@
 ;; post-start hook, hook arguments, inspection-provider flag, dependencies,
 ;; required assets, route claims, declarative-workspace flag.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token)
-  (define local (bootstrap:build-local self system resolve slot
-    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
+;; A verified core upgrade supplies the preserved namespace and its newly
+;; published compiler images. Rebuild the service closures from those images;
+;; a saved supervisor still captures the old kernel even after code publication.
+;; The ordinary boot and upgrade use the same mount/route installation.
+(define (mounted-with self system resolve slot port specs scan-port scan-token install local)
+  ;; The pinned, iced core publication (foil-bootstrap:build-local).
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
-      (merge-images (_2 (bootstrap:publisher-code system)) (_2 core-code))))
-  (define core (module core-images "source_mount"))
+      (merge-images (_2 (bootstrap:publisher-code system)) (_2 (Unpin core-code)))))
+  ;; What the library holds, compiled once for every world that starts from it;
+  ;; nothing when the world compiled its own kernel.
+  (define library-images
+    (If (bootstrap:library? system) (bootstrap:system-images system) []))
+  (define core-pin (module-pin core-images "source_mount"))
+  (define core (Unpin core-pin))
   (define eden (module core-images "eden"))
-  (define (tool path) (driver:get-perc path core))
+  (define (tool path) (driver:get-perc path (Unpin core-pin)))
   (define mount-key (tool ["source_mount" "mount_key"]))
   (define (home self spec)
     [self ("ts" "io") ("ts" "fs") (mount-key (_0 spec))])
   (define (images-at path state)
     (define result ((tool ["source_mount" "images"]) path state))
     (If (Eq 1 (Sz result)) (_0 result) []))
+  ;; What a mount compiled in this world comes before the library's copy of
+  ;; the same module: it was compiled here because it reads differently here.
   (define (images state)
-    (foldl (lambda (out spec)
-      (merge-images out (images-at (home self spec) state))) core-images specs))
+    (merge-images
+      (foldl (lambda (out spec)
+        (merge-images out (images-at (home self spec) state))) [] specs)
+      core-images))
   ;; Resolved once: `previous` runs per definition path, and the constructor
   ;; lookup derives the core module's whole TypeWorld (driver:perc-world).
   (define case (tool ["namespace" "case"]))
@@ -69,27 +86,61 @@
     (DeepSeq (map read-file (Ix 11 spec)) 0)
     (Seq (print ["Publishing mount" (_0 spec)]) 0)
     (define own (_3 spec))
-    (define imported (filter (lambda (pair)
-      (Nil (find (lambda (binding) (Equal (_0 pair) (_0 binding))) own)))
-      (foldl (lambda (out dependency)
-        (merge-images out (images-at (home self [dependency]) state)))
-        core-images (Ix 10 spec))))
     (define (read name)
       (define found (find (lambda (binding) (Equal name (_0 binding))) own))
       (If found (rex:ParseRexNormFile (read-file (_1 (_0 found))))
         (source:read-module name)))
+    ;; What the mounts this one depends on compiled in this world.
+    (define compiled-here
+      (foldl (lambda (out dependency)
+        (merge-images out (images-at (home self [dependency]) state)))
+        [] (Ix 10 spec)))
+    ;; A module of this mount stands as the library compiled it when the
+    ;; library holds it, its source reads here as it did there, and nothing it
+    ;; imports was compiled again in this world. judge answers
+    ;; [verdicts' stands]; verdicts are [name stands] for this mount's modules.
+    (define (judge verdicts name)
+      (define seen (find (lambda (pair) (Equal name (_0 pair))) verdicts))
+      (define held (find (lambda (pair) (Equal name (_0 pair))) library-images))
+      (define mine (find (lambda (binding) (Equal name (_0 binding))) own))
+      (cond
+        (seen [verdicts (_1 (_0 seen))])
+        ((find (lambda (pair) (Equal name (_0 pair))) compiled-here) [verdicts 0])
+        ((Nil held) [(If mine (snoc [name 0] verdicts) verdicts) 0])
+        ((Nil mine) [verdicts 1])
+        (else
+          (let* ((perc (Unpin (_1 (_0 held))))
+                 (now (Try (lambda (ignored) (force (source:new-imports (read name)))) 0))
+                 (same (If (Eq 1 (Hd now)) 0 (Equal (_0 now) (driver:perc-rex perc)))))
+            (Ifz same [(snoc [name 0] verdicts) 0]
+              (let ((deps (foldl (lambda (state dep)
+                            (define next (judge (_0 state) dep))
+                            [(_0 next) (If (_1 state) (_1 next) 0)])
+                          [verdicts 1] (driver:perc-dependencies perc))))
+                [(snoc [name (_1 deps)] (_0 deps)) (_1 deps)]))))))
+    (define verdicts
+      (Ifz (Sz library-images) []
+        (foldl (lambda (verdicts binding) (_0 (judge verdicts (_0 binding)))) [] own)))
+    (define (stands name)
+      (define verdict (find (lambda (pair) (Equal name (_0 pair))) verdicts))
+      (If verdict (_1 (_0 verdict)) 0))
+    (define compile (filter (lambda (binding) (Nil (stands (_0 binding)))) own))
+    (Seq (print ["Mount modules" (_0 spec) "compiled here" (Sz compile) "of" (Sz own)]) 0)
+    (define imported (filter (lambda (pair)
+      (Nil (find (lambda (binding) (Equal (_0 pair) (_0 binding))) compile)))
+      (merge-images compiled-here core-images)))
     (define (root name)
       (define found (find (lambda (pair) (Equal name (_0 pair))) imported))
       (If found
         (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
         (resolve name)))
-    (define origin (publication:compilation-context (Unpin (_0 core-code))))
+    (define origin (publication:compilation-context (Unpin (_0 (Unpin core-code)))))
     (define prepared (source:prepare-publication-with read
       (context:publication-key origin) (context:compiler-key origin)
-      root imported (previous state) (map _0 own)))
-    (define code (publication:compile prepared (_1 core-code)))
+      root imported (previous state) (map _0 compile)))
+    (define code (publication:compile prepared (_1 (Unpin core-code))))
     (define candidate
-      (If (Sz own)
+      (If (Sz (_2 code))
         (_0 (need-ok (publication:publish-local (bootstrap:policy system)
           slot code 0 0 state))) state))
     (define all-images (merge-images (_2 code) imported))
@@ -119,6 +170,7 @@
                   path (_2 spec) published)) published))
     ((tool ["source_mount" "save_images"]) path (_2 code) registered))
   (define (attempt path state)
+    (define core (Unpin core-pin))
     (define result (Try (lambda (ignored) (force (publish-mount path state))) 0))
     (If (Eq 1 (Hd result))
       (Seq (print ["Mount publication failed" path (_0 result)])
@@ -128,10 +180,11 @@
   (define ports ((abi:constructor core ["source_mount" "ports"]) attempt))
   ;; Namespace drafts use exactly the mounted compiler substrate and publisher.
   ;; The registration supplies the prelude, never the HTTP request or scene.
-  (define draft-policy (module core-images "grove_draft"))
-  (define (draft-tool name) (driver:get-perc ["grove_draft" name] draft-policy))
+  (define draft-pin (module-pin core-images "grove_draft"))
+  (define (draft-tool name) (driver:get-perc ["grove_draft" name] (Unpin draft-pin)))
   (define (compile-draft root text prelude state)
-    (define complete ((Hd core-code) (_0 core-code) (_1 core-code) (images state)))
+    (define cc (Unpin core-code))
+    (define complete ((Hd cc) (_0 cc) (_1 cc) (images state)))
     (define prepared (backend:prepare-with complete prelude))
     (define policy (_1 prepared))
     (define (lookup requested)
@@ -156,7 +209,7 @@
       ((abi:result policy "err") ((abi:constructor policy ["grove_backend" "diagnostic"])
         (driver:get-perc ["rex" "zero_span"] policy) "Draft compilation failed" 0))
       (_0 result)))
-  (define draft-ports ((abi:constructor draft-policy ["grove_draft" "ports"]) compile-draft))
+  (define draft-ports ((abi:constructor (Unpin draft-pin) ["grove_draft" "ports"]) compile-draft))
   (define homes (map (home self) specs))
   (Seq (print "Core publication compiled") 0)
   (define initial (need-ok ((driver:get-perc ["eden" "boot"] eden)
@@ -191,14 +244,16 @@
       (If binding
         (let ((policy (Unpin (_1 (_0 binding)))))
           (need-ok ((driver:get-perc ["goo_documentation" "install_reader"] policy)
-            (documentation:reader policy slot) installed))) installed)))
+            (documentation:reader-among policy [slot bootstrap:library-slot]) installed))) installed)))
   (define editable
     (let ((policy (module (images documented) "goo_value")))
       (need-ok ((driver:get-perc ["goo_value" "install"] policy)
         (value-editor:compiler policy) documented))))
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
-  (define config
+  ;; The HTTP routes for a state: each mount's http hook over its snapshot,
+  ;; the workspace's, then the declared assets served live from the bundle.
+  (define (config-for installed)
     (foldl (lambda (config spec)
       (Ifz (Or (Sz (_6 spec)) (Ix 13 spec)) config
         (let* ((manual (If (Sz (_6 spec))
@@ -216,22 +271,45 @@
                    0 (error ["undeclared-mount-routes" (_0 spec)]))
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
-  (define server ((driver:get-perc ["eden" "serve_read"] eden)
+  (define config (config-for installed))
+  (define run-with (driver:get-perc ["http_foot" "run_with"] http))
+  ;; remount: a resumed process scans every mount again through its own
+  ;; bridge (the files and the published code come from the checkout now,
+  ;; the records stay as saved) and rebuilds the HTTP entry over them.
+  (define (remount reader state)
+    (define reloaded
+      (foldl (lambda (state spec)
+        ((tool ["source_mount" "reload"]) reader ports (_0 spec) (_1 spec) state))
+        state specs))
+    (Seq (print ["Remounted" (map _0 specs)]) 0)
+    [reloaded (run-with (config-for reloaded))])
+  ;; serve_saved: every admitted event saves the world as the store root,
+  ;; so running the snapshot again resumes it (eden/resume).
+  (define server ((driver:get-perc ["eden" "serve_saved"] eden)
     ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes))
     reader ((draft-tool "reconcile") draft-ports editable)
-    ((driver:get-perc ["http_foot" "run_with"] http) config)))
+    (run-with config)
+    install remount))
   (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
   (Seq server (foldl (lambda (ignored spec)
     (Ifz (Sz (_7 spec)) 0
       (Seq ((hook installed spec 7) server (Ix 8 spec)) 0))) 0 specs))
   server)
 
-(define (start self system resolve slot port specs scan-port scan-token)
+(define (mounted self system resolve slot port specs scan-port scan-token install)
+  (define local (bootstrap:build-local self system resolve slot
+    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
+  (mounted-with self system resolve slot port specs scan-port scan-token install local))
+
+
+;; install: a thunk that installs the session's compiler, kept in the
+;; saved world so a resumed process compiles too.
+(define (start self system resolve slot port specs scan-port scan-token install)
   (If (Sz specs)
-    (mounted self system resolve slot port specs scan-port scan-token)
+    (mounted self system resolve slot port specs scan-port scan-token install)
     (let* ((local (bootstrap:build-local self system resolve slot ["eden"]))
-           (eden (module (_2 (_1 local)) "eden"))
+           (eden (module (_2 (Unpin (_1 local))) "eden"))
            (state (need-ok ((driver:get-perc ["eden" "boot"] eden)
              self (bootstrap:trusted system) (_1 (_0 local)) port))))
       ((driver:get-perc ["eden" "serve"] eden) state))))
-(#export start)
+(#export start mounted-with)

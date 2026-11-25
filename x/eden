@@ -19,9 +19,11 @@ from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, run
 from eden_runtime import runtime_exit_status, startup_failed, startup_ready
 from eden_hands import parse_hand, start_hands
 from namespace_identity import parse_node_identity
-from test_runner import stage
+from test_runner import stage, stage_modules, stage_library
 
 ROOT = Path(__file__).resolve().parent.parent
+# How many times a world's runtime enters a law before compiling it (nix/enki-code-warmup.patch).
+WARMUP = '1000'
 
 
 def enter_environment(argv):
@@ -146,8 +148,20 @@ def main():
             work = world
         else:
             work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
+        library = os.environ.get('EDEN_LIBRARY', 'system') != 'world'
         if not kept:
-            template = stage(runtime, False, args.startup_timeout)
+            # The compiler, and on it the modules a world's bootstrap binds: compiled once for a
+            # checkout and a runtime, not again in every world.
+            template = stage_modules(runtime, stage(runtime, False, args.startup_timeout),
+                                     ['std', 'plangrm', 'eden', 'foil-bootstrap'], args.startup_timeout)
+            # And on that the library: the kernel and these mounts' modules, compiled and published
+            # once under the system's authority for every world that starts from this checkout with
+            # these mounts. EDEN_LIBRARY=world makes the world compile its own, as before.
+            if library:
+                template = stage_library(runtime, template, [
+                    (mount.name, {module: mount.root / leaf
+                                  for module, leaf in mount.manifest.get('modules', {}).items()})
+                    for mount in selected], args.startup_timeout, WARMUP)
             if (work / 'snap').exists():
                 shutil.rmtree(work / 'snap')
             (work / 'snap').mkdir()
@@ -190,6 +204,11 @@ def main():
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+            # A law is compiled once it has been entered PL_CODE_WARMUP times and is interpreted until
+            # then: a start runs most of its laws once, and compiling each of them before its first step
+            # was half of a first start. A runtime without the warm-up reads nothing from this and
+            # compiles on first entry.
+            runtime_environment = dict(os.environ, PL_CODE_WARMUP=os.environ.get('PL_CODE_WARMUP', WARMUP))
             def spawn(resume):
                 # A saved world's root is a program applied to the argument
                 # row (eden/resume); the boot repl takes its script on stdin.
@@ -198,7 +217,8 @@ def main():
                 if resume:
                     command += [str(scan_port), scan_token]
                 process = subprocess.Popen(command, cwd=work, stdin=subprocess.PIPE,
-                                           stdout=log, stderr=log, text=True, restore_signals=False)
+                                           stdout=log, stderr=log, text=True, restore_signals=False,
+                                           env=runtime_environment)
                 cleanup.callback(stop, process)
                 return process
             def listening():
@@ -255,7 +275,7 @@ def main():
 (define (launch ignored)
   (define (resolve name) [["x" {number}] ["ts" "lib"] ["ts" name]])
   (define slot [("x" {number}) ("ts" "compiler") ("ts" "artifact")])
-  (define system (bootstrap:build-system (Pin eden:start) resolve slot))
+  (define system {'staged_library' if library else '(bootstrap:build-system (Pin eden:start) resolve slot)'})
   (define (install ignored) {installer})
   (eden:start ("x" {number}) system resolve slot {port} {literal(specs)} {scan_port} {literal(scan_token)} install))
 (print ("EDEN-LAUNCH-RETURNED" (Try launch 0)))

@@ -242,6 +242,100 @@ def stage(wisp, fresh, timeout):
     return template
 
 
+def stage_modules(wisp, base, modules, timeout, extra=''):
+    """A template that already holds these Reaver modules, built once on another template.
+
+    A session that binds a module the template does not hold compiles it then and there. A world's first
+    start binds the whole of its bootstrap, so it compiled the same modules again in every world; here they
+    are compiled once for a checkout and a runtime, and a world starts from the result. `extra` is source
+    the template's session runs after the binds (a name a later session expects to find defined)."""
+    cache = ROOT / '.check'
+    files = [ROOT / 'src/reaver' / (m + '.rvr') for m in reaver_closure(modules)
+             if (ROOT / 'src/reaver' / (m + '.rvr')).exists()]
+    key = hashlib.sha256(((base / 'ready').read_text() + '\n' + ' '.join(modules) + '\n'
+                          + digest(files) + '\n' + extra).encode()).hexdigest()[:16]
+    template = cache / ('template-modules-' + key)
+    with (cache / 'stage.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (template / 'ready').exists() and (template / 'arena.dat').is_file():
+            return template
+        directory = Path(tempfile.mkdtemp(prefix='stage-', dir=cache))
+        print(f'Staging modules {key}: {directory}', flush=True)
+        copy_snapshot(base, directory / 'snap')
+        source = ''.join(f'(#bind staged_{i} (#module {module}))\n' for i, module in enumerate(modules))
+        code, complete, _ = run_process([wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
+                                        directory, source + extra + '(print "TEST-RUN-DONE")\n', timeout)
+        log = (directory / 'out.log').read_text(errors='replace')
+        if not verdict(log, code, complete)[0]:
+            raise RuntimeError(f'staging modules failed: {directory}/out.log')
+        prepared = directory / 'snap'
+        (prepared / 'ready').write_text(key)
+        if template.exists():
+            shutil.rmtree(template)
+        prepared.rename(template)
+        shutil.rmtree(directory, ignore_errors=True)   # the log is kept only when staging failed
+    return template
+
+
+LIBRARY_KERNEL = ['compiler_publication', 'eden', 'source_mount', 'grove_backend', 'grove_role_runtime',
+                  'grove_draft']
+
+
+def stage_library(wisp, base, mounts, timeout, warmup='1000'):
+    """A world template that also holds the library: the kernel and these mounts' modules, compiled once.
+
+    Every world used to compile the kernel library and each of its mounts' modules under its own node's
+    name, so nothing one world compiled was the same value in another. Whatever among them does not depend
+    on the name of the world that runs it is compiled and published here once, under the system's
+    authority (foil-bootstrap.rvr: build-library), from the sources of this checkout, and kept in a
+    template beside the compiler's. A world started from it takes the library as its trusted publication
+    and compiles only what does depend on its name and what it reads differently. `mounts` are (name,
+    {module: path}) pairs. Keyed by the kernel's sources, the mounts' module sources and the template it
+    is built on; built on the compiler under the tier worlds run."""
+    cache = ROOT / '.check'
+    kernel = sorted((ROOT / 'src/foil').rglob('*.foil'))
+    modules = [(module, Path(path)) for _, bag in mounts for module, path in sorted(bag.items())]
+    described = hashlib.sha256()
+    described.update(((base / 'ready').read_text() + '\n' + digest(kernel) + '\n').encode())
+    for module, path in modules:
+        described.update(module.encode() + b'\0' + path.read_bytes() + b'\0')
+    key = described.hexdigest()[:16]
+    template = cache / ('template-library-' + key)
+    with (cache / 'stage.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (template / 'ready').exists() and (template / 'arena.dat').is_file():
+            return template
+        directory = Path(tempfile.mkdtemp(prefix='stage-', dir=cache))
+        print(f'Staging library {key}: {directory}', flush=True)
+        # The session reads every module by its name beneath foil/, the mounts' beside the kernel's.
+        shutil.copytree(ROOT / 'src', directory / 'src')
+        for module, path in modules:
+            target = directory / 'src/foil' / (module + '.foil')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        copy_snapshot(base, directory / 'snap')
+        names = ' '.join(rvr_string(name) for name in LIBRARY_KERNEL + [module for module, _ in modules])
+        source = ('(#bind library_tier (#module plangrm))\n(Install library_tier:compileP6)\n'
+                  '(#bind library_eden (#module eden))\n(#bind library_bootstrap (#module foil-bootstrap))\n'
+                  f'(define staged_library (library_bootstrap:build-library (Pin library_eden:start) [{names}]))\n'
+                  '(print ["LIBRARY-STAGED" (library_bootstrap:library-names staged_library)])\n'
+                  '(print "TEST-RUN-DONE")\n')
+        code, complete, seconds = run_process(
+            [wisp, '--file-root', str(directory / 'src'), 'snap', 'root', '_'], directory, source, timeout,
+            dict(os.environ, PL_CODE_WARMUP=os.environ.get('PL_CODE_WARMUP', warmup)))
+        log = (directory / 'out.log').read_text(errors='replace')
+        if not verdict(log, code, complete)[0] or not re.search(r'^\((?:0\s+)?"LIBRARY-STAGED"', log, re.M):
+            raise RuntimeError(f'staging the library failed: {directory}/out.log')
+        print(f'Library staged in {seconds:.0f} s', flush=True)
+        prepared = directory / 'snap'
+        (prepared / 'ready').write_text(key)
+        if template.exists():
+            shutil.rmtree(template)
+        prepared.rename(template)
+        shutil.rmtree(directory, ignore_errors=True)
+    return template
+
+
 def rvr_string(value):
     # CLI selections are resolved through the inventory, never raw code.
     return '"' + value.replace('\\', '\\\\').replace('"', '""') + '"'

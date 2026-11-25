@@ -5,7 +5,7 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/main";
+    url = "github:axsys-org/enki/ic-fast-start";
   };
   outputs = { self, nixpkgs, rex, enki }:
     let
