@@ -242,6 +242,41 @@ def stage(wisp, fresh, timeout):
     return template
 
 
+def stage_modules(wisp, base, modules, timeout, extra=''):
+    """A template that already holds these Reaver modules, built once on another template.
+
+    A session that binds a module the template does not hold compiles it then and there. A world's first
+    start binds the whole of its bootstrap, so it compiled the same modules again in every world; here they
+    are compiled once for a checkout and a runtime, and a world starts from the result. `extra` is source
+    the template's session runs after the binds (a name a later session expects to find defined)."""
+    cache = ROOT / '.check'
+    files = [ROOT / 'src/reaver' / (m + '.rvr') for m in reaver_closure(modules)
+             if (ROOT / 'src/reaver' / (m + '.rvr')).exists()]
+    key = hashlib.sha256(((base / 'ready').read_text() + '\n' + ' '.join(modules) + '\n'
+                          + digest(files) + '\n' + extra).encode()).hexdigest()[:16]
+    template = cache / ('template-modules-' + key)
+    with (cache / 'stage.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (template / 'ready').exists() and (template / 'arena.dat').is_file():
+            return template
+        directory = Path(tempfile.mkdtemp(prefix='stage-', dir=cache))
+        print(f'Staging modules {key}: {directory}', flush=True)
+        copy_snapshot(base, directory / 'snap')
+        source = ''.join(f'(#bind staged_{i} (#module {module}))\n' for i, module in enumerate(modules))
+        code, complete, _ = run_process([wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
+                                        directory, source + extra + '(print "TEST-RUN-DONE")\n', timeout)
+        log = (directory / 'out.log').read_text(errors='replace')
+        if not verdict(log, code, complete)[0]:
+            raise RuntimeError(f'staging modules failed: {directory}/out.log')
+        prepared = directory / 'snap'
+        (prepared / 'ready').write_text(key)
+        if template.exists():
+            shutil.rmtree(template)
+        prepared.rename(template)
+        shutil.rmtree(directory, ignore_errors=True)   # the log is kept only when staging failed
+    return template
+
+
 def rvr_string(value):
     # CLI selections are resolved through the inventory, never raw code.
     return '"' + value.replace('\\', '\\\\').replace('"', '""') + '"'

@@ -19,9 +19,11 @@ from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, run
 from eden_runtime import runtime_exit_status, startup_failed, startup_ready
 from eden_hands import parse_hand, start_hands
 from namespace_identity import parse_node_identity
-from test_runner import stage
+from test_runner import stage, stage_modules
 
 ROOT = Path(__file__).resolve().parent.parent
+# How many times a world's runtime enters a law before compiling it (nix/enki-code-warmup.patch).
+WARMUP = '64'
 
 
 def enter_environment(argv):
@@ -147,7 +149,10 @@ def main():
         else:
             work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
         if not kept:
-            template = stage(runtime, False, args.startup_timeout)
+            # The compiler, and on it the modules a world's bootstrap binds: compiled once for a
+            # checkout and a runtime, not again in every world.
+            template = stage_modules(runtime, stage(runtime, False, args.startup_timeout),
+                                     ['std', 'plangrm', 'eden', 'foil-bootstrap'], args.startup_timeout)
             if (work / 'snap').exists():
                 shutil.rmtree(work / 'snap')
             (work / 'snap').mkdir()
@@ -190,6 +195,11 @@ def main():
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+            # A law is compiled once it has been entered PL_CODE_WARMUP times and is interpreted until
+            # then: a start runs most of its laws once, and compiling each of them before its first step
+            # was half of a first start. A runtime without the warm-up reads nothing from this and
+            # compiles on first entry.
+            runtime_environment = dict(os.environ, PL_CODE_WARMUP=os.environ.get('PL_CODE_WARMUP', WARMUP))
             def spawn(resume):
                 # A saved world's root is a program applied to the argument
                 # row (eden/resume); the boot repl takes its script on stdin.
@@ -198,7 +208,8 @@ def main():
                 if resume:
                     command += [str(scan_port), scan_token]
                 process = subprocess.Popen(command, cwd=work, stdin=subprocess.PIPE,
-                                           stdout=log, stderr=log, text=True, restore_signals=False)
+                                           stdout=log, stderr=log, text=True, restore_signals=False,
+                                           env=runtime_environment)
                 cleanup.callback(stop, process)
                 return process
             def listening():
