@@ -41,13 +41,83 @@
     (error ["system-publication-failed" (_0 result)])
     (force (tag (_0 result) images policy-code policy))))
 
+;; The library: everything among the given modules and what they import that
+;; does not depend on the name of the world that runs it, compiled and
+;; published once under the system's authority, at /sys/lib/<module>. A world
+;; takes it as its trusted publication and imports its artifacts; it compiles
+;; and publishes under its own name only what does depend on its name (a
+;; module that reaches runtime_context, whose owner is the compiling world)
+;; and what it reads differently from the library's source.
+(define library-tag "foil/library-build/v1")
+(define library-slot [("ts" "sys") ("ts" "compiler") ("ts" "artifact")])
+(define named-module "runtime_context")
+(define (library-root name) [["ts" "sys"] ["ts" "lib"] ["ts" name]])
+
+;; -> [[name imports] ...] for the modules reachable from mods.
+(define (import-graph mods)
+  (define (go seen pending)
+    (Ifz (Sz pending) seen
+      (let ((name (_0 pending)) (rest (drop 1 pending)))
+        (If (find (lambda (pair) (Equal name (_0 pair))) seen) (go seen rest)
+          (let ((imports (source:module-imports name)))
+            (go (snoc [name imports] seen) (Weld rest imports)))))))
+  (go [] mods))
+;; The modules of a graph that reach the named module, itself included.
+(define (reaching graph target)
+  (define (grow held)
+    (define next
+      (foldl (lambda (out pair)
+        (If (includes (Equal (_0 pair)) out) out
+          (If (any (lambda (name) (includes (Equal name) out)) (_1 pair))
+            (snoc (_0 pair) out) out))) held graph))
+    (If (Eq (Sz next) (Sz held)) held (grow next)))
+  (grow [target]))
+
+(define (build-library compiler modules)
+  (define graph (import-graph (Weld (map _0 system-roots) modules)))
+  (define named (reaching graph named-module))
+  (define roots
+    (Weld system-roots
+      (map (lambda (pair) [(_0 pair) (library-root (_0 pair))])
+        (filter (lambda (pair)
+          (Nil (Or (includes (Equal (_0 pair)) named)
+                   (Truth (find (lambda (root) (Equal (_0 pair) (_0 root))) system-roots)))))
+          graph))))
+  (Seq (print ["Library" "modules" (Sz roots) "left to each world" (Sz named)]) 0)
+  (define prepared (publication:prepare-system compiler source:read-module roots))
+  (DeepSeq prepared 0)
+  (Seq (print ["Library" "prepared"]) 0)
+  (define compiled (publication:compile prepared driver:empty-foil-cache))
+  (define images (_2 compiled))
+  (DeepSeq images 0)
+  (Seq (print ["Library" "compiled"]) 0)
+  (define found (find (lambda (pair) (Equal "compiler_publication" (_0 pair))) images))
+  (define policy
+    (Ifz found (error "library-without-publication-policy: compiler_publication depends on the world's name")
+      (_1 (_0 found))))
+  (define result (publication:publish-system (Unpin policy) library-slot compiled 0 0))
+  (DeepSeq result 0)
+  (Seq (print ["Library" "published"]) 0)
+  ;; What a world takes is pins: the publication, each module's artifact, the
+  ;; plan they were compiled under, and the policy. The driver's cache of this
+  ;; compile is left behind: it is keyed by this context, which no world
+  ;; compiles in, and forcing its unpinned subjects costs gigabytes.
+  (If (Equal "err" (Hd result))
+    (error ["library-publication-failed" (_0 result)])
+    (force (library-tag (_0 result) images
+      ((Hd compiled) (_0 compiled) driver:empty-foil-cache images) policy))))
+
+(define (library? value) (Equal library-tag (Hd value)))
+(define (library-names value) (map _0 (_1 value)))
+
 (define (checked value)
-  (If (And (Equal tag (Hd value)) (Eq 4 (Sz value))) value
+  (If (And (Or (Equal tag (Hd value)) (Equal library-tag (Hd value))) (Eq 4 (Sz value))) value
     (error "stale-system-build: rebuild system publication")))
 (define (trusted value) (_0 (checked value)))
 (define (system-images value) (_1 (checked value)))
 (define (publisher-code value) (_2 (checked value)))
-(define (policy value) (_3 (checked value)))
+(define (policy value)
+  (If (library? value) (Unpin (_3 (checked value))) (_3 (checked value))))
 
 ;; Publish the compiler/store policy and requested local source graph into
 ;; a fresh local sovereign before an application creates any instances.
@@ -58,7 +128,10 @@
   (define policy-code (publisher-code build))
   (define previous-context
     (publication:compilation-context (Unpin (_0 policy-code))))
-  (define images (Weld (system-images build) (_2 policy-code)))
+  ;; A library's policy is among its own images.
+  (define images
+    (If (library? build) (system-images build)
+      (Weld (system-images build) (_2 policy-code))))
   (define (module-root name)
     (define image (find (lambda (pair) (Equal name (_0 pair))) images))
     (If image
@@ -76,12 +149,18 @@
   (define (accepted result)
     (If (Equal "ok" (Hd result)) (_0 result)
       (error ["local-publication-failed" (_0 result)])))
+  ;; A library's policy is already published, by the system. What a world
+  ;; compiles beside a library is published as its own; beside a whole
+  ;; library that is nothing.
   (define policy-state
-    (_0 (accepted (publication:publish-local store-policy slot policy-code
-      0 0 (accepted initial)))))
+    (If (library? build) (accepted initial)
+      (_0 (accepted (publication:publish-local store-policy slot policy-code
+        0 0 (accepted initial))))))
   (define state
-    (_0 (accepted (publication:publish-local store-policy slot code
-      0 0 policy-state))))
+    (Ifz (Sz (_2 code)) policy-state
+      (_0 (accepted (publication:publish-local store-policy slot code
+        0 0 policy-state)))))
   (force [state code]))
 
-(#export build-system build-local system-roots trusted system-images publisher-code policy)
+(#export build-system build-local system-roots trusted system-images publisher-code policy
+         build-library library? library-names library-slot)

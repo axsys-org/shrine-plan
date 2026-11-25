@@ -38,6 +38,10 @@
   (define core-images
     (merge-images (bootstrap:system-images system)
       (merge-images (_2 (bootstrap:publisher-code system)) (_2 core-code))))
+  ;; What the library holds, compiled once for every world that starts from it;
+  ;; nothing when the world compiled its own kernel.
+  (define library-images
+    (If (bootstrap:library? system) (bootstrap:system-images system) []))
   (define core (module core-images "source_mount"))
   (define eden (module core-images "eden"))
   (define (tool path) (driver:get-perc path core))
@@ -47,9 +51,13 @@
   (define (images-at path state)
     (define result ((tool ["source_mount" "images"]) path state))
     (If (Eq 1 (Sz result)) (_0 result) []))
+  ;; What a mount compiled in this world comes before the library's copy of
+  ;; the same module: it was compiled here because it reads differently here.
   (define (images state)
-    (foldl (lambda (out spec)
-      (merge-images out (images-at (home self spec) state))) core-images specs))
+    (merge-images
+      (foldl (lambda (out spec)
+        (merge-images out (images-at (home self spec) state))) [] specs)
+      core-images))
   ;; Resolved once: `previous` runs per definition path, and the constructor
   ;; lookup derives the core module's whole TypeWorld (driver:perc-world).
   (define case (tool ["namespace" "case"]))
@@ -69,15 +77,49 @@
     (DeepSeq (map read-file (Ix 11 spec)) 0)
     (Seq (print ["Publishing mount" (_0 spec)]) 0)
     (define own (_3 spec))
-    (define imported (filter (lambda (pair)
-      (Nil (find (lambda (binding) (Equal (_0 pair) (_0 binding))) own)))
-      (foldl (lambda (out dependency)
-        (merge-images out (images-at (home self [dependency]) state)))
-        core-images (Ix 10 spec))))
     (define (read name)
       (define found (find (lambda (binding) (Equal name (_0 binding))) own))
       (If found (rex:ParseRexNormFile (read-file (_1 (_0 found))))
         (source:read-module name)))
+    ;; What the mounts this one depends on compiled in this world.
+    (define compiled-here
+      (foldl (lambda (out dependency)
+        (merge-images out (images-at (home self [dependency]) state)))
+        [] (Ix 10 spec)))
+    ;; A module of this mount stands as the library compiled it when the
+    ;; library holds it, its source reads here as it did there, and nothing it
+    ;; imports was compiled again in this world. judge answers
+    ;; [verdicts' stands]; verdicts are [name stands] for this mount's modules.
+    (define (judge verdicts name)
+      (define seen (find (lambda (pair) (Equal name (_0 pair))) verdicts))
+      (define held (find (lambda (pair) (Equal name (_0 pair))) library-images))
+      (define mine (find (lambda (binding) (Equal name (_0 binding))) own))
+      (cond
+        (seen [verdicts (_1 (_0 seen))])
+        ((find (lambda (pair) (Equal name (_0 pair))) compiled-here) [verdicts 0])
+        ((Nil held) [(If mine (snoc [name 0] verdicts) verdicts) 0])
+        ((Nil mine) [verdicts 1])
+        (else
+          (let* ((perc (Unpin (_1 (_0 held))))
+                 (now (Try (lambda (ignored) (force (source:new-imports (read name)))) 0))
+                 (same (If (Eq 1 (Hd now)) 0 (Equal (_0 now) (driver:perc-rex perc)))))
+            (Ifz same [(snoc [name 0] verdicts) 0]
+              (let ((deps (foldl (lambda (state dep)
+                            (define next (judge (_0 state) dep))
+                            [(_0 next) (If (_1 state) (_1 next) 0)])
+                          [verdicts 1] (driver:perc-dependencies perc))))
+                [(snoc [name (_1 deps)] (_0 deps)) (_1 deps)]))))))
+    (define verdicts
+      (Ifz (Sz library-images) []
+        (foldl (lambda (verdicts binding) (_0 (judge verdicts (_0 binding)))) [] own)))
+    (define (stands name)
+      (define verdict (find (lambda (pair) (Equal name (_0 pair))) verdicts))
+      (If verdict (_1 (_0 verdict)) 0))
+    (define compile (filter (lambda (binding) (Nil (stands (_0 binding)))) own))
+    (Seq (print ["Mount modules" (_0 spec) "compiled here" (Sz compile) "of" (Sz own)]) 0)
+    (define imported (filter (lambda (pair)
+      (Nil (find (lambda (binding) (Equal (_0 pair) (_0 binding))) compile)))
+      (merge-images compiled-here core-images)))
     (define (root name)
       (define found (find (lambda (pair) (Equal name (_0 pair))) imported))
       (If found
@@ -86,10 +128,10 @@
     (define origin (publication:compilation-context (Unpin (_0 core-code))))
     (define prepared (source:prepare-publication-with read
       (context:publication-key origin) (context:compiler-key origin)
-      root imported (previous state) (map _0 own)))
+      root imported (previous state) (map _0 compile)))
     (define code (publication:compile prepared (_1 core-code)))
     (define candidate
-      (If (Sz own)
+      (If (Sz (_2 code))
         (_0 (need-ok (publication:publish-local (bootstrap:policy system)
           slot code 0 0 state))) state))
     (define all-images (merge-images (_2 code) imported))
@@ -191,7 +233,7 @@
       (If binding
         (let ((policy (Unpin (_1 (_0 binding)))))
           (need-ok ((driver:get-perc ["goo_documentation" "install_reader"] policy)
-            (documentation:reader policy slot) installed))) installed)))
+            (documentation:reader-among policy [slot bootstrap:library-slot]) installed))) installed)))
   (define editable
     (let ((policy (module (images documented) "goo_value")))
       (need-ok ((driver:get-perc ["goo_value" "install"] policy)
