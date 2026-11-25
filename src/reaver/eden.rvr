@@ -15,8 +15,13 @@
 (#bind documentation (#module goo-documentation-bridge))
 (#bind value-editor (#module goo-value-bridge))
 
+;; A module's artifact pin from an image row; module unpins it.  A closure
+;; that outlives the launch holds the pin and unpins when called, so a
+;; snapshot references the artifact instead of rewriting it.
+(define (module-pin images name)
+  (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images))))
 (define (module images name)
-  (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
+  (Unpin (module-pin images name)))
 (define (merge-images left right)
   (foldl (lambda (out pair)
     (If (find (lambda (other) (Equal (_0 pair) (_0 other))) out) out
@@ -31,20 +36,24 @@
 ;; post-start hook, hook arguments, inspection-provider flag, dependencies,
 ;; required assets, route claims, declarative-workspace flag.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token)
-  (define local (bootstrap:build-local self system resolve slot
-    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
+;; A verified core upgrade supplies the preserved namespace and its newly
+;; published compiler images. Rebuild the service closures from those images;
+;; a saved supervisor still captures the old kernel even after code publication.
+;; The ordinary boot and upgrade use the same mount/route installation.
+(define (mounted-with self system resolve slot port specs scan-port scan-token install local)
+  ;; The pinned, iced core publication (foil-bootstrap:build-local).
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
-      (merge-images (_2 (bootstrap:publisher-code system)) (_2 core-code))))
+      (merge-images (_2 (bootstrap:publisher-code system)) (_2 (Unpin core-code)))))
   ;; What the library holds, compiled once for every world that starts from it;
   ;; nothing when the world compiled its own kernel.
   (define library-images
     (If (bootstrap:library? system) (bootstrap:system-images system) []))
-  (define core (module core-images "source_mount"))
+  (define core-pin (module-pin core-images "source_mount"))
+  (define core (Unpin core-pin))
   (define eden (module core-images "eden"))
-  (define (tool path) (driver:get-perc path core))
+  (define (tool path) (driver:get-perc path (Unpin core-pin)))
   (define mount-key (tool ["source_mount" "mount_key"]))
   (define (home self spec)
     [self ("ts" "io") ("ts" "fs") (mount-key (_0 spec))])
@@ -125,11 +134,11 @@
       (If found
         (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
         (resolve name)))
-    (define origin (publication:compilation-context (Unpin (_0 core-code))))
+    (define origin (publication:compilation-context (Unpin (_0 (Unpin core-code)))))
     (define prepared (source:prepare-publication-with read
       (context:publication-key origin) (context:compiler-key origin)
       root imported (previous state) (map _0 compile)))
-    (define code (publication:compile prepared (_1 core-code)))
+    (define code (publication:compile prepared (_1 (Unpin core-code))))
     (define candidate
       (If (Sz (_2 code))
         (_0 (need-ok (publication:publish-local (bootstrap:policy system)
@@ -161,6 +170,7 @@
                   path (_2 spec) published)) published))
     ((tool ["source_mount" "save_images"]) path (_2 code) registered))
   (define (attempt path state)
+    (define core (Unpin core-pin))
     (define result (Try (lambda (ignored) (force (publish-mount path state))) 0))
     (If (Eq 1 (Hd result))
       (Seq (print ["Mount publication failed" path (_0 result)])
@@ -170,10 +180,11 @@
   (define ports ((abi:constructor core ["source_mount" "ports"]) attempt))
   ;; Namespace drafts use exactly the mounted compiler substrate and publisher.
   ;; The registration supplies the prelude, never the HTTP request or scene.
-  (define draft-policy (module core-images "grove_draft"))
-  (define (draft-tool name) (driver:get-perc ["grove_draft" name] draft-policy))
+  (define draft-pin (module-pin core-images "grove_draft"))
+  (define (draft-tool name) (driver:get-perc ["grove_draft" name] (Unpin draft-pin)))
   (define (compile-draft root text prelude state)
-    (define complete ((Hd core-code) (_0 core-code) (_1 core-code) (images state)))
+    (define cc (Unpin core-code))
+    (define complete ((Hd cc) (_0 cc) (_1 cc) (images state)))
     (define prepared (backend:prepare-with complete prelude))
     (define policy (_1 prepared))
     (define (lookup requested)
@@ -198,7 +209,7 @@
       ((abi:result policy "err") ((abi:constructor policy ["grove_backend" "diagnostic"])
         (driver:get-perc ["rex" "zero_span"] policy) "Draft compilation failed" 0))
       (_0 result)))
-  (define draft-ports ((abi:constructor draft-policy ["grove_draft" "ports"]) compile-draft))
+  (define draft-ports ((abi:constructor (Unpin draft-pin) ["grove_draft" "ports"]) compile-draft))
   (define homes (map (home self) specs))
   (Seq (print "Core publication compiled") 0)
   (define initial (need-ok ((driver:get-perc ["eden" "boot"] eden)
@@ -240,7 +251,9 @@
         (value-editor:compiler policy) documented))))
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
-  (define config
+  ;; The HTTP routes for a state: each mount's http hook over its snapshot,
+  ;; the workspace's, then the declared assets served live from the bundle.
+  (define (config-for installed)
     (foldl (lambda (config spec)
       (Ifz (Or (Sz (_6 spec)) (Ix 13 spec)) config
         (let* ((manual (If (Sz (_6 spec))
@@ -258,22 +271,45 @@
                    0 (error ["undeclared-mount-routes" (_0 spec)]))
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
-  (define server ((driver:get-perc ["eden" "serve_read"] eden)
+  (define config (config-for installed))
+  (define run-with (driver:get-perc ["http_foot" "run_with"] http))
+  ;; remount: a resumed process scans every mount again through its own
+  ;; bridge (the files and the published code come from the checkout now,
+  ;; the records stay as saved) and rebuilds the HTTP entry over them.
+  (define (remount reader state)
+    (define reloaded
+      (foldl (lambda (state spec)
+        ((tool ["source_mount" "reload"]) reader ports (_0 spec) (_1 spec) state))
+        state specs))
+    (Seq (print ["Remounted" (map _0 specs)]) 0)
+    [reloaded (run-with (config-for reloaded))])
+  ;; serve_saved: every admitted event saves the world as the store root,
+  ;; so running the snapshot again resumes it (eden/resume).
+  (define server ((driver:get-perc ["eden" "serve_saved"] eden)
     ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes))
     reader ((draft-tool "reconcile") draft-ports editable)
-    ((driver:get-perc ["http_foot" "run_with"] http) config)))
+    (run-with config)
+    install remount))
   (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
   (Seq server (foldl (lambda (ignored spec)
     (Ifz (Sz (_7 spec)) 0
       (Seq ((hook installed spec 7) server (Ix 8 spec)) 0))) 0 specs))
   server)
 
-(define (start self system resolve slot port specs scan-port scan-token)
+(define (mounted self system resolve slot port specs scan-port scan-token install)
+  (define local (bootstrap:build-local self system resolve slot
+    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
+  (mounted-with self system resolve slot port specs scan-port scan-token install local))
+
+
+;; install: a thunk that installs the session's compiler, kept in the
+;; saved world so a resumed process compiles too.
+(define (start self system resolve slot port specs scan-port scan-token install)
   (If (Sz specs)
-    (mounted self system resolve slot port specs scan-port scan-token)
+    (mounted self system resolve slot port specs scan-port scan-token install)
     (let* ((local (bootstrap:build-local self system resolve slot ["eden"]))
-           (eden (module (_2 (_1 local)) "eden"))
+           (eden (module (_2 (Unpin (_1 local))) "eden"))
            (state (need-ok ((driver:get-perc ["eden" "boot"] eden)
              self (bootstrap:trusted system) (_1 (_0 local)) port))))
       ((driver:get-perc ["eden" "serve"] eden) state))))
-(#export start)
+(#export start mounted-with)
